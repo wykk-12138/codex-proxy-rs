@@ -35,6 +35,7 @@ pub struct RuntimeSettings {
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
+    pub codex_turn_metadata_strip_workspaces: bool,
     pub model_mappings: BTreeMap<String, String>,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -74,6 +75,10 @@ impl fmt::Debug for RuntimeSettings {
             .field("rotation_strategy", &self.rotation_strategy)
             .field("request_location_enabled", &self.request_location_enabled)
             .field("request_location", &self.request_location)
+            .field(
+                "codex_turn_metadata_strip_workspaces",
+                &self.codex_turn_metadata_strip_workspaces,
+            )
             .field("model_mappings", &self.model_mappings)
             .field("min_codex_desktop_version", &self.min_codex_desktop_version)
             .field("min_codex_cli_version", &self.min_codex_cli_version)
@@ -138,6 +143,7 @@ pub struct RuntimeSettingsUpdate {
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
+    pub codex_turn_metadata_strip_workspaces: bool,
     pub model_mappings: BTreeMap<String, String>,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -167,6 +173,10 @@ impl fmt::Debug for RuntimeSettingsUpdate {
             .field("rotation_strategy", &self.rotation_strategy)
             .field("request_location_enabled", &self.request_location_enabled)
             .field("request_location", &self.request_location)
+            .field(
+                "codex_turn_metadata_strip_workspaces",
+                &self.codex_turn_metadata_strip_workspaces,
+            )
             .field("model_mappings", &self.model_mappings)
             .finish_non_exhaustive()
     }
@@ -264,6 +274,7 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
             "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
+                    codex_turn_metadata_strip_workspaces,
                     refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                     rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
@@ -416,6 +427,7 @@ pub(crate) async fn load_runtime_settings_in_transaction(
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
         "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
+                codex_turn_metadata_strip_workspaces,
                 refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                 rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
@@ -495,6 +507,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      account_warmup_schedule_time = $29,
                      account_warmup_model = $30,
                      smart_scheduling_json = $31,
+                     codex_turn_metadata_strip_workspaces = $32,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -542,6 +555,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     .bind(&update.account_warmup_schedule_time)
     .bind(update.account_warmup_model.as_deref())
     .bind(sqlx::types::Json(update.smart_scheduling))
+    .bind(update.codex_turn_metadata_strip_workspaces)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -604,6 +618,7 @@ struct RuntimeSettingsRow {
     rotation_strategy: String,
     request_location_enabled: bool,
     request_location_json: sqlx::types::Json<gateway_core::account::RequestLocation>,
+    codex_turn_metadata_strip_workspaces: bool,
     model_mappings_json: sqlx::types::Json<BTreeMap<String, String>>,
     usage_retention_days: i64,
     ops_event_retention_days: i64,
@@ -657,6 +672,7 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
             .0
             .normalized()
             .map_err(|_| invalid_location())?,
+        codex_turn_metadata_strip_workspaces: row.codex_turn_metadata_strip_workspaces,
         model_mappings: row.model_mappings_json.0,
         usage_retention_days: to_u32(row.usage_retention_days)?,
         ops_event_retention_days: to_u32(row.ops_event_retention_days)?,

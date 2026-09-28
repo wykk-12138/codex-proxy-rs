@@ -36,6 +36,7 @@ pub struct SnapshotSettingsFacts {
     request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     request_location_enabled: bool,
     request_location: crate::account::RequestLocation,
+    codex_turn_metadata_strip_workspaces: bool,
     max_concurrent_per_account: u32,
     max_waiting_per_key: u32,
     max_waiting_per_account: u32,
@@ -71,6 +72,12 @@ impl SnapshotSettingsFacts {
         profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     ) -> Self {
         self.request_profiles = profiles;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_codex_turn_metadata_strip_workspaces(mut self, enabled: bool) -> Self {
+        self.codex_turn_metadata_strip_workspaces = enabled;
         self
     }
 
@@ -118,6 +125,7 @@ impl SnapshotSettingsFacts {
             pricing: Arc::default(),
             request_location_enabled: false,
             request_location: crate::account::RequestLocation::default(),
+            codex_turn_metadata_strip_workspaces: false,
             max_concurrent_per_account,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
@@ -684,6 +692,9 @@ async fn compile_runtime_snapshot(
         snapshot
             .with_pricing(facts.settings.pricing)
             .with_request_location(request_location)
+            .with_codex_turn_metadata_strip_workspaces(
+                facts.settings.codex_turn_metadata_strip_workspaces,
+            )
             .with_responses_max_decompressed_body_bytes(decompressed_body_limit)
             .with_client_queue_policy(client_queue_policy)
             .with_model_mappings(model_mappings)
@@ -701,6 +712,7 @@ pub struct RuntimeSnapshot {
     pricing: Arc<crate::metering::PricingOverrides>,
     responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
     request_location: Option<crate::account::RequestLocation>,
+    codex_turn_metadata_strip_workspaces: bool,
     revision: ConfigRevision,
     client_queue_policy: ConcurrencyQueuePolicy,
     account_selection_policy: AccountSelectionPolicy,
@@ -802,6 +814,12 @@ impl RuntimeSnapshot {
     }
 
     #[must_use]
+    pub const fn with_codex_turn_metadata_strip_workspaces(mut self, enabled: bool) -> Self {
+        self.codex_turn_metadata_strip_workspaces = enabled;
+        self
+    }
+
+    #[must_use]
     pub const fn client_queue_policy(&self) -> ConcurrencyQueuePolicy {
         self.client_queue_policy
     }
@@ -885,6 +903,7 @@ impl RuntimeSnapshot {
                 .expect("positive default limit"),
             pricing: Arc::default(),
             request_location: None,
+            codex_turn_metadata_strip_workspaces: false,
             revision,
             account_selection_policy,
             client_queue_policy: ConcurrencyQueuePolicy::default(),
@@ -1314,6 +1333,7 @@ impl RuntimeSnapshot {
             config_revision: self.revision,
             pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
+            codex_turn_metadata_strip_workspaces: self.codex_turn_metadata_strip_workspaces,
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),
             max_attempts: NonZeroU32::new(super::MAX_REQUEST_ATTEMPTS)
@@ -1381,6 +1401,7 @@ impl RuntimeSnapshot {
             config_revision: self.revision,
             pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
+            codex_turn_metadata_strip_workspaces: self.codex_turn_metadata_strip_workspaces,
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),
             max_attempts: NonZeroU32::new(super::MAX_REQUEST_ATTEMPTS)

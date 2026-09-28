@@ -28,6 +28,7 @@ export function useSettingsForm() {
     providerRequestProfiles: {} as ProviderRequestProfiles,
     requestLocationEnabled: false,
     requestLocation: { country: '', region: '', city: '', timezone: '' },
+    codexTurnMetadataStripWorkspaces: false,
     refreshMarginSeconds: null as number | null,
     refreshConcurrency: null as number | null,
     maxConcurrentPerAccount: null as number | null,
@@ -121,6 +122,7 @@ export function useSettingsForm() {
     savedRequestLocation.value = { ...data.requestLocation }
     form.requestLocationEnabled = data.requestLocationEnabled
     form.requestLocation = { ...data.requestLocation }
+    form.codexTurnMetadataStripWorkspaces = data.codexTurnMetadataStripWorkspaces
     form.refreshMarginSeconds = data.refreshMarginSeconds
     form.refreshConcurrency = data.refreshConcurrency
     form.maxConcurrentPerAccount = data.maxConcurrentPerAccount
@@ -279,6 +281,7 @@ export function useSettingsForm() {
         ),
         requestLocationEnabled: form.requestLocationEnabled,
         requestLocation,
+        codexTurnMetadataStripWorkspaces: form.codexTurnMetadataStripWorkspaces,
         modelMappings: mappingPayload(),
         refreshMarginSeconds,
         refreshConcurrency,
