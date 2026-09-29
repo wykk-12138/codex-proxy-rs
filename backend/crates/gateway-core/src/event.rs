@@ -842,13 +842,13 @@ impl ProviderEvent {
 
     /// 返回协议表达是否由中间件替换、展开或丢弃映射产生。
     ///
-    /// 该事实只供宿主最终协议边界决定是否启用严格复核，不进入插件 wire。
+    /// 宿主最终协议边界据此启用严格复核，插件可读取其快照。
     #[must_use]
     pub const fn middleware_transformed(&self) -> bool {
         self.middleware_transformed
     }
 
-    /// 返回中间件第一次改写前的协议表达；仅宿主协议复核可见。
+    /// 返回中间件第一次改写前的协议表达，供协议复核和插件读取。
     #[must_use]
     pub fn middleware_origin_wire(&self) -> Option<&ProtocolWireEvent> {
         self.middleware_origin_wire.as_deref()

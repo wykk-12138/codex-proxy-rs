@@ -6,7 +6,7 @@ use axum::{
     extract::{
         ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State, rejection::BytesRejection,
     },
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -24,6 +24,7 @@ use headers::{ETag, HeaderMapExt as _, IfNoneMatch};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::middleware::headers::{decode_headers, encode_headers};
 use crate::{
     admin::{
         AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse,
@@ -99,27 +100,28 @@ async fn model_responses(
     state
         .admin_services()
         .plugin_management()
-        .authorize_models(&target)
+        .validate_target(&target)
         .await
         .map_err(map_admin_service_error)?;
     let client_key_id = ClientApiKeyId::new(query.client_key_id)
         .map_err(|_| AdminError::bad_request("Client Key 标识不合法"))?;
-    let headers = model_request_headers(&parts.headers);
+    // 推理身份由显式 Key 决定；原始 HTTP 头仍完整交给插件，原生上游自行构造认证。
+    let headers = parts.headers;
     let (decoded, middleware_body) =
         match decode_request_with_body(&body, &headers, MAXIMUM_MODEL_BODY_BYTES) {
             Ok(decoded) => decoded,
             Err(error) => {
-                return Ok(harden_model_response(protocol_error_response(
+                return Ok(protocol_error_response(
                     StatusCode::BAD_REQUEST,
                     error.protocol_body(),
-                )));
+                ));
             }
         };
     let service = state.openai().clone();
     let execution = service.execution();
     let prepared = match execution.prepare_plugin_execution(&client_key_id).await {
         Ok(prepared) => prepared,
-        Err(error) => return Ok(harden_model_response(gateway_error_response(&error))),
+        Err(error) => return Ok(gateway_error_response(&error)),
     };
     let authorization: Arc<dyn ResponseAuthorization> =
         Arc::new(PluginModelsAuthorization { state, target });
@@ -139,12 +141,11 @@ async fn model_responses(
             headers,
             decoded,
             middleware_body,
-            maximum_body_bytes: MAXIMUM_MODEL_BODY_BYTES,
         },
         Some(authorization),
     )
     .await;
-    Ok(harden_model_response(response))
+    Ok(response)
 }
 
 struct PluginModelsAuthorization {
@@ -158,7 +159,7 @@ impl ResponseAuthorization for PluginModelsAuthorization {
             self.state
                 .admin_services()
                 .plugin_management()
-                .authorize_models(&self.target)
+                .validate_target(&self.target)
                 .await
                 .map_err(plugin_model_authorization_error)
         })
@@ -178,51 +179,6 @@ fn plugin_model_authorization_error(error: gateway_admin::model::AdminError) -> 
         ),
     };
     GatewayError::new(kind, message)
-}
-
-fn model_request_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut sanitized = HeaderMap::new();
-    for name in [
-        header::ACCEPT,
-        header::CONTENT_ENCODING,
-        header::CONTENT_TYPE,
-        header::USER_AGENT,
-        HeaderName::from_static("cf-connecting-ip"),
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderName::from_static("x-real-ip"),
-    ] {
-        for value in headers.get_all(&name) {
-            sanitized.append(name.clone(), value.clone());
-        }
-    }
-    sanitized
-}
-
-fn harden_model_response(mut response: Response) -> Response {
-    for name in [
-        header::SET_COOKIE,
-        HeaderName::from_static("set-cookie2"),
-        header::WWW_AUTHENTICATE,
-        header::PROXY_AUTHENTICATE,
-        header::AUTHORIZATION,
-        header::PROXY_AUTHORIZATION,
-    ] {
-        response.headers_mut().remove(name);
-    }
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; sandbox"),
-    );
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    response
 }
 
 async fn start_callback<S: SessionState + Send + Sync>(
@@ -271,6 +227,7 @@ async fn callback<S: SessionState + Send + Sync>(
         .map(|(_, value)| value.into_owned())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AdminError::bad_request("插件登录回调缺少 state"))?;
+    let headers = encode_headers(request.headers());
     if values.next().is_some() || to_bytes(request.into_body(), 0).await.is_err() {
         return Err(AdminError::bad_request("插件登录回调 state 重复或包含正文"));
     }
@@ -285,6 +242,7 @@ async fn callback<S: SessionState + Send + Sync>(
                 path: path.path,
                 query,
                 content_type: None,
+                headers,
                 body: Vec::new(),
                 request_id: uuid::Uuid::now_v7().to_string(),
             },
@@ -340,6 +298,7 @@ async fn handle<S: SessionState + Send + Sync>(
     let target = path.target();
     let method = request.method().as_str().to_owned();
     let query = request.uri().query().unwrap_or_default().to_owned();
+    let headers = encode_headers(request.headers());
     let body = to_bytes(request.into_body(), MAXIMUM_BODY_BYTES)
         .await
         .map_err(|_| {
@@ -355,6 +314,7 @@ async fn handle<S: SessionState + Send + Sync>(
                 path: path.path,
                 query,
                 content_type,
+                headers,
                 body: body.to_vec(),
                 request_id: auth.context().request_id.clone(),
             },
@@ -452,5 +412,7 @@ fn raw_response(result: PluginManagementResponse) -> Result<Response, AdminError
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
     );
+    // 宿主提供默认值，插件显式字段随后覆盖；保留同名多值，只验证 HTTP 语法。
+    headers.extend(decode_headers(result.headers).map_err(|_| AdminError::bad_gateway())?);
     Ok(response)
 }

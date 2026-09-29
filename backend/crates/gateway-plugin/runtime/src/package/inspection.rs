@@ -35,28 +35,6 @@ impl PackageInspector {
 
 #[async_trait]
 impl PluginPackageInspector for PackageInspector {
-    fn permission_descriptions(
-        &self,
-        permissions: &[String],
-    ) -> Vec<gateway_admin::model::plugins::PluginPermissionDescription> {
-        permissions
-            .iter()
-            .map(|identifier| {
-                let permission = serde_json::from_value::<gateway_plugin_sdk::Permission>(
-                    serde_json::Value::String(identifier.clone()),
-                )
-                .ok();
-                gateway_admin::model::plugins::PluginPermissionDescription {
-                    permission: identifier.clone(),
-                    label: permission
-                        .map_or(identifier.as_str(), |value| value.label())
-                        .into(),
-                    description: permission.map_or("", |value| value.description()).into(),
-                }
-            })
-            .collect()
-    }
-
     async fn inspect(
         &self,
         archive: Arc<[u8]>,
@@ -122,11 +100,6 @@ impl PluginPackageInspector for PackageInspector {
                             },
                         ))
                     })
-                    .collect::<Result<_, _>>()?,
-                requested_permissions: manifest
-                    .permissions
-                    .iter()
-                    .map(identifier)
                     .collect::<Result<_, _>>()?,
                 configuration_schema: manifest.configuration_schema.clone(),
                 secret_fields: manifest.secret_fields.iter().cloned().collect(),

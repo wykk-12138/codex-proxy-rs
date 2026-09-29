@@ -149,6 +149,7 @@ pub struct ControlPlaneSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneReplacement {
+    pub expected_revision: Revision,
     pub settings: RuntimeSettingsUpdate,
     pub audit: AdminAuditEvent,
 }
@@ -225,6 +226,20 @@ impl ControlPlaneRepository for PgControlPlaneRepository {
             .await
             .map_err(|_| postgres_unavailable("begin control plane replacement"))?;
         let result = async {
+            // 锁住所有配置写入共同使用的行，版本检查与修改不能被其他事务穿插。
+            let current = sqlx::query_scalar::<_, i64>(
+                "select config_revision from runtime_settings where id = 1 for update",
+            )
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| postgres_unavailable("lock control plane revision"))?;
+            if u64::try_from(current).ok() != Some(replacement.expected_revision.get()) {
+                return Err(StoreError::Conflict {
+                    entity: "runtime settings",
+                    id: "1".to_owned(),
+                    kind: crate::ConflictKind::StaleRevision,
+                });
+            }
             let revision =
                 update_runtime_settings_in_transaction(&mut transaction, &replacement.settings)
                     .await?;

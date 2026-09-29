@@ -32,6 +32,13 @@ impl ExtensionSetId {
 pub trait ExtensionSetLease: Send + Sync {
     fn is_ready(&self) -> bool;
 
+    /// 与发布集合一起冻结的上游适配计划，不能在请求中解析为新代次。
+    fn upstream_adapters(
+        &self,
+    ) -> Option<Arc<dyn crate::engine::upstream_adapter::UpstreamAdapterPlan>> {
+        None
+    }
+
     /// 与集合一起冻结的目录事实，读取不调用插件进程。
     fn model_aliases(&self) -> &[ContributedModelAlias] {
         &[]
@@ -50,6 +57,15 @@ pub struct ExtensionSetReference {
 }
 
 impl ExtensionSetReference {
+    #[must_use]
+    pub fn upstream_adapters(
+        &self,
+    ) -> Option<crate::engine::upstream_adapter::FrozenUpstreamAdapterPlan> {
+        self.lease.upstream_adapters().map(|plan| {
+            crate::engine::upstream_adapter::FrozenUpstreamAdapterPlan::new(plan, self.clone())
+        })
+    }
+
     #[must_use]
     pub fn new(id: ExtensionSetId, lease: Arc<dyn ExtensionSetLease>) -> Self {
         Self { id, lease }

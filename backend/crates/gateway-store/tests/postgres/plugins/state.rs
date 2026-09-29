@@ -62,7 +62,7 @@ fn instance(artifact_sha256: String) -> PluginInstance {
         trusted_process: true,
         configuration: json!({}),
         secrets: BTreeMap::new(),
-        grants: vec![],
+
         bindings: vec![],
         revision: Revision::new(1).unwrap(),
     }

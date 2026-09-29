@@ -1,21 +1,19 @@
 use std::collections::BTreeMap;
 mod extensions;
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use futures::channel::{mpsc, oneshot};
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 
-use gateway_core::account::{AccountSelectionPolicy, ProviderAccountId, RotationStrategy};
+use gateway_core::account::ProviderAccountId;
 use gateway_core::lifecycle::CancellationToken;
 use gateway_core::policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits};
 use gateway_core::routing::snapshot::{
     RuntimeSnapshotCompiler, SnapshotAccountGroupFacts, SnapshotAccountGroupMemberFacts,
-    SnapshotClientPolicyFacts, SnapshotFacts, SnapshotProviderAccountFacts, SnapshotSettingsFacts,
-    SnapshotStoreError, SnapshotStorePort,
+    SnapshotClientPolicyFacts, SnapshotFacts, SnapshotProviderAccountFacts, SnapshotStoreError,
+    SnapshotStorePort,
 };
 use gateway_core::routing::{
     AccountGroupId, ConfigRevision, ModelCapabilities, ProviderCatalogGeneration,
@@ -26,6 +24,7 @@ use gateway_core::runtime::{
     RuntimeSnapshotHandle, RuntimeSnapshotPublisher, SnapshotControl, SnapshotRevisionStream,
     SnapshotSubscriptionError, SnapshotSubscriptionPort, runtime_revision_needs_refresh,
 };
+use gateway_core::settings::SettingsValues;
 use gateway_core::task::{
     ScheduledTask, WorkerContribution, WorkerCycleContext, WorkerKind, WorkerRunnable,
 };
@@ -739,7 +738,7 @@ fn scoped_facts(value: u64, allow_removed: bool) -> SnapshotFacts {
     SnapshotFacts::new(
         revision(value),
         revision(value),
-        SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None),
+        SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None),
         vec![SnapshotClientPolicyFacts::new(
             ClientApiKeyId::new("key_audit_synthetic").expect("key ID"),
             PlaintextClientApiKey::new("sk_audit_synthetic_not_a_real_key").expect("synthetic key"),
@@ -772,7 +771,7 @@ fn facts(config_revision: u64, observed_current_revision: u64) -> SnapshotFacts 
     SnapshotFacts::new(
         revision(config_revision),
         revision(observed_current_revision),
-        SnapshotSettingsFacts::new(
+        SettingsValues::new(
             3,
             50,
             "smart",
@@ -799,11 +798,7 @@ fn compiler(store: Arc<dyn SnapshotStorePort>) -> RuntimeSnapshotCompiler {
 fn empty_snapshot(value: u64) -> RuntimeSnapshot {
     RuntimeSnapshot::new(
         revision(value),
-        AccountSelectionPolicy::new(
-            RotationStrategy::Smart,
-            NonZeroU32::new(1).expect("positive concurrency"),
-            Duration::ZERO,
-        ),
+        gateway_core::settings::SettingsValues::new(1, 0, "smart", Default::default(), None, None),
         Vec::new(),
         Vec::new(),
         Vec::new(),

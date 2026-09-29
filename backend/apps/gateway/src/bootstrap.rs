@@ -202,6 +202,23 @@ async fn launch(
             plugin_runtime,
             plugin_runtime.bind_model_ports(&nested_models, &affinity_lookup)
         );
+        let settings = gateway_admin::initialize_settings(
+            store.admin_ports().settings(),
+            core.snapshot_control(),
+            admin_providers,
+            std::sync::Arc::new(gateway_host::pricing::ModelsDevPricing),
+        );
+        let mut services = gateway_admin::service::Registry::new({
+            let snapshots = core.snapshots();
+            let middleware = plugin_runtime.middleware_registry();
+            std::sync::Arc::new(move || {
+                let snapshot = snapshots.snapshot_for_diagnostics()?;
+                middleware.resolve(snapshot.extensions()?)
+            })
+        });
+        or_shutdown!(plugin_runtime, services.register_settings(&settings));
+        let services = std::sync::Arc::new(services);
+        or_shutdown!(plugin_runtime, plugin_runtime.bind_services(&services));
         let commands = or_shutdown!(plugin_runtime, plugin_runtime.prepare_command_line().await);
         or_shutdown!(plugin_runtime, store.start_command_line_writes());
         let result = commands
@@ -277,6 +294,14 @@ async fn launch(
             client,
             store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                service_middleware: {
+                    let snapshots = core.snapshots();
+                    let middleware = plugin_runtime.middleware_registry();
+                    std::sync::Arc::new(move || {
+                        let snapshot = snapshots.snapshot_for_diagnostics()?;
+                        middleware.resolve(snapshot.extensions()?)
+                    })
+                },
                 providers: admin_providers,
                 plugin_preparation: plugin_runtime.clone(),
                 plugin_management: plugin_runtime.clone(),
@@ -330,8 +355,27 @@ async fn launch(
             host.worker_health(),
             host.connection_lifecycle(),
         )
-    );
+    )
+    .with_middleware({
+        let snapshots = core.snapshots();
+        let middleware = plugin_runtime.middleware_registry();
+        move |snapshot| {
+            if let Some(snapshot) = snapshot {
+                return middleware.resolve(snapshot.extensions()?);
+            }
+            // 数据面未就绪时，管理与诊断路由仍可使用发布候选中的插件。
+            let diagnostic = snapshots.snapshot_for_diagnostics()?;
+            middleware.resolve(diagnostic.extensions()?)
+        }
+    });
+    let http_dispatcher = api.dispatcher();
+    or_shutdown!(plugin_runtime, plugin_runtime.bind_http(&http_dispatcher));
     host.report_startup_ready("API");
+
+    or_shutdown!(
+        plugin_runtime,
+        plugin_runtime.bind_services(&admin.services().public_services())
+    );
 
     let mut plan = store.take_worker_contributions();
     plan.extend(core.take_worker_contributions());

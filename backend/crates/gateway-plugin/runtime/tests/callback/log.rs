@@ -123,10 +123,7 @@ async fn real_worker_logs_are_correlated_sanitized_validated_and_bounded() {
     entries.push(json!({"params":{"event":"fixture.resumed"},"delay_ms":1100}));
 
     let artifact = PackageInspector::new(PackageLimits::default(), "1.0.0".parse().unwrap())
-        .inspect(
-            crate::support::package_with_permissions(crate::support::worker(), vec![]),
-            None,
-        )
+        .inspect(crate::support::package(crate::support::worker()), None)
         .await
         .unwrap();
     let instance = PluginInstance {
@@ -137,7 +134,7 @@ async fn real_worker_logs_are_correlated_sanitized_validated_and_bounded() {
         trusted_process: true,
         configuration: json!({"log_method":"plugin.register","log_entries":entries,"log_marker":marker}),
         secrets: BTreeMap::new(),
-        grants: vec![],
+
         bindings: vec![],
         revision: Revision::new(1).unwrap(),
     };

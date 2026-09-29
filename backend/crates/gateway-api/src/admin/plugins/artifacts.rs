@@ -8,7 +8,7 @@ use axum::{
 };
 use gateway_admin::model::plugins::{
     InstalledPluginArtifact, PluginArtifactMetadata, PluginIconTheme, PluginInstallResult,
-    PluginPermissionDescription, PluginSource, distribution::VerifiedPluginArtifact,
+    PluginSource, distribution::VerifiedPluginArtifact,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,16 +23,16 @@ use crate::{
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ArtifactView {
-    metadata: MetadataView,
+    metadata: PluginArtifactMetadata,
     source: PluginSource,
     installed_at: String,
     accepted_at: Option<String>,
 }
 
 impl ArtifactView {
-    fn new(value: InstalledPluginArtifact, service: &gateway_admin::PluginsService) -> Self {
+    fn new(value: InstalledPluginArtifact) -> Self {
         Self {
-            metadata: MetadataView::new(value.metadata, service),
+            metadata: value.metadata,
             source: value.source,
             installed_at: value.installed_at.to_rfc3339(),
             accepted_at: value.accepted_at.map(|value| value.to_rfc3339()),
@@ -41,36 +41,15 @@ impl ArtifactView {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MetadataView {
-    #[serde(flatten)]
-    metadata: PluginArtifactMetadata,
-    permission_descriptions: Vec<PluginPermissionDescription>,
-}
-
-impl MetadataView {
-    fn new(metadata: PluginArtifactMetadata, service: &gateway_admin::PluginsService) -> Self {
-        Self {
-            permission_descriptions: service
-                .permission_descriptions(&metadata.requested_permissions),
-            metadata,
-        }
-    }
-}
-
-#[derive(Serialize)]
 pub(super) struct VerifiedArtifactView {
-    metadata: MetadataView,
+    metadata: PluginArtifactMetadata,
     source: PluginSource,
 }
 
 impl VerifiedArtifactView {
-    pub(super) fn new(
-        value: VerifiedPluginArtifact,
-        service: &gateway_admin::PluginsService,
-    ) -> Self {
+    pub(super) fn new(value: VerifiedPluginArtifact) -> Self {
         Self {
-            metadata: MetadataView::new(value.metadata, service),
+            metadata: value.metadata,
             source: value.source,
         }
     }
@@ -86,9 +65,9 @@ pub(super) struct InstallResultView {
 }
 
 impl InstallResultView {
-    pub(super) fn new(value: PluginInstallResult, service: &gateway_admin::PluginsService) -> Self {
+    pub(super) fn new(value: PluginInstallResult) -> Self {
         Self {
-            artifact: ArtifactView::new(value.mutation.artifact, service),
+            artifact: ArtifactView::new(value.mutation.artifact),
             config_revision: value.mutation.config_revision.get(),
             default_instance_id: value.default_instance_id,
             configuration_required: value.configuration_required,
@@ -173,7 +152,7 @@ async fn list<S: SessionState + Send + Sync>(
         .await
         .map_err(map_admin_service_error)?
         .into_iter()
-        .map(|artifact| ArtifactView::new(artifact, state.admin_services().plugins()))
+        .map(ArtifactView::new)
         .collect();
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(items)))
 }
@@ -200,10 +179,7 @@ async fn verify_upload<S: SessionState + Send + Sync>(
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(VerifiedArtifactView::new(
-            result,
-            state.admin_services().plugins(),
-        )),
+        AdminEnvelope::ok(VerifiedArtifactView::new(result)),
     ))
 }
 
@@ -228,10 +204,7 @@ async fn upload<S: SessionState + Send + Sync>(
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
-        AdminEnvelope::ok(InstallResultView::new(
-            result,
-            state.admin_services().plugins(),
-        )),
+        AdminEnvelope::ok(InstallResultView::new(result)),
     ))
 }
 
@@ -254,10 +227,7 @@ async fn accept<S: SessionState + Send + Sync>(
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
-        AdminEnvelope::ok(InstallResultView::new(
-            result,
-            state.admin_services().plugins(),
-        )),
+        AdminEnvelope::ok(InstallResultView::new(result)),
     ))
 }
 

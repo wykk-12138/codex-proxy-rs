@@ -9,10 +9,7 @@ use gateway_admin::{
             UpdateClientKey, UpdateClientKeyBudgetLimits,
         },
         plugin_resources::PluginResourceOwner,
-        plugins::{
-            PluginSource,
-            instances::{PluginInstance, PluginPermissionGrant},
-        },
+        plugins::{PluginSource, instances::PluginInstance},
     },
     ports::{
         plugins::PluginStore as _,
@@ -582,8 +579,7 @@ async fn budget_database_outage_fails_closed() {
 async fn plugin_reset_owner(database: &TestDatabase) -> PluginResourceOwner {
     super::plugins::artifacts::initialize_revision(database).await;
     let store = PgPluginStore::new(database.pool.clone());
-    let mut package = super::plugins::artifacts::artifact('b', &["linux-x86_64"]);
-    package.metadata.requested_permissions = vec!["key_budgets".into()];
+    let package = super::plugins::artifacts::artifact('b', &["linux-x86_64"]);
     let installed = store
         .install_artifact(package, PluginSource::Upload, &context())
         .await
@@ -602,9 +598,7 @@ async fn plugin_reset_owner(database: &TestDatabase) -> PluginResourceOwner {
                 trusted_process: true,
                 configuration: serde_json::json!({}),
                 secrets: BTreeMap::new(),
-                grants: vec![PluginPermissionGrant {
-                    permission: "key_budgets".into(),
-                }],
+
                 bindings: vec![],
                 revision: Revision::new(1).unwrap(),
             },
@@ -682,7 +676,7 @@ async fn plugin_resets_share_the_native_ledger_and_each_call_resets_again() {
 }
 
 #[tokio::test]
-async fn plugin_reset_revalidates_current_authorization_without_changing_the_ledger() {
+async fn plugin_reset_revalidates_current_revision_without_changing_the_ledger() {
     let Some(database) = TestDatabase::create("plugin_budget_authorization").await else {
         return;
     };
@@ -698,7 +692,6 @@ async fn plugin_reset_revalidates_current_authorization_without_changing_the_led
         "update plugin_instances set revision=revision+1",
         "update plugin_instances set revision=revision-1, enabled=false",
         "update plugin_instances set enabled=true; update plugin_artifacts set accepted_at=null",
-        "update plugin_artifacts set accepted_at=now(), metadata_json=jsonb_set(metadata_json,'{requestedPermissions}','[]'::jsonb)",
     ] {
         sqlx::raw_sql(sql).execute(&database.pool).await.unwrap();
         assert_eq!(
@@ -718,8 +711,10 @@ async fn plugin_reset_revalidates_current_authorization_without_changing_the_led
         );
         assert_eq!(status(&database, "key").await, before);
     }
-    sqlx::query("update plugin_artifacts set metadata_json=jsonb_set(metadata_json,'{requestedPermissions}','[\"key_budgets\"]'::jsonb)")
-        .execute(&database.pool).await.unwrap();
+    sqlx::query("update plugin_artifacts set accepted_at=now()")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let wrong_artifact = PluginResourceOwner {
         artifact_sha256: "c".repeat(64),
         ..owner.clone()

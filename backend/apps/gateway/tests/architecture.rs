@@ -76,7 +76,12 @@ fn core_value_owners_do_not_depend_on_execution_or_routing() {
             "account/selection.rs" => Some(&["account", "concurrency", "identity", "validation"]),
             "concurrency.rs" => Some(&["error"]),
             "account/store.rs" => Some(&["account", "error", "identity", "validation"]),
-            path if path.starts_with("policy/") => Some(&["account", "policy", "validation"]),
+            path if path.starts_with("policy/") => {
+                Some(&["account", "identity", "policy", "validation"])
+            }
+            "settings/values.rs" | "settings/compiled.rs" => {
+                Some(&["account", "concurrency", "identity", "metering", "policy"])
+            }
             path if path.starts_with("account/") => Some(&["account", "identity", "validation"]),
             _ => None,
         };
@@ -378,7 +383,9 @@ fn workspace_modules_follow_conventional_file_layout() {
     let targets = test_source_roots();
     for member in WORKSPACE_MEMBERS {
         let member_root = backend_root().join(member);
-        assert_module_tree(&member_root.join("src"), &["lib.rs", "main.rs"]);
+        let src = member_root.join("src");
+        assert_module_tree(&src, &["lib.rs", "main.rs"]);
+        assert_directory_modules_have_children(&src, &["lib.rs", "main.rs"]);
 
         let tests = member_root.join("tests");
         if tests.is_dir() {
@@ -388,6 +395,29 @@ fn workspace_modules_follow_conventional_file_layout() {
                 &roots.iter().map(String::as_str).collect::<Vec<_>>(),
             );
         }
+    }
+}
+
+fn assert_directory_modules_have_children(root: &Path, crate_roots: &[&str]) {
+    let files = super::rust_files(root);
+    for relative in &files {
+        if crate_roots
+            .iter()
+            .any(|candidate| relative == Path::new(candidate))
+            || relative.file_name().and_then(|value| value.to_str()) != Some("mod.rs")
+        {
+            continue;
+        }
+
+        let directory = relative.parent().expect("mod.rs parent");
+        assert!(
+            files
+                .iter()
+                .any(|candidate| candidate != relative && candidate.starts_with(directory)),
+            "{} is a leaf module and must use {}",
+            root.join(relative).display(),
+            root.join(directory).with_extension("rs").display(),
+        );
     }
 }
 
@@ -498,6 +528,8 @@ fn root_test_scenario_allowed(member: &str, module: &Path) -> bool {
 
 fn assert_module_tree(root: &Path, crate_roots: &[&str]) {
     let files = super::rust_files(root);
+    // 同一父模块的所有子文件复用一次语法解析，计数仍保留重复声明检查。
+    let mut declarations = BTreeMap::<PathBuf, BTreeMap<String, usize>>::new();
     for relative in &files {
         if crate_roots
             .iter()
@@ -560,7 +592,14 @@ fn assert_module_tree(root: &Path, crate_roots: &[&str]) {
         };
         let declaration_count = declaration_parents
             .iter()
-            .map(|path| external_module_declaration_count(path, module_name))
+            .map(|path| {
+                declarations
+                    .entry(path.clone())
+                    .or_insert_with(|| external_module_declarations(path))
+                    .get(module_name)
+                    .copied()
+                    .unwrap_or_default()
+            })
             .sum::<usize>();
         assert_eq!(
             declaration_count,
@@ -571,23 +610,21 @@ fn assert_module_tree(root: &Path, crate_roots: &[&str]) {
     }
 }
 
-fn external_module_declaration_count(path: &Path, module_name: &str) -> usize {
+fn external_module_declarations(path: &Path) -> BTreeMap<String, usize> {
     if !path.is_file() {
-        return 0;
+        return BTreeMap::new();
     }
     let source = fs::read_to_string(path).expect("read parent module source");
     let syntax = syn::parse_file(&source).expect("parse parent module source");
-    syntax
-        .items
-        .iter()
-        .filter(|item| {
-            matches!(
-                item,
-                Item::Mod(module)
-                    if module.content.is_none() && module.ident == module_name
-            )
-        })
-        .count()
+    let mut declarations = BTreeMap::new();
+    for item in syntax.items {
+        if let Item::Mod(module) = item
+            && module.content.is_none()
+        {
+            *declarations.entry(module.ident.to_string()).or_default() += 1;
+        }
+    }
+    declarations
 }
 
 pub(super) fn backend_root() -> PathBuf {

@@ -1,6 +1,7 @@
 # 构建、联调与验证
 
-仅在准备工程、构建或验证插件时读取。这里给出执行入口，不复制 SDK 协议或安装 API 的字段手册。
+仅在准备工程、构建或验证插件时读取对应章节，分发规则只在准备分发时读取
+这里给出执行入口，不复制 SDK 协议或安装 API 的字段手册
 
 ## 工程与依赖
 
@@ -11,11 +12,11 @@
 | [codex-proxy-plugins](https://github.com/zyycn/codex-proxy-plugins) 的 `examples/workbench/` | 基础能力体验与文本工作流示例，按需选择功能，不整体复制 |
 | [codex-proxy-ui](https://github.com/zyycn/codex-proxy-ui) | 可选的 Vue UI 库、组件文档与 playground |
 
-先检查用户给定工程，或主仓父目录下的同级仓库是否存在；读取实际仓库约定、README、`Cargo.toml`、`package.json` 与锁文件。
+先检查用户给定工程、`modules/plugins` 子模块或同级仓库是否存在，读取实际仓库约定及当前步骤所需的 README 章节、依赖与锁文件，不预读无关前端配置
 只需中间件时不复制示例的管理 API、页面和相关权限；CLI 等能力从 SDK 对应合同起步，不给示例添加无关能力。
 
-本地源码联调可以使用 Cargo 路径依赖和 pnpm 的包级链接／override；路径必须真实可解析，并记录在消费方依赖配置中。
-这不等于允许从业务源码跨仓 `import .../src/...`，也不能证明第三方能独立安装。
+本仓库子模块联调使用[开发文档](../../../../docs/development.md#源码联调)中的 source 模式和本地 SDK 验证入口，不改写正式依赖或锁文件
+其他工程按其自身联调配置临时使用包级链接或 override，路径须真实可解析，不从业务源码跨仓 `import .../src/...`
 
 对外交付前核实 UI／SDK 的可用版本和安装来源：仅引用确实存在的发布版本，或包含所需合同的固定 Git commit；
 不要把浮动 `main` 当版本，也不要自动发布依赖以补齐条件。本地 override 尚未移除时，明确说明独立安装缺口。
@@ -23,7 +24,7 @@
 
 ## 复用示例
 
-找到 `codex-proxy-plugins` 后先读根目录与 `examples/workbench/README.md`。
+找到 `codex-proxy-plugins` 后，只读根目录约定与 `examples/workbench/README.md` 中当前能力或构建所需的章节
 该仓库使用 `bash scripts/package` 构建页面、Rust 二进制并打包；前端依赖和工具配置位于示例的 `frontend/`，根目录不维护 Node 工程。执行前核对脚本适用的插件路径和目标平台。
 
 | 任务 | 示例入口 |

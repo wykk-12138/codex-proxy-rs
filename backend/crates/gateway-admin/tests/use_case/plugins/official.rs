@@ -142,7 +142,7 @@ impl PluginPackageInspector for Fixture {
                 )],
                 icon: None,
                 contributes: Default::default(),
-                requested_permissions: Vec::new(),
+
                 configuration_schema: serde_json::json!({}),
                 secret_fields: Vec::new(),
                 state_namespaces: Vec::new(),
@@ -372,11 +372,10 @@ fn identity() -> OfficialPluginReleaseIdentity {
 
 fn plugin_host() -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "manifest_schema_versions": [2],
         "protocol_versions": [3],
         "capabilities": [{ "capability": "executor", "versions": [1] }],
-        "permissions": ["log"],
     })
 }
 

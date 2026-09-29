@@ -57,9 +57,7 @@ async fn candidate_rejects_undeclared_resources_invalid_routes_and_missing_publi
         candidate.instances[0].configuration["management_registration"][field] = value;
         assert!(runtime.prepare(candidate).await.is_err(), "{field}");
     }
-    let mut candidate = source.clone();
-    candidate.instances[0].grants.clear();
-    assert!(runtime.prepare(candidate).await.is_err());
+    assert!(runtime.prepare(source).await.is_ok());
     drop(core);
     drop(runtime);
     environment.close().await;

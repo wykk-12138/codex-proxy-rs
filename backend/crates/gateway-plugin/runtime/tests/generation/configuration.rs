@@ -1,7 +1,5 @@
 use gateway_admin::{
-    model::plugins::instances::{
-        PluginCapabilityBinding, PluginFailurePolicy, PluginPermissionGrant,
-    },
+    model::plugins::instances::{PluginCapabilityBinding, PluginFailurePolicy},
     ports::plugins::PluginPreparation,
 };
 use gateway_plugin_sdk::{Capability, Contributions, Stage};
@@ -108,16 +106,13 @@ async fn schema_rejection_identifies_the_field_without_exposing_configuration_va
 }
 
 #[tokio::test]
-async fn process_execution_requires_trust_and_undeclared_permissions_are_rejected() {
+async fn process_execution_requires_explicit_trust() {
     let (_cache, store, runtime) = super::setup().await;
     let mut instance = store.snapshot.lock().unwrap().instances[0].clone();
     instance.trusted_process = false;
     assert!(runtime.validate(instance.clone()).await.is_err());
     instance.trusted_process = true;
-    instance.grants.push(PluginPermissionGrant {
-        permission: "accounts".into(),
-    });
-    assert!(runtime.validate(instance).await.is_err());
+    assert!(runtime.validate(instance).await.is_ok());
 }
 
 #[tokio::test]
@@ -134,7 +129,7 @@ async fn secrets_must_be_declared_by_the_package() {
 async fn enabled_bindings_must_reference_the_exact_declared_contribution_and_stage() {
     let (_cache, store, runtime) =
         super::setup_with_contributions(Contributions::from([crate::support::contribution(
-            Capability::Usage,
+            Capability::Observer,
             vec![Stage::Observation],
             vec![],
             vec![],
@@ -143,7 +138,7 @@ async fn enabled_bindings_must_reference_the_exact_declared_contribution_and_sta
     let instance = store.snapshot.lock().unwrap().instances[0].clone();
     let mut valid = instance.clone();
     valid.bindings = vec![PluginCapabilityBinding {
-        contribution: "test.example.usage".into(),
+        contribution: "test.example.observer".into(),
         stage: "observation".into(),
         order: 0,
         failure_policy: PluginFailurePolicy::Observe,
@@ -151,6 +146,7 @@ async fn enabled_bindings_must_reference_the_exact_declared_contribution_and_sta
         account_group_ids: vec![],
         provider_ids: vec![],
         models: vec![],
+        event: Some("request_completed".into()),
         identity_bindings: vec![],
     }];
     assert!(runtime.validate(valid.clone()).await.is_ok());
@@ -158,7 +154,7 @@ async fn enabled_bindings_must_reference_the_exact_declared_contribution_and_sta
     for (contribution, stage) in [
         ("test.example.unknown", "observation"),
         ("other.example.usage", "observation"),
-        ("test.example.usage", "routing"),
+        ("test.example.observer", "routing"),
     ] {
         let mut candidate = valid.clone();
         candidate.bindings[0].contribution = contribution.into();

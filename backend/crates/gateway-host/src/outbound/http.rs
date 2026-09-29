@@ -30,6 +30,7 @@ struct ClientKey {
     addresses: Vec<std::net::SocketAddr>,
     proxy: Option<OutboundProxy>,
     scope: Option<String>,
+    websocket: bool,
 }
 
 pub struct HttpRequest {
@@ -94,7 +95,7 @@ impl HttpError {
         self
     }
 
-    fn sent(reason: &'static str) -> Self {
+    pub(super) fn sent(reason: &'static str) -> Self {
         Self {
             reason,
             kind: HttpErrorKind::Response,
@@ -139,7 +140,7 @@ impl HttpClient {
             return client.clone();
         }
         let connector = Connector::new(key.addresses.clone(), key.proxy.clone(), self.tls.clone());
-        let connector = connector::https(connector, self.tls.as_ref().clone(), true);
+        let connector = connector::https(connector, self.tls.as_ref().clone(), !key.websocket);
         let client = Client::builder(TokioExecutor::new())
             .pool_max_idle_per_host(4)
             .http1_max_buf_size(64 * 1024)
@@ -173,6 +174,21 @@ impl HttpClient {
         timeout: Duration,
         scope: Option<&str>,
     ) -> Result<HttpResponse, HttpError> {
+        let response = self
+            .send(request, proxy, network, timeout, scope, None)
+            .await?;
+        Ok(response.into_http())
+    }
+
+    pub(super) async fn send(
+        &self,
+        request: HttpRequest,
+        proxy: Option<&OutboundProxy>,
+        network: &NetworkPolicy,
+        timeout: Duration,
+        scope: Option<&str>,
+        websocket_key: Option<&str>,
+    ) -> Result<PendingResponse, HttpError> {
         if request.body.len() > 16 * 1024 * 1024
             || request.headers.len() > 128
             || timeout.is_zero()
@@ -241,6 +257,7 @@ impl HttpClient {
             addresses: addresses.clone(),
             proxy: proxy.cloned(),
             scope: scope.map(str::to_owned),
+            websocket: websocket_key.is_some(),
         });
         let mut uri: http::Uri = url
             .as_str()
@@ -278,6 +295,18 @@ impl HttpClient {
             }
         }
         let mut outgoing = http::Request::new(Full::new(Bytes::from(request.body)));
+        if let Some(key) = websocket_key {
+            headers.insert(
+                http::header::CONNECTION,
+                HeaderValue::from_static("Upgrade"),
+            );
+            headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+            headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+            headers.insert(
+                "sec-websocket-key",
+                HeaderValue::from_str(key).map_err(|_| HttpError::invalid("WebSocket key"))?,
+            );
+        }
         *outgoing.method_mut() = method;
         *outgoing.uri_mut() = uri;
         *outgoing.headers_mut() = headers;
@@ -311,17 +340,37 @@ impl HttpClient {
         {
             return Err(HttpError::sent("response headers"));
         }
-        Ok(HttpResponse {
+        Ok(PendingResponse {
             status,
             headers,
+            response,
+            permit,
+            deadline,
+        })
+    }
+}
+
+pub(super) struct PendingResponse {
+    pub(super) status: u16,
+    pub(super) headers: Vec<(String, Vec<u8>)>,
+    pub(super) response: http::Response<hyper::body::Incoming>,
+    pub(super) permit: OwnedSemaphorePermit,
+    pub(super) deadline: Instant,
+}
+
+impl PendingResponse {
+    pub(super) fn into_http(self) -> HttpResponse {
+        HttpResponse {
+            status: self.status,
+            headers: self.headers,
             body: HttpBody {
-                response: response.into_body(),
+                response: self.response.into_body(),
                 pending: Bytes::new(),
                 received: 0,
-                deadline,
-                _permit: permit,
+                deadline: self.deadline,
+                _permit: self.permit,
             },
-        })
+        }
     }
 }
 

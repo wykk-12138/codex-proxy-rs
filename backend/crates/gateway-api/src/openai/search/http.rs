@@ -13,7 +13,8 @@ use gateway_core::error::{GatewayError, GatewayErrorKind};
 use gateway_core::operation::{Operation, OperationKind, RawJsonPayload, StandaloneSearchRequest};
 
 use crate::ApiState;
-use crate::openai::middleware::{HttpMiddlewareInput, request_headers};
+use crate::middleware::headers::encode_headers;
+use crate::openai::middleware::RequestInput;
 use crate::openai::{
     auth::{authenticate_client, client_access_error_response},
     endpoint::provider_endpoint_response,
@@ -42,13 +43,13 @@ pub(crate) async fn standalone_search(
     provider_endpoint_response(
         service.clone(),
         client,
-        HttpMiddlewareInput {
+        RequestInput {
             endpoint: SEARCH_PATH.to_owned(),
             protocol: OPENAI_PROTOCOL.to_owned(),
             operation: Some(OperationKind::Search),
             transport: ClientTransport::HttpJson,
             model_hint: None,
-            headers: request_headers(&headers),
+            headers: encode_headers(&headers),
             body,
         },
         client_ip,

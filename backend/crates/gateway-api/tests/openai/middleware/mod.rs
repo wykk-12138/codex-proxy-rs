@@ -28,6 +28,7 @@ pub(super) struct RequestMiddleware {
     pub(super) response_actions: Mutex<VecDeque<ResponseFrameAction>>,
     pub(super) response_headers: Vec<MiddlewareHeader>,
     pub(super) short_circuit_json: Option<Bytes>,
+    pub(super) settings: Option<fn(&mut gateway_core::settings::ExecutionSettings)>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,8 +93,8 @@ impl MiddlewarePlan for RequestMiddleware {
     fn handle(
         &self,
         context: MiddlewareContext,
-        request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        mut request: MiddlewareRequest,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         assert_eq!(context.mount(), MiddlewareMount::Request);
         assert_eq!(context.operation(), self.expected_operation);
@@ -107,6 +108,18 @@ impl MiddlewarePlan for RequestMiddleware {
         let actions = std::mem::take(&mut *self.response_actions.lock().unwrap());
         let response_headers = self.response_headers.clone();
         let short_circuit_json = self.short_circuit_json.clone();
+        if let Some(update) = self.settings {
+            let settings = request.settings().expect("effective request settings");
+            let mut values = settings.execution_values().expect("execution scope");
+            update(&mut values);
+            let updated = settings
+                .replace_execution(&values, "test-middleware")
+                .map_err(|_| MiddlewareError::InvalidState);
+            request = match updated {
+                Ok(settings) => request.with_settings(settings),
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
+        }
         Box::pin(async move {
             if let Some(body) = short_circuit_json {
                 return Ok(MiddlewareResponse::new(

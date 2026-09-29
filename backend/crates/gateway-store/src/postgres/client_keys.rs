@@ -724,8 +724,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 .await
                 .map_err(|_| map_error(postgres_unavailable("begin budget limits update")))?,
             ClientKeyBudgetMutationOrigin::Plugin(owner) => {
-                super::plugins::begin_authorized_mutation(&self.keys.pool, owner, "key_budgets")
-                    .await?
+                super::plugins::begin_plugin_mutation(&self.keys.pool, owner).await?
             }
         };
         // 保持与完整 Key 编辑相同的锁顺序；绝不读出整份配置再覆盖写回。

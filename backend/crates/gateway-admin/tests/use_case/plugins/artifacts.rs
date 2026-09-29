@@ -337,7 +337,7 @@ async fn existing_plugin_instance_prevents_an_extra_default_instance() {
         trusted_process: false,
         configuration: json!({}),
         secrets: BTreeMap::new(),
-        grants: Vec::new(),
+
         bindings: Vec::new(),
         revision: revision(1),
     };
@@ -389,7 +389,7 @@ fn metadata(with_required_default: bool) -> PluginArtifactMetadata {
                 contribution("test.example.middleware", &["observation", "request"]),
             ),
         ]),
-        requested_permissions: vec!["network".into()],
+
         configuration_schema: json!({
             "type":"object",
             "properties": {

@@ -37,22 +37,17 @@ fn append_middleware_grok_headers(
     target: &mut Vec<crate::transport::GrokHeader>,
     headers: &[MiddlewareHeader],
 ) -> Result<(), ProviderError> {
-    let provider_header_count = target.len();
+    let mut replaced = std::collections::HashSet::new();
     for header in headers {
-        if target[..provider_header_count]
-            .iter()
-            .any(|existing| existing.name().eq_ignore_ascii_case(header.name()))
-        {
-            return Err(provider_error(
-                ProviderErrorKind::Protocol,
-                UpstreamSendState::NotSent,
-            ));
+        if replaced.insert(header.name().to_ascii_lowercase()) {
+            target.retain(|existing| !existing.name().eq_ignore_ascii_case(header.name()));
         }
         let value = std::str::from_utf8(header.value())
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
-        target.push(crate::transport::GrokHeader::public(
+        // 插件可写任意字段，值不进入 Debug；transport 仍读取完整原值。
+        target.push(crate::transport::GrokHeader::sensitive(
             header.name().to_owned(),
-            value.to_owned(),
+            crate::SecretValue::new(value),
         ));
     }
     Ok(())

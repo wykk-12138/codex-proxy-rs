@@ -130,7 +130,6 @@ pub struct RuntimeSettingsUpdate {
         gateway_core::routing::ProviderKind,
         Option<gateway_core::account::OpaqueProviderData>,
     >,
-    pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
     pub max_concurrent_per_account: u32,
@@ -166,10 +165,6 @@ impl fmt::Debug for RuntimeSettingsUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeSettingsUpdate")
-            .field(
-                "admin_api_key",
-                &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
-            )
             .field("rotation_strategy", &self.rotation_strategy)
             .field("request_location_enabled", &self.request_location_enabled)
             .field("request_location", &self.request_location)
@@ -477,42 +472,40 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     let next = sqlx::query_scalar::<_, i64>(
         "update runtime_settings
              set config_revision = config_revision + 1,
-	                 admin_api_key = $1,
-	                 refresh_margin_seconds = $2,
-	                 refresh_concurrency = $3,
-	                 max_concurrent_per_account = $4,
-	                 request_interval_ms = $5,
-	                 rotation_strategy = $6,
-	                 model_mappings_json = $7,
-	                 usage_retention_days = $8,
-	                 ops_event_retention_days = $9,
-	                 audit_retention_days = $10,
-	                 min_codex_desktop_version = $11,
-	                 min_codex_cli_version = $12,
-                     max_waiting_per_key = $13,
-                     max_waiting_per_account = $14,
-                     concurrency_wait_timeout_seconds = $15,
-                     account_auto_freeze_enabled = $16,
-                     account_auto_freeze_threshold = $17,
-                     account_auto_freeze_window_seconds = $18,
-                     account_auto_freeze_duration_seconds = $19,
-                     account_auto_freeze_probe_enabled = $20,
-                     account_auto_freeze_probe_model = $21,
-                     account_auto_freeze_adaptive_concurrency = $22,
-                     request_location_json = $23,
-                     request_location_enabled = $24,
-                     responses_max_decompressed_body_bytes = $25,
-	                 provider_request_profiles_json = (provider_request_profiles_json - $26::text[]) || $27::jsonb,
-                     account_warmup_enabled = $28,
-                     account_warmup_schedule_time = $29,
-                     account_warmup_model = $30,
-                     smart_scheduling_json = $31,
-                     codex_turn_metadata_strip_workspaces = $32,
+	                 refresh_margin_seconds = $1,
+	                 refresh_concurrency = $2,
+	                 max_concurrent_per_account = $3,
+	                 request_interval_ms = $4,
+	                 rotation_strategy = $5,
+	                 model_mappings_json = $6,
+	                 usage_retention_days = $7,
+	                 ops_event_retention_days = $8,
+	                 audit_retention_days = $9,
+	                 min_codex_desktop_version = $10,
+	                 min_codex_cli_version = $11,
+                     max_waiting_per_key = $12,
+                     max_waiting_per_account = $13,
+                     concurrency_wait_timeout_seconds = $14,
+                     account_auto_freeze_enabled = $15,
+                     account_auto_freeze_threshold = $16,
+                     account_auto_freeze_window_seconds = $17,
+                     account_auto_freeze_duration_seconds = $18,
+                     account_auto_freeze_probe_enabled = $19,
+                     account_auto_freeze_probe_model = $20,
+                     account_auto_freeze_adaptive_concurrency = $21,
+                     request_location_json = $22,
+                     request_location_enabled = $23,
+                     responses_max_decompressed_body_bytes = $24,
+	                 provider_request_profiles_json = (provider_request_profiles_json - $25::text[]) || $26::jsonb,
+                     account_warmup_enabled = $27,
+                     account_warmup_schedule_time = $28,
+                     account_warmup_model = $29,
+                     smart_scheduling_json = $30,
+                     codex_turn_metadata_strip_workspaces = $31,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
     )
-    .bind(update.admin_api_key.as_deref())
     .bind(refresh_margin_seconds)
     .bind(i64::from(update.refresh_concurrency))
     .bind(i64::from(update.max_concurrent_per_account))

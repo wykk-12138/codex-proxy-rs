@@ -223,7 +223,7 @@ async fn observation_callbacks_use_typed_state_crud_and_reject_undeclared_namesp
     let cache = tempfile::tempdir().unwrap();
     let marker = cache.path().join("state.jsonl");
     let contributes = Contributions::from([crate::support::contribution(
-        Capability::RequestLifecycle,
+        Capability::Observer,
         vec![Stage::Observation],
         vec![],
         vec![],
@@ -244,7 +244,6 @@ async fn observation_callbacks_use_typed_state_crud_and_reject_undeclared_namesp
     };
     let archive = crate::support::package_with_contributions_and_state(
         crate::support::worker(),
-        vec![],
         contributes,
         vec![state_namespace],
     );
@@ -269,9 +268,9 @@ async fn observation_callbacks_use_typed_state_crud_and_reject_undeclared_namesp
             "state_marker": marker,
         }),
         secrets: BTreeMap::new(),
-        grants: vec![],
+
         bindings: vec![PluginCapabilityBinding {
-            contribution: "test.example.requestLifecycle".into(),
+            contribution: "test.example.observer".into(),
             stage: "observation".into(),
             order: 0,
             failure_policy: PluginFailurePolicy::Observe,
@@ -279,6 +278,7 @@ async fn observation_callbacks_use_typed_state_crud_and_reject_undeclared_namesp
             account_group_ids: vec![],
             provider_ids: vec!["openai".into()],
             models: vec!["gpt-state".into()],
+            event: Some("request_completed".into()),
             identity_bindings: vec![],
         }],
         revision: Revision::new(1).unwrap(),

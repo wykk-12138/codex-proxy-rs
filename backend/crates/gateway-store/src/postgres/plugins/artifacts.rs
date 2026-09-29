@@ -54,13 +54,9 @@ pub(super) fn not_found() -> AdminStoreError {
 pub(super) fn decode_metadata(
     row: &sqlx::postgres::PgRow,
 ) -> AdminStoreResult<PluginArtifactMetadata> {
-    let mut metadata: serde_json::Value =
+    let metadata: sqlx::types::Json<PluginArtifactMetadata> =
         row.try_get("metadata_json").map_err(|_| unavailable())?;
-    // 兼容开发期已写入的展示说明；忽略这一旧字段，其他未知字段仍严格拒绝。
-    if let Some(metadata) = metadata.as_object_mut() {
-        metadata.remove("permissionDescriptions");
-    }
-    serde_json::from_value(metadata).map_err(|_| unavailable())
+    Ok(metadata.0)
 }
 
 fn decode(row: &sqlx::postgres::PgRow) -> AdminStoreResult<InstalledPluginArtifact> {
@@ -322,7 +318,7 @@ impl PluginStore for PgPluginStore {
                     "accept",
                     "plugin_artifact",
                     digest,
-                    vec!["permissions".into()],
+                    vec!["acceptedAt".into()],
                 ),
                 revision,
             )

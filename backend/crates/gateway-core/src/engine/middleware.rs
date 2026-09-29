@@ -28,10 +28,17 @@ use crate::operation::{
 };
 use crate::policy::ClientApiKeyId;
 use crate::runtime::extensions::{ExtensionSetId, ExtensionSetReference};
+use crate::settings::RequestSettings;
 
 /// 中间件在一次逻辑请求中的挂载位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MiddlewareMount {
+    /// 所有 HTTP 接口的认证、路由和正文解析之前。
+    Http,
+    /// 下游 WebSocket 消息在默认解析和写入之前组合。
+    WebSocket,
+    /// 类型化公开服务在执行默认业务逻辑前组合。
+    Service,
     /// 客户端请求外层；一次逻辑请求只执行一次。
     Request,
     /// 受管 Provider attempt 内层；每次真实 retry 都重新建立。
@@ -94,6 +101,7 @@ impl fmt::Debug for MiddlewareHeader {
 /// 一次中间件调用可修改的请求事实。
 #[derive(Clone, PartialEq, Eq)]
 pub struct MiddlewareRequest {
+    settings: Option<RequestSettings>,
     protocol: String,
     headers: Vec<MiddlewareHeader>,
     body: Bytes,
@@ -114,6 +122,7 @@ impl MiddlewareRequest {
     pub fn new(protocol: impl Into<String>, headers: Vec<MiddlewareHeader>, body: Bytes) -> Self {
         let protocol = protocol.into();
         Self {
+            settings: None,
             original_protocol: protocol.clone(),
             original_body: body.clone(),
             capabilities: None,
@@ -121,6 +130,17 @@ impl MiddlewareRequest {
             headers,
             body,
         }
+    }
+
+    #[must_use]
+    pub fn with_settings(mut self, settings: RequestSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> Option<&RequestSettings> {
+        self.settings.as_ref()
     }
 
     #[must_use]
@@ -265,10 +285,16 @@ impl MiddlewareFrame {
 
     /// 返回正文是否经过至少一个中间件的替换、展开或丢弃映射。
     ///
-    /// 该事实只在宿主进程内传播，不进入插件 RPC wire，插件不能自行伪造。
+    /// 插件可读取该事实；对快照的修改不改变宿主确认的来源。
     #[must_use]
     pub const fn transformed(&self) -> bool {
         self.transformed
+    }
+
+    /// 返回来源事件的只读视图；读取不转移原结算和会话状态的所有权。
+    #[must_use]
+    pub fn event(&self) -> Option<&ProviderEvent> {
+        self.envelope.as_ref().map(MiddlewareFrameEnvelope::event)
     }
 
     /// 继承宿主确认的改写事实；`false` 不能清除内层已经记录的改写。
@@ -286,7 +312,7 @@ impl MiddlewareFrame {
     /// 拆出插件可见正文与只能由宿主原样搬运的事实信封。
     ///
     /// Runtime 在一对多转换时必须把信封附到最后一个输出；这样 `Completed` 不会在
-    /// 前置输出交付前提前终结。信封不能被读取、序列化、复制或伪造。
+    /// 前置输出交付前提前终结。读取快照不会转移信封的计量所有权。
     #[must_use]
     pub fn into_parts(
         self,
@@ -347,11 +373,18 @@ impl fmt::Debug for MiddlewareFrame {
     }
 }
 
-/// Runtime 可移动但不能检查或构造的 Core 事实信封。
+/// 可读取完整事件、只能随正文移动一次的 Core 事实信封。
 ///
 /// 该类型故意不实现 `Clone`，防止同一 usage/cost 在一对多响应中被复制。
 pub struct MiddlewareFrameEnvelope {
     event: ProviderEvent,
+}
+
+impl MiddlewareFrameEnvelope {
+    #[must_use]
+    pub const fn event(&self) -> &ProviderEvent {
+        &self.event
+    }
 }
 
 impl fmt::Debug for MiddlewareFrameEnvelope {
@@ -453,7 +486,7 @@ impl MiddlewareResponse {
         )
     }
 
-    /// 搬运宿主 terminal 的不透明来源事实；Runtime 不得序列化或自行构造。
+    /// 搬运宿主 terminal 的来源事实；读取快照不转移其所有权。
     #[must_use]
     pub fn with_envelope(mut self, envelope: MiddlewareResponseEnvelope) -> Self {
         self.envelope = Some(envelope);
@@ -485,6 +518,11 @@ pub struct MiddlewareResponseEnvelope {
 }
 
 impl MiddlewareResponseEnvelope {
+    #[must_use]
+    pub const fn metadata(&self) -> &ProviderCallMetadata {
+        &self.metadata
+    }
+
     pub(crate) fn into_provider_metadata(self) -> ProviderCallMetadata {
         self.metadata
     }
@@ -498,9 +536,10 @@ impl fmt::Debug for MiddlewareResponseEnvelope {
     }
 }
 
-/// Core 已冻结、但不会序列化敏感身份的调用事实。
+/// Core 冻结的调用事实；完整业务身份可由插件读取。
 #[derive(Clone)]
 pub struct MiddlewareContext {
+    plan: Option<FrozenMiddlewarePlan>,
     request_id: ModelRequestId,
     mount: MiddlewareMount,
     attempt_index: Option<NonZeroU32>,
@@ -519,6 +558,11 @@ pub struct MiddlewareContext {
 }
 
 impl MiddlewareContext {
+    #[must_use]
+    pub fn plan(&self) -> Option<FrozenMiddlewarePlan> {
+        self.plan.clone()
+    }
+
     #[must_use]
     pub fn new(target: MiddlewareTarget, authority: MiddlewareAuthority) -> Self {
         let MiddlewareTarget {
@@ -541,6 +585,7 @@ impl MiddlewareContext {
             execution_effects,
         } = authority;
         Self {
+            plan: None,
             request_id,
             mount,
             attempt_index,
@@ -604,13 +649,13 @@ impl MiddlewareContext {
         self.account_id.as_ref()
     }
 
-    /// 只供宿主 Runtime 匹配冻结 binding；不得序列化给插件。
+    /// 返回冻结的业务归属，也用于匹配 binding。
     #[must_use]
     pub const fn client_key_id(&self) -> &ClientApiKeyId {
         &self.client_key_id
     }
 
-    /// 只供宿主 Runtime 匹配冻结 binding；不得序列化给插件。
+    /// 返回冻结的业务归属，也用于匹配 binding。
     #[must_use]
     pub fn account_group_ids(&self) -> &[AccountGroupId] {
         &self.account_group_ids
@@ -651,7 +696,7 @@ pub struct MiddlewareTarget {
     pub account_id: Option<ProviderAccountId>,
 }
 
-/// Runtime 只用于授权求交的冻结主体；字段不得进入插件 wire。
+/// 冻结的业务主体与生命周期；不用于裁剪插件权限。
 pub struct MiddlewareAuthority {
     pub client_key_id: ClientApiKeyId,
     pub account_group_ids: Arc<[AccountGroupId]>,
@@ -684,6 +729,11 @@ impl fmt::Debug for MiddlewareContext {
 pub enum MiddlewareError {
     Rejected,
     Fault,
+    /// 保留跨进程失败，供外层插件读取；客户端响应由协议 owner 决定。
+    Remote {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        rejected: bool,
+    },
     InvalidState,
     Gateway(GatewayError),
     Engine(EngineError),
@@ -695,6 +745,7 @@ impl fmt::Display for MiddlewareError {
         formatter.write_str(match self {
             Self::Rejected => "middleware rejected the request",
             Self::Fault => "middleware call failed",
+            Self::Remote { source, .. } => return fmt::Display::fmt(source, formatter),
             Self::InvalidState => "middleware state is invalid",
             Self::Gateway(_) => "gateway middleware terminal failed",
             Self::Engine(_) => "execution middleware terminal failed",
@@ -703,7 +754,24 @@ impl fmt::Display for MiddlewareError {
     }
 }
 
-impl std::error::Error for MiddlewareError {}
+impl std::error::Error for MiddlewareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Remote { source, .. } => Some(source.as_ref()),
+            Self::Gateway(error) => Some(error),
+            Self::Engine(error) => Some(error),
+            Self::Provider(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl MiddlewareError {
+    #[must_use]
+    pub const fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected | Self::Remote { rejected: true, .. })
+    }
+}
 
 impl From<GatewayError> for MiddlewareError {
     fn from(error: GatewayError) -> Self {
@@ -724,20 +792,58 @@ impl From<ProviderError> for MiddlewareError {
 }
 
 /// 绑定当前调用且只能消费一次的宿主续体。
-pub trait MiddlewareNext: Send {
-    fn run(
-        self: Box<Self>,
-        request: MiddlewareRequest,
-    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>>;
-}
+pub type MiddlewareNext =
+    crate::middleware::Next<MiddlewareRequest, MiddlewareResponse, MiddlewareError>;
 
 /// 一个发布代次冻结的统一数据面中间件计划。
 pub trait MiddlewarePlan: Send + Sync + fmt::Debug {
+    fn has_service(&self) -> bool {
+        false
+    }
+    fn handle_service(
+        &self,
+        _context: crate::middleware::service::Context,
+        input: crate::middleware::service::Value,
+        next: crate::middleware::service::Next,
+    ) -> BoxFuture<
+        'static,
+        Result<crate::middleware::service::Value, crate::middleware::service::Error>,
+    > {
+        next.run(input)
+    }
+
+    fn has_websocket(&self) -> bool {
+        false
+    }
+    fn handle_websocket(
+        &self,
+        _context: crate::middleware::websocket::Context,
+        message: crate::middleware::websocket::Message,
+        next: crate::middleware::websocket::Next,
+    ) -> BoxFuture<'static, Result<Option<crate::middleware::websocket::Message>, MiddlewareError>>
+    {
+        next.run(message)
+    }
+
+    /// HTTP 入口在认证、路由与正文解析之前组合，无匹配时保留直接路径。
+    fn has_http(&self) -> bool {
+        false
+    }
+
+    fn handle_http(
+        &self,
+        _context: crate::middleware::http::Context,
+        request: crate::middleware::http::Request,
+        next: crate::middleware::http::Next,
+    ) -> BoxFuture<'static, Result<crate::middleware::http::Response, MiddlewareError>> {
+        next.run(request)
+    }
+
     fn handle(
         &self,
         context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>>;
 }
 
@@ -750,6 +856,51 @@ pub struct FrozenMiddlewarePlan {
 
 impl FrozenMiddlewarePlan {
     #[must_use]
+    pub fn has_service(&self) -> bool {
+        self.plan.has_service()
+    }
+    pub fn handle_service(
+        &self,
+        context: crate::middleware::service::Context,
+        input: crate::middleware::service::Value,
+        next: crate::middleware::service::Next,
+    ) -> BoxFuture<
+        'static,
+        Result<crate::middleware::service::Value, crate::middleware::service::Error>,
+    > {
+        self.plan.handle_service(context, input, next)
+    }
+
+    #[must_use]
+    pub fn has_websocket(&self) -> bool {
+        self.plan.has_websocket()
+    }
+    pub fn handle_websocket(
+        &self,
+        context: crate::middleware::websocket::Context,
+        message: crate::middleware::websocket::Message,
+        next: crate::middleware::websocket::Next,
+    ) -> BoxFuture<'static, Result<Option<crate::middleware::websocket::Message>, MiddlewareError>>
+    {
+        self.plan.handle_websocket(context, message, next)
+    }
+
+    #[must_use]
+    pub fn has_http(&self) -> bool {
+        self.plan.has_http()
+    }
+
+    pub fn handle_http(
+        &self,
+        mut context: crate::middleware::http::Context,
+        request: crate::middleware::http::Request,
+        next: crate::middleware::http::Next,
+    ) -> BoxFuture<'static, Result<crate::middleware::http::Response, MiddlewareError>> {
+        context.plan = Some(self.clone());
+        self.plan.handle_http(context, request, next)
+    }
+
+    #[must_use]
     pub fn new(plan: Arc<dyn MiddlewarePlan>, generation: ExtensionSetReference) -> Self {
         Self {
             plan,
@@ -759,10 +910,11 @@ impl FrozenMiddlewarePlan {
 
     pub fn handle(
         &self,
-        context: MiddlewareContext,
+        mut context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+        context.plan = Some(self.clone());
         self.plan.handle(context, request, next)
     }
 }

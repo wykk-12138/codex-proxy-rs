@@ -3,7 +3,7 @@ import type { ConfigurePluginInstanceRequest, PluginArtifact, PluginInstance, Pl
 import { BaseButton, BaseModal, BaseSegmented, toast } from '@codex-proxy/ui'
 import { Blocks, Save, Settings2, ShieldCheck } from '@lucide/vue'
 import { computed, nextTick, ref, shallowRef, useTemplateRef, watch } from 'vue'
-import { cloneJsonValue, pluginContributionForCapability } from '../utils/model'
+import { cloneJsonValue, pluginContributionForCapability, pluginRequestBindingEntries } from '../utils/model'
 import PluginBindingEditor from './PluginBindingEditor.vue'
 import PluginConfigurationFields from './PluginConfigurationFields.vue'
 import PluginFrontendAuthenticationEditor from './PluginFrontendAuthenticationEditor.vue'
@@ -37,7 +37,7 @@ const authenticationBinding = computed({
     bindings.value = binding ? [...others, cloneJsonValue(binding)] : others
   },
 })
-const hasRequestBindings = computed(() => Object.values(props.artifact?.metadata.contributes ?? {}).some(contribution => contribution.stages.some(stage => ['request', 'attempt', 'routing', 'scheduling', 'retry', 'observation'].includes(stage))))
+const hasRequestBindings = computed(() => props.artifact && pluginRequestBindingEntries(props.artifact.metadata).length > 0)
 const sections = computed(() => [
   { label: '插件参数', value: 'general', icon: Settings2 },
   ...(hasRequestBindings.value ? [{ label: '高级设置', value: 'requests', icon: Blocks }] : []),

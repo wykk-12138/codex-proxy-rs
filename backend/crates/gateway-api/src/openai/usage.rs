@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::{
     ApiState,
     auth::SessionState as _,
-    openai::middleware::{self as plugin_middleware, HttpMiddlewareInput},
+    openai::middleware::{self as plugin_middleware, RequestInput},
 };
 
 use super::{
@@ -48,7 +48,7 @@ async fn usage(
     plugin_middleware::query_response(
         state.openai().execution(),
         client,
-        HttpMiddlewareInput::query(super::router::USAGE_PATH.to_owned(), None, &headers),
+        RequestInput::query(super::router::USAGE_PATH.to_owned(), None, &headers),
         move |client| usage_response(state, client, uri),
     )
     .await

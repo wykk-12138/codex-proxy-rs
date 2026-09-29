@@ -110,7 +110,7 @@ impl PluginResourceStore for PgPluginStore {
         context: &MutationContext,
     ) -> AdminStoreResult<ResourceMutation<ManagedResource>> {
         validate_resource_key(&resource_key)?;
-        let mut tx = super::begin_authorized_mutation(&self.pool, owner, "groups").await?;
+        let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         if let Some(row) = sqlx::query(
             "select g.id,g.name,g.enabled from plugin_group_resources r
@@ -168,7 +168,7 @@ impl PluginResourceStore for PgPluginStore {
         for group in &groups {
             validate_resource_key(group)?;
         }
-        let mut tx = super::begin_authorized_mutation(&self.pool, owner, "keys").await?;
+        let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         if let Some(row) = sqlx::query(
             "select k.id,k.name,k.enabled from plugin_key_resources r
@@ -238,7 +238,7 @@ impl PluginResourceStore for PgPluginStore {
         {
             return Err(invalid());
         }
-        let mut tx = super::begin_authorized_mutation(&self.pool, owner, "groups").await?;
+        let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         let group: String = sqlx::query_scalar(
             "select group_id from plugin_group_resources where instance_id=$1 and resource_key=$2",

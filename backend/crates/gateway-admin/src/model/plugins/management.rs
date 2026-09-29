@@ -78,6 +78,7 @@ pub struct PluginManagementRequest {
     pub path: String,
     pub query: String,
     pub content_type: Option<String>,
+    pub headers: Vec<gateway_core::engine::middleware::MiddlewareHeader>,
     pub body: Vec<u8>,
     pub request_id: String,
 }
@@ -85,5 +86,6 @@ pub struct PluginManagementRequest {
 pub struct PluginManagementResponse {
     pub status: u16,
     pub content_type: String,
+    pub headers: Vec<gateway_core::engine::middleware::MiddlewareHeader>,
     pub body: Arc<[u8]>,
 }

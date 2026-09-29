@@ -137,7 +137,6 @@ impl From<PluginInstanceView> for InstanceView {
             trusted_process: _,
             configuration,
             secrets,
-            grants: _,
             bindings,
             revision,
         } = value.instance;

@@ -49,7 +49,7 @@ const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
 type ReqwestClientCacheKey = (Option<String>, String, Duration);
 type ReqwestClientCache = Mutex<HashMap<ReqwestClientCacheKey, Client>>;
 
-/// 构建带缓存、自动协商 HTTP/2 的 reqwest Client。
+/// 构建复用连接池的 Codex HTTP 客户端。
 pub fn build_reqwest_client() -> Result<Client, CustomCaError> {
     build_account_http_client("", None)
 }
@@ -82,17 +82,12 @@ pub(super) fn build_account_http_client_with_timeout(
         return Ok(client.clone());
     }
 
+    // 连接池与 TCP、HTTP/2 保活沿用官方 Core 的 reqwest 默认值。
     let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(4)
-        .pool_idle_timeout(None::<Duration>)
         .connect_timeout(timeout)
-        .connector_layer(super::connection::ConnectionLayer)
-        .tcp_keepalive(Duration::from_secs(30))
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(5))
-        .http2_keep_alive_while_idle(true);
+        .connector_layer(super::connection::ConnectionLayer);
     if let Some(proxy) = proxy {
         builder = builder.proxy(
             reqwest::Proxy::all(proxy.expose_url())
@@ -229,8 +224,6 @@ pub enum CodexClientError {
     #[error("invalid request header value: {0}")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
     /// 中间件业务头试图覆盖 Provider 已构造的受管头。
-    #[error("middleware request header conflicts with a provider-managed header")]
-    MiddlewareHeaderConflict,
     /// SSE 响应解析失败。
     #[error("invalid upstream SSE response: {0}")]
     InvalidSse(#[from] SseError),
@@ -303,9 +296,6 @@ impl fmt::Debug for CodexClientError {
             Self::InvalidHeaderValue(_) => {
                 formatter.write_str("CodexClientError::InvalidHeaderValue([REDACTED])")
             }
-            Self::MiddlewareHeaderConflict => {
-                formatter.write_str("CodexClientError::MiddlewareHeaderConflict")
-            }
             Self::InvalidSse(_) => formatter.write_str("CodexClientError::InvalidSse([REDACTED])"),
             Self::ModelCatalog(error) => formatter
                 .debug_tuple("CodexClientError::ModelCatalog")
@@ -360,7 +350,6 @@ impl CodexClientError {
             | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
-            | Self::MiddlewareHeaderConflict
             | Self::WebSocketEncode(_)
             | Self::RequestBodyEncode(_)
             | Self::RequestCompression(_) => None,

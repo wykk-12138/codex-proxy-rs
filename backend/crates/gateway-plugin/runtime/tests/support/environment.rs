@@ -14,7 +14,7 @@ use gateway_admin::{
             },
             instances::{
                 PluginCapabilityBinding, PluginFailurePolicy, PluginFrontendIdentityBinding,
-                PluginInstance, PluginPermissionGrant,
+                PluginInstance,
             },
         },
         pricing::PricingSyncPreview,
@@ -165,26 +165,17 @@ impl Environment {
     pub async fn plugin(
         &self,
         configuration: serde_json::Value,
-        grants: Vec<PluginPermissionGrant>,
     ) -> (Arc<PluginRuntime>, gateway_core::CoreBundle) {
-        self.install_plugin(configuration, grants).await;
+        self.install_plugin(configuration).await;
         self.runtime().await
     }
 
-    pub async fn install_plugin(
-        &self,
-        configuration: serde_json::Value,
-        grants: Vec<PluginPermissionGrant>,
-    ) {
+    pub async fn install_plugin(&self, configuration: serde_json::Value) {
         let plugin_id = configuration
             .get("plugin_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| super::DEFAULT_PLUGIN_ID.to_owned());
-        let permissions = grants
-            .iter()
-            .map(|grant| serde_json::from_value(json!(grant.permission)).unwrap())
-            .collect();
         let mut contributes = Contributions::new();
         if configuration.get("maintenance_fixture").is_some() {
             contributes.extend([super::contribution_for_id(
@@ -214,14 +205,45 @@ impl Environment {
                 vec![],
             )]);
         }
-        let has_middleware = configuration.get("middleware_marker").is_some();
+        let has_upstream_adapter = configuration.get("upstream_registration").is_some();
+        if has_upstream_adapter {
+            contributes.extend([super::contribution_for_id(
+                &plugin_id,
+                Capability::UpstreamAdapter,
+                vec![Stage::Upstream],
+                vec!["openai".into()],
+                vec!["openai".into()],
+            )]);
+        }
+        let has_service = configuration["service"] == true;
+        let has_http = configuration["http"] == true;
+        let has_middleware =
+            configuration.get("middleware_marker").is_some() || has_service || has_http;
         if has_middleware {
             contributes.extend([super::contribution_for_id(
                 &plugin_id,
                 Capability::Middleware,
-                vec![Stage::Request],
-                vec!["openai".into()],
-                vec!["openai".into()],
+                vec![if has_service {
+                    Stage::Service
+                } else if has_http {
+                    Stage::Http
+                } else {
+                    Stage::Request
+                }],
+                vec![if has_service {
+                    "service".into()
+                } else if has_http {
+                    "http".into()
+                } else {
+                    "openai".into()
+                }],
+                vec![if has_service {
+                    "service".into()
+                } else if has_http {
+                    "http".into()
+                } else {
+                    "openai".into()
+                }],
             )]);
         }
         let frontend_authentication = configuration
@@ -275,12 +297,10 @@ impl Environment {
                 vec![],
             )]);
         }
-        let archive = super::package_with_contributions_for_id(
-            super::worker(),
-            &plugin_id,
-            permissions,
-            contributes,
-        );
+        let service_worker = (has_service || has_http)
+            .then(|| std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap());
+        let worker = service_worker.as_deref().unwrap_or_else(|| super::worker());
+        let archive = super::package_with_contributions_for_id(worker, &plugin_id, contributes);
         let inspector = PackageInspector::new(PackageLimits::default(), "1.0.0".parse().unwrap());
         let artifact = inspector
             .inspect(Arc::clone(&archive), None)
@@ -304,14 +324,6 @@ impl Environment {
             .accept_artifact(&installed.artifact.metadata.sha256, &mutation)
             .await
             .unwrap();
-        let grants = installed
-            .artifact
-            .metadata
-            .requested_permissions
-            .iter()
-            .cloned()
-            .map(|permission| PluginPermissionGrant { permission })
-            .collect();
         let instance = PluginInstance {
             id: uuid::Uuid::new_v4().to_string(),
             name: "provider".into(),
@@ -320,8 +332,20 @@ impl Environment {
             trusted_process: true,
             configuration,
             secrets: BTreeMap::new(),
-            grants,
+
             bindings: [
+                has_upstream_adapter.then(|| PluginCapabilityBinding {
+                    contribution: format!("{plugin_id}.upstreamAdapter"),
+                    stage: "upstream".into(),
+                    order: 0,
+                    failure_policy: PluginFailurePolicy::Reject,
+                    client_key_ids: vec![],
+                    account_group_ids: vec![],
+                    provider_ids: vec![],
+                    models: vec![],
+                    event: None,
+                    identity_bindings: vec![],
+                }),
                 has_model_router.then(|| PluginCapabilityBinding {
                     contribution: format!("{plugin_id}.modelRouter"),
                     stage: "routing".into(),
@@ -331,6 +355,7 @@ impl Environment {
                     account_group_ids: vec![],
                     provider_ids: vec![],
                     models: vec![],
+                    event: None,
                     identity_bindings: vec![],
                 }),
                 has_scheduler.then(|| PluginCapabilityBinding {
@@ -342,6 +367,7 @@ impl Environment {
                     account_group_ids: vec![],
                     provider_ids: vec![],
                     models: vec![],
+                    event: None,
                     identity_bindings: vec![],
                 }),
                 frontend_authentication
@@ -359,6 +385,7 @@ impl Environment {
                         account_group_ids: vec![],
                         provider_ids: vec![],
                         models: vec![],
+                        event: None,
                         identity_bindings: vec![PluginFrontendIdentityBinding {
                             principal: principal.clone(),
                             client_key_id: key_id.clone(),
@@ -366,13 +393,20 @@ impl Environment {
                     }),
                 has_middleware.then(|| PluginCapabilityBinding {
                     contribution: format!("{plugin_id}.middleware"),
-                    stage: "request".into(),
+                    stage: if has_service {
+                        "service".into()
+                    } else if has_http {
+                        "http".into()
+                    } else {
+                        "request".into()
+                    },
                     order: 0,
                     failure_policy: PluginFailurePolicy::Reject,
                     client_key_ids: vec![],
                     account_group_ids: vec![],
                     provider_ids: vec![],
                     models: vec![],
+                    event: None,
                     identity_bindings: vec![],
                 }),
             ]
@@ -388,7 +422,14 @@ impl Environment {
     }
 
     pub async fn runtime(&self) -> (Arc<PluginRuntime>, gateway_core::CoreBundle) {
-        let runtime = self.plugin_runtime();
+        self.runtime_with_limits(RpcLimits::default()).await
+    }
+
+    pub async fn runtime_with_limits(
+        &self,
+        limits: RpcLimits,
+    ) -> (Arc<PluginRuntime>, gateway_core::CoreBundle) {
+        let runtime = self.plugin_runtime_with_limits(limits);
         let core = gateway_core::prepare(
             self.store.core_ports(),
             super::native::provider_registry(),
@@ -443,6 +484,10 @@ impl Environment {
     }
 
     fn plugin_runtime(&self) -> Arc<PluginRuntime> {
+        self.plugin_runtime_with_limits(RpcLimits::default())
+    }
+
+    fn plugin_runtime_with_limits(&self, rpc_limits: RpcLimits) -> Arc<PluginRuntime> {
         Arc::new(
             PluginRuntime::new(
                 self.store.admin_ports().plugins(),
@@ -451,7 +496,7 @@ impl Environment {
                     cache_directory: self.directory.path().join("cache"),
                     host_version: "1.0.0".parse().unwrap(),
                     package_limits: PackageLimits::default(),
-                    rpc_limits: RpcLimits::default(),
+                    rpc_limits,
                     restart_circuit: Default::default(),
                 },
                 Arc::new(gateway_host::outbound::HttpClient::new().unwrap()),
@@ -459,14 +504,7 @@ impl Environment {
                     std::num::NonZeroUsize::new(128).unwrap(),
                 )),
             )
-            .with_oauth_pending(self.store.provider_ports().oauth_pending())
-            .with_network_policy(
-                gateway_host::outbound::NetworkPolicy::new(&[
-                    "127.0.0.0/8".into(),
-                    "::1/128".into(),
-                ])
-                .unwrap(),
-            ),
+            .with_oauth_pending(self.store.provider_ports().oauth_pending()),
         )
     }
 
@@ -491,6 +529,14 @@ impl Environment {
             ClientConfig::default(),
             self.store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                service_middleware: {
+                    let snapshots = core.snapshots();
+                    let middleware = runtime.middleware_registry();
+                    std::sync::Arc::new(move || {
+                        let snapshot = snapshots.snapshot_for_diagnostics()?;
+                        middleware.resolve(snapshot.extensions()?)
+                    })
+                },
                 plugin_preparation: runtime.clone(),
                 plugin_management: runtime.clone(),
                 published_snapshot: core.snapshots(),
@@ -667,6 +713,16 @@ impl Environment {
         .unwrap()
     }
 
+    pub async fn assert_upstream_accounting(&self, key: &str, account: &str) {
+        let rows: Vec<(String, String, i32, i64, i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select outcome, provider_account_ref, attempt_count, input_tokens, output_tokens, cost_amount > 0 from {}.model_requests where client_api_key_ref=$1", self.schema,
+        ))).bind(key).fetch_all(&self.admin).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![("succeeded".into(), account.into(), 1, 7, 2, true)]
+        );
+    }
+
     pub async fn bound_model_requests(&self, client_key_id: &str) -> Vec<(String, String)> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "select request_kind, subagent_kind from {}.model_requests
@@ -809,11 +865,5 @@ pub fn mutation() -> MutationContext {
     MutationContext {
         actor: MutationActor::System,
         request_id: "plugin-host-account-test".into(),
-    }
-}
-
-pub fn account_grant(permission: &str) -> PluginPermissionGrant {
-    PluginPermissionGrant {
-        permission: permission.into(),
     }
 }

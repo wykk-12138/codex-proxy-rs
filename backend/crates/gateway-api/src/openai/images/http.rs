@@ -16,7 +16,8 @@ use gateway_core::operation::{
 use serde_json::Value;
 
 use crate::ApiState;
-use crate::openai::middleware::{HttpMiddlewareInput, request_headers};
+use crate::middleware::headers::encode_headers;
+use crate::openai::middleware::RequestInput;
 use crate::openai::{
     auth::{authenticate_client, client_access_error_response},
     endpoint::provider_endpoint_response,
@@ -83,13 +84,13 @@ async fn handle_image_request(
     provider_endpoint_response(
         service.clone(),
         client,
-        HttpMiddlewareInput {
+        RequestInput {
             endpoint: endpoint.to_owned(),
             protocol: OPENAI_PROTOCOL.to_owned(),
             operation: Some(OperationKind::GenerateImage),
             transport: ClientTransport::HttpJson,
             model_hint: None,
-            headers: request_headers(&headers),
+            headers: encode_headers(&headers),
             body,
         },
         client_ip,

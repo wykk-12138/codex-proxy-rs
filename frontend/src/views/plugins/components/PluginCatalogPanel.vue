@@ -60,7 +60,7 @@ const columns = defineTableColumns<(typeof rows.value)[number]>([
       <BaseSegmented v-model="display" :options="displayOptions" label="插件显示方式" display="icon" class="ml-auto w-20 shrink-0" />
     </div>
     <div v-if="loading && !plugins.length" class="min-h-0 flex-1" aria-busy="true" />
-    <BaseEmpty v-else-if="!filtered.length" :icon="Puzzle" :title="plugins.length ? '没有匹配的插件' : '安装第一个插件'" :description="plugins.length ? '试试其他名称或状态' : '从上方安装插件，查看权限后即可开始使用'" surface="none" class="flex-1 content-center">
+    <BaseEmpty v-else-if="!filtered.length" :icon="Puzzle" :title="plugins.length ? '没有匹配的插件' : '安装第一个插件'" :description="plugins.length ? '试试其他名称或状态' : '从上方安装插件，请先确认来源可信'" surface="none" class="flex-1 content-center">
       <template v-if="plugins.length" #action>
         <BaseButton variant="secondary" @click="search = ''; status = 'all'">
           清除筛选

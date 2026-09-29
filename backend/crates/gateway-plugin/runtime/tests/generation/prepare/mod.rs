@@ -189,6 +189,7 @@ async fn management_needs_no_binding_and_rejects_stale_execution_identity_config
         account_group_ids: Vec::new(),
         provider_ids: Vec::new(),
         models: Vec::new(),
+        event: None,
         identity_bindings: Vec::new(),
     }];
     assert!(
@@ -208,7 +209,7 @@ async fn management_needs_no_binding_and_rejects_stale_execution_identity_config
 async fn registration_with_a_changed_contribution_id_is_rejected() {
     let (cache, store, runtime) =
         super::setup_with_contributions(Contributions::from([crate::support::contribution(
-            Capability::Usage,
+            Capability::Observer,
             vec![Stage::Observation],
             Vec::new(),
             Vec::new(),
@@ -659,8 +660,8 @@ async fn restart_circuit_does_not_let_an_older_generation_clear_newer_failures()
     let mut snapshot = store.snapshot.lock().unwrap().clone();
     snapshot.instances[0].configuration = serde_json::json!({
         "startup_marker":marker,
-        "exit_after_ready_delays_ms":[null,15,15,15],
-        "exit_after_ready_signals":[old_exit,null,null,null],
+        "startup_failures":[false,true,true,true],
+        "exit_after_ready_signals":[old_exit],
     });
     let mut other = snapshot.instances[0].clone();
     other.id = "other-instance".into();
@@ -671,6 +672,9 @@ async fn restart_circuit_does_not_let_an_older_generation_clear_newer_failures()
         .await
         .expect("published generation");
     assert!(published.is_ready());
+    // 旧代次明确越过稳定窗口；新代次在握手前失败，运行时间固定为零。
+    // 不依赖 15 ms 退出与注册完成的竞速，也不让调度延迟重置新失败预算。
+    tokio::time::sleep(restart_circuit.stability_window).await;
 
     let mut failed_candidate = None;
     for revision in 2..=4 {
@@ -679,8 +683,8 @@ async fn restart_circuit_does_not_let_an_older_generation_clear_newer_failures()
         snapshot.instances[1].configuration = serde_json::json!({"revision":revision});
         let candidate = PluginPreparation::prepare(&runtime, snapshot.clone())
             .await
-            .expect("newer candidate starts before its controlled exit");
-        wait_until_unready(&candidate).await;
+            .expect("the unrelated instance starts while the newer incarnation fails");
+        assert_eq!(startup_count(&marker), revision as usize);
         drop(failed_candidate.replace(candidate));
         assert!(published.is_ready(), "the older generation remains healthy");
     }

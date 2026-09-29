@@ -36,7 +36,7 @@ fn instance(digest: String) -> PluginInstance {
         trusted_process: true,
         configuration: serde_json::json!({"baseUrl":"https://example.com"}),
         secrets: BTreeMap::from([("token".into(), "sensitive-fixture".into())]),
-        grants: vec![],
+
         bindings: vec![],
         revision: Revision::new(1).unwrap(),
     }
@@ -149,6 +149,7 @@ fn usage_binding(client_key_id: &str, account_group_id: &str) -> PluginCapabilit
         account_group_ids: vec![account_group_id.into()],
         provider_ids: vec![],
         models: vec![],
+        event: None,
         identity_bindings: vec![],
     }
 }
@@ -166,6 +167,7 @@ fn frontend_authentication_binding(
         account_group_ids: vec![],
         provider_ids: vec![],
         models: vec![],
+        event: None,
         identity_bindings: vec![PluginFrontendIdentityBinding {
             principal: principal.into(),
             client_key_id: client_key_id.into(),
@@ -315,8 +317,7 @@ async fn instance_save_rejects_unaccepted_enablement_and_forged_acceptance_facts
     };
     initialize_revision(&database).await;
     let store = PgPluginStore::new(database.pool.clone());
-    let mut package = artifact('d', &["linux-x86_64"]);
-    package.metadata.requested_permissions = vec!["network".into()];
+    let package = artifact('d', &["linux-x86_64"]);
     let installed = store
         .install_artifact(package, PluginSource::Upload, &context())
         .await
@@ -350,16 +351,14 @@ async fn instance_save_rejects_unaccepted_enablement_and_forged_acceptance_facts
         .accept_artifact(&installed.artifact.metadata.sha256, &context())
         .await
         .unwrap();
-    let missing_grant = instance(installed.artifact.metadata.sha256);
-    assert_eq!(
-        store
-            .save_instance(missing_grant, accepted.config_revision, &context())
-            .await
-            .err()
-            .expect("accepted artifact grants cannot be forged")
-            .kind(),
-        AdminStoreErrorKind::Invalid
-    );
+    let mut enabled = instance(installed.artifact.metadata.sha256);
+    enabled.enabled = true;
+    let saved = store
+        .save_instance(enabled, accepted.config_revision, &context())
+        .await
+        .expect("accepted artifact can be enabled without permission grants");
+    assert!(saved.instance.enabled);
+    assert!(saved.instance.trusted_process);
     database.close().await;
 }
 

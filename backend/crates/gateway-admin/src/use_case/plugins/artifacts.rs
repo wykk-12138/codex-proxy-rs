@@ -14,7 +14,7 @@ use crate::{
             distribution::VerifiedPluginArtifact,
             instances::{
                 ConfigurePluginInstance, PluginCapabilityBinding, PluginFailurePolicy,
-                PluginInstance, PluginPermissionGrant,
+                PluginInstance,
             },
         },
     },
@@ -52,13 +52,6 @@ pub struct PluginsService {
 }
 
 impl PluginsService {
-    pub fn permission_descriptions(
-        &self,
-        permissions: &[String],
-    ) -> Vec<crate::model::plugins::PluginPermissionDescription> {
-        self.inspector.permission_descriptions(permissions)
-    }
-
     #[must_use]
     pub fn new(
         store: Arc<dyn PluginStore>,
@@ -384,11 +377,14 @@ pub(super) fn default_bindings(metadata: &PluginArtifactMetadata) -> Vec<PluginC
                     | "maintenance"
             )
         })
-        .flat_map(|(_, contribution)| {
-            contribution
-                .stages
-                .iter()
-                .map(|stage| PluginCapabilityBinding {
+        .flat_map(|(capability, contribution)| {
+            contribution.stages.iter().flat_map(move |stage| {
+                let events: &[Option<&str>] = if capability == "observer" {
+                    &[Some("request_completed"), Some("websocket_response")]
+                } else {
+                    &[None]
+                };
+                events.iter().map(move |event| PluginCapabilityBinding {
                     contribution: contribution.id.clone(),
                     stage: stage.clone(),
                     order: 0,
@@ -403,8 +399,10 @@ pub(super) fn default_bindings(metadata: &PluginArtifactMetadata) -> Vec<PluginC
                     account_group_ids: Vec::new(),
                     provider_ids: Vec::new(),
                     models: Vec::new(),
+                    event: event.map(str::to_owned),
                     identity_bindings: Vec::new(),
                 })
+            })
         })
         .collect()
 }
@@ -425,12 +423,6 @@ fn default_instance(
         trusted_process: true,
         configuration,
         secrets: Default::default(),
-        grants: metadata
-            .requested_permissions
-            .iter()
-            .cloned()
-            .map(|permission| PluginPermissionGrant { permission })
-            .collect(),
         bindings,
         revision,
     }

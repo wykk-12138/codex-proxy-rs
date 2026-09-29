@@ -23,7 +23,6 @@ pub(crate) const MAXIMUM_BODY_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct ManagementEntry {
     pub(crate) view: PluginManagementView,
-    pub(crate) models_authorized: bool,
     routes: Vec<ManagementRoute>,
     resources: BTreeMap<String, Arc<[u8]>>,
     session: Arc<RpcSession>,
@@ -49,6 +48,7 @@ impl ManagementEntry {
         Ok(PluginManagementResponse {
             status: 200,
             content_type: resource.content_type.clone(),
+            headers: Vec::new(),
             body: body.clone(),
         })
     }
@@ -81,6 +81,16 @@ impl ManagementEntry {
             path: request.path,
             query: request.query,
             content_type: request.content_type,
+            headers: request
+                .headers
+                .iter()
+                .map(
+                    |header| gateway_plugin_sdk::call::middleware::MiddlewareHeader {
+                        name: header.name().to_owned(),
+                        value: header.value().to_vec(),
+                    },
+                )
+                .collect(),
         })
         .map_err(|_| AdminError::invalid("插件管理请求无法编码"))?;
         let mut context = self
@@ -102,7 +112,7 @@ impl ManagementEntry {
     }
 }
 
-// 受保护 API 与公开回调共用响应合同，公开入口不能因采用另一阶段而放宽输出边界。
+// 管理 API 与公开回调共用类型和正文预算校验，完整响应头由 HTTP 入口解码。
 fn decode_response(
     reply: RpcReply,
     allowed_content_types: &[String],
@@ -122,6 +132,16 @@ fn decode_response(
     Ok(PluginManagementResponse {
         status: response.status,
         content_type: response.content_type,
+        headers: response
+            .headers
+            .into_iter()
+            .map(|header| {
+                gateway_core::engine::middleware::MiddlewareHeader::new(
+                    header.name,
+                    header.value.into(),
+                )
+            })
+            .collect(),
         body: reply.payload.into(),
     })
 }

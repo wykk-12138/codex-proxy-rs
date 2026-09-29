@@ -29,19 +29,17 @@ pub struct PluginHostCompatibility {
     pub manifest_schema_versions: Vec<u32>,
     pub protocol_versions: Vec<u32>,
     pub capabilities: Vec<PluginHostCapability>,
-    pub permissions: Vec<String>,
 }
 
 impl PluginHostCompatibility {
     /// 拒绝空集合、重复项和不受控标识，避免发行清单把“未知”解释为通配。
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || !valid_versions(&self.manifest_schema_versions)
             || !valid_versions(&self.protocol_versions)
             || self.capabilities.is_empty()
             || self.capabilities.len() > 64
-            || self.permissions.len() > 64
         {
             return false;
         }
@@ -53,10 +51,7 @@ impl PluginHostCompatibility {
         }) {
             return false;
         }
-        let mut permissions = BTreeSet::new();
-        !self.permissions.iter().any(|permission| {
-            !valid_identifier(permission) || !permissions.insert(permission.as_str())
-        })
+        true
     }
 
     #[must_use]
@@ -64,11 +59,6 @@ impl PluginHostCompatibility {
         self.capabilities
             .iter()
             .any(|entry| entry.capability == capability && entry.versions.contains(&version))
-    }
-
-    #[must_use]
-    pub fn supports_permission(&self, permission: &str) -> bool {
-        self.permissions.iter().any(|entry| entry == permission)
     }
 }
 
@@ -118,7 +108,6 @@ pub struct PluginCompatibilityRequirements {
     pub manifest_schema_version: u32,
     pub protocol_version: u32,
     pub capabilities: Vec<(String, u32)>,
-    pub permissions: Vec<String>,
 }
 
 /// 一次下载使用的非敏感出站代理身份；地址与认证由受管代理记录持有。
@@ -177,12 +166,15 @@ impl PluginSource {
 
 /// 管理端保留的单项贡献声明；map key 是能力标识，`id` 是实例绑定引用的扩展项身份。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginContribution {
     pub id: String,
     pub version: u32,
+    #[serde(default)]
     pub stages: Vec<String>,
+    #[serde(default)]
     pub input_formats: Vec<String>,
+    #[serde(default)]
     pub output_formats: Vec<String>,
 }
 
@@ -195,7 +187,6 @@ pub enum PluginArtifactIcon {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PluginArtifactIconVariants {
     pub light: String,
     pub dark: String,
@@ -214,17 +205,10 @@ pub struct PluginArtifactIconResource {
     pub body: Vec<u8>,
 }
 
-/// 管理端使用的静态描述，不承载 SDK 的运行时消息或宿主实现类型。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginPermissionDescription {
-    pub permission: String,
-    pub label: String,
-    pub description: String,
-}
-
+/// 已校验制品的持久化投影；读取时忽略未知字段，可选字段缺省沿用清单语义。
+/// 身份与执行所需事实仍为必填，包清单及协议版本由 Runtime 独立校验。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginArtifactMetadata {
     pub plugin_id: String,
     pub version: String,
@@ -239,11 +223,16 @@ pub struct PluginArtifactMetadata {
     #[serde(default)]
     pub icon: Option<PluginArtifactIcon>,
     pub contributes: BTreeMap<String, PluginContribution>,
-    pub requested_permissions: Vec<String>,
+    #[serde(default = "empty_configuration_schema")]
     pub configuration_schema: serde_json::Value,
+    #[serde(default)]
     pub secret_fields: Vec<String>,
     #[serde(default)]
     pub state_namespaces: Vec<state::PluginStateSchema>,
+}
+
+fn empty_configuration_schema() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// 由包检查端口产生的不可变制品；不派生 Debug，包内可能含敏感用户数据。

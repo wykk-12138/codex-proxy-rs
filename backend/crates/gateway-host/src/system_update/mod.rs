@@ -241,9 +241,13 @@ pub struct ProcessSystemOperations {
 
 impl ProcessSystemOperations {
     #[must_use]
-    pub fn new(cancellation: CancellationToken, config: SystemUpdateConfig) -> Self {
-        // 组合根在接收请求前创建服务，记录本次启动的发行文件，后续替换不能改写这份事实。
-        let running_files = Arc::new(ReleaseFiles::installed(&config));
+    pub fn new(cancellation: CancellationToken, mut config: SystemUpdateConfig) -> Self {
+        // 组合根在接收请求前固定安装路径和发行文件；旧程序重命名后，
+        // current_exe 可能指向备份，后续更新、回滚和重启不能再反查运行文件。
+        let running_files = Arc::new(config.executable_path().and_then(|executable| {
+            config.executable_path = Some(executable);
+            ReleaseFiles::installed(&config)
+        }));
         Self {
             cancellation,
             events: Arc::new(UpdateEvents::default()),

@@ -7,7 +7,6 @@
 use std::{
     fmt,
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
 };
 
 use futures::future::BoxFuture;
@@ -58,14 +57,15 @@ pub struct NestedModelExecutionRequest {
     pub parent_account: Option<ProviderAccountId>,
 }
 
-/// 管理页或 CLI 为一次插件调用显式绑定的模型执行身份。
+/// 插件为当前调用或连接显式绑定的模型执行身份。
 ///
-/// Key ID 由已获模型域访问的调用选择，发起实例由宿主确定。Core 在绑定时冻结当前
+/// Key ID 由插件选择，发起实例由宿主确定。Core 在绑定时冻结当前
 /// Key 策略；每个实际模型请求仍独立经过准入、预算、账本与计费。
 pub struct BoundModelExecutionBinding {
+    pub settings: Option<crate::settings::RequestSettings>,
     pub client_key_id: ClientApiKeyId,
     pub initiating_plugin_instance_id: String,
-    pub timeout: Duration,
+    /// 身份随父调用或连接回收；每个模型请求使用独立的执行期限。
     pub cancellation: CancellationToken,
     /// 宿主保留的扩展调用链，异步观察不能通过新建模型请求清空防递归事实。
     pub extension_scope: super::extensions::ExtensionCallScope,
@@ -80,7 +80,6 @@ impl fmt::Debug for BoundModelExecutionBinding {
                 "initiating_plugin_instance_id",
                 &self.initiating_plugin_instance_id,
             )
-            .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
 }
@@ -135,7 +134,7 @@ pub trait NestedModelExecutionPort: Send + Sync {
         client_version: String,
     ) -> BoxFuture<'_, Result<Vec<PublicModelId>, GatewayError>>;
 
-    /// 为单次受保护管理调用或 CLI 命令冻结显式执行身份与共享调用图。
+    /// 为插件调用冻结显式执行身份；取消父调用会取消其所有模型执行。
     fn bind(
         &self,
         binding: BoundModelExecutionBinding,

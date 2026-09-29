@@ -3,6 +3,8 @@
 mod connector;
 mod http;
 mod network;
+mod websocket;
 
 pub use http::{HttpBody, HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse};
 pub use network::{DnsResolver, NetworkPolicy};
+pub use websocket::{ManagedWebSocket, WebSocketMessage, WebSocketResponse};

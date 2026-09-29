@@ -10,7 +10,7 @@ use gateway_core::policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits};
 use gateway_core::routing::snapshot::{
     RuntimeSnapshotCompileError, RuntimeSnapshotCompiler, SnapshotAccountGroupFacts,
     SnapshotAccountGroupMemberFacts, SnapshotClientPolicyFacts, SnapshotFacts,
-    SnapshotProviderAccountFacts, SnapshotSettingsFacts, SnapshotStoreError, SnapshotStorePort,
+    SnapshotProviderAccountFacts, SnapshotStoreError, SnapshotStorePort,
 };
 use gateway_core::routing::{
     ConfigRevision, ContributedModelAlias, ModelCapabilities, ModelPresentation,
@@ -21,6 +21,7 @@ use gateway_core::runtime::extensions::{
     ExtensionPreparationError, ExtensionPreparationPort, ExtensionSetId, ExtensionSetLease,
     ExtensionSetReference,
 };
+use gateway_core::settings::SettingsValues;
 
 #[derive(Clone)]
 struct TestSnapshotStore {
@@ -130,7 +131,7 @@ fn compile_aliases(
     let facts = SnapshotFacts::new(
         revision(1),
         revision(1),
-        SnapshotSettingsFacts::new(
+        SettingsValues::new(
             3,
             50,
             "smart",
@@ -330,7 +331,7 @@ fn compiler_accepts_unlimited_default_account_concurrency() {
     let facts = SnapshotFacts::new(
         revision(1),
         revision(1),
-        SnapshotSettingsFacts::new(0, 50, "smart", BTreeMap::new(), None, None),
+        SettingsValues::new(0, 50, "smart", BTreeMap::new(), None, None),
         Vec::new(),
         Vec::new(),
         vec![SnapshotProviderAccountFacts::new(
@@ -374,7 +375,7 @@ fn compiled_plans_keep_their_smart_config_after_a_new_snapshot_is_built() {
         let facts = SnapshotFacts::new(
             revision(index as u64 + 1),
             revision(index as u64 + 1),
-            SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+            SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
                 .with_smart_scheduling(config),
             vec![],
             vec![],
@@ -422,7 +423,7 @@ fn withdrawn_provider_keeps_accounts_without_becoming_a_route_or_expanding_group
         let facts = SnapshotFacts::new(
             revision(1),
             revision(1),
-            SnapshotSettingsFacts::new(
+            SettingsValues::new(
                 3,
                 0,
                 "smart",
@@ -512,7 +513,12 @@ fn routing_plans_share_frozen_pricing_after_a_new_snapshot_is_published() {
         )
     };
     let original = prices(12500);
-    let handle = RuntimeSnapshotHandle::new(super::snapshot().with_pricing(original.clone()));
+    let snapshot = super::snapshot();
+    let handle = RuntimeSnapshotHandle::new(
+        snapshot
+            .with_settings(&snapshot.settings().clone().with_pricing(original.clone()))
+            .unwrap(),
+    );
     let frozen = handle.acquire().unwrap();
     let plan = |snapshot: &gateway_core::routing::RuntimeSnapshot| {
         snapshot
@@ -525,7 +531,11 @@ fn routing_plans_share_frozen_pricing_after_a_new_snapshot_is_published() {
             .unwrap()
     };
     let old_plan = plan(&frozen);
-    handle.publish(super::snapshot().with_pricing(prices(20000)));
+    handle.publish(
+        snapshot
+            .with_settings(&snapshot.settings().clone().with_pricing(prices(20000)))
+            .unwrap(),
+    );
     let new_plan = plan(&handle.acquire().unwrap());
     assert!(Arc::ptr_eq(&old_plan.pricing(), &original));
     assert!(Arc::ptr_eq(&plan(&frozen).pricing(), &original));
@@ -766,7 +776,7 @@ fn facts_with_min_versions(
     SnapshotFacts::new(
         revision(config_revision),
         revision(observed_current_revision),
-        SnapshotSettingsFacts::new(
+        SettingsValues::new(
             3,
             50,
             "smart",
@@ -810,7 +820,7 @@ fn global_request_location_should_be_frozen_when_snapshot_is_published() {
         let facts = SnapshotFacts::new(
             revision(version),
             revision(version),
-            SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+            SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
                 .with_request_location(location, enabled),
             Vec::new(),
             Vec::new(),
@@ -888,7 +898,7 @@ fn codex_turn_metadata_strip_workspaces_should_be_frozen_when_snapshot_is_publis
         let facts = SnapshotFacts::new(
             revision(version),
             revision(version),
-            SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+            SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
                 .with_codex_turn_metadata_strip_workspaces(strip_workspaces),
             Vec::new(),
             Vec::new(),
@@ -920,6 +930,8 @@ fn codex_turn_metadata_strip_workspaces_should_be_frozen_when_snapshot_is_publis
             .unwrap()
     };
     assert!(plan(&frozen).codex_turn_metadata_strip_workspaces());
+    let recompiled = frozen.with_settings(frozen.settings()).unwrap();
+    assert!(plan(&recompiled).codex_turn_metadata_strip_workspaces());
     handle.publish(compile(2, false));
     assert!(!plan(&handle.acquire().unwrap()).codex_turn_metadata_strip_workspaces());
     // 已冻结的请求计划沿用发布时的策略。
@@ -933,7 +945,7 @@ fn decompression_setting_should_validate_and_remain_frozen_across_publication() 
         let facts = SnapshotFacts::new(
             revision(version),
             revision(version),
-            SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+            SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
                 .with_responses_max_decompressed_body_bytes(bytes),
             Vec::new(),
             Vec::new(),
@@ -986,7 +998,7 @@ fn disable_fast_uses_only_bound_groups_without_changing_account_scope() {
                 let facts = SnapshotFacts::new(
                     revision(1),
                     revision(1),
-                    SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None),
+                    SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None),
                     vec![SnapshotClientPolicyFacts::new(
                         ClientApiKeyId::new("key_fast_policy").unwrap(),
                         PlaintextClientApiKey::new("sk_fast_policy").unwrap(),
@@ -1066,7 +1078,7 @@ fn key_profiles_replace_whole_global_choice_and_previous_snapshot_stays_frozen()
     };
     let build = |global, overridden| {
         let profiles = BTreeMap::from([(provider.clone(), document(global))]);
-        let settings = SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+        let settings = SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
             .with_request_profiles(profiles);
         let inherited = SnapshotClientPolicyFacts::new(
             ClientApiKeyId::new("key_inherited").unwrap(),
@@ -1100,10 +1112,15 @@ fn key_profiles_replace_whole_global_choice_and_previous_snapshot_stays_frozen()
         .unwrap()
     };
     let values = |snapshot: &gateway_core::routing::RuntimeSnapshot| {
+        let settings = gateway_core::settings::RequestSettings::new(Arc::new(snapshot.clone()));
         let mut values: Vec<_> = snapshot
             .client_policies()
             .map(|policy| {
-                policy
+                if policy.key_id().as_str() == "key_inherited" {
+                    assert!(policy.defaults().request_profiles.is_empty());
+                }
+                settings
+                    .apply_policy(policy.clone())
                     .account_scope()
                     .request_profile(&provider)
                     .unwrap()

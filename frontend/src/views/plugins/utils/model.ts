@@ -3,6 +3,7 @@ import type {
   PluginArtifactMetadata,
   PluginInstance,
   PluginInstanceRuntimeStatus,
+  PluginObserverEvent,
   PluginSource,
   PluginUpdateSource,
   VerifyRemotePluginRequest,
@@ -31,26 +32,55 @@ export interface JsonSchema {
   additionalProperties?: boolean | JsonSchema
 }
 
+export const PLUGIN_OBSERVER_EVENT_LABELS: Record<PluginObserverEvent, string> = {
+  request_completed: '请求完成与用量',
+  websocket_response: '上游 WebSocket 事件',
+}
+
 export const PLUGIN_CAPABILITY_LABELS: Record<string, string> = {
-  models: '模型目录',
-  authentication: '账号认证',
   frontend_authentication: '客户端认证',
   scheduler: '请求调度',
   model_router: '模型路由',
   model_catalog: '模型目录',
   retry_policy: '重试策略',
-  executor: 'Provider 执行',
   middleware: '请求中间件',
-  request_lifecycle: '请求生命周期',
-  web_socket_observer: 'WebSocket 观察',
-  usage: '用量处理',
+  upstream_adapter: '上游适配器',
+  observer: '事件观察',
   command_line: '命令行',
   management: '管理扩展',
-  quota: '额度查询',
-  request_profile: '请求画像',
-  account_management: '账号管理',
-  billing: '计费处理',
   maintenance: '维护任务',
+}
+
+// 编辑入口、范围控件与摘要共用阶段描述；能力和阶段的合法组合由宿主校验。
+export const PLUGIN_REQUEST_STAGES: Record<string, {
+  label: string
+  scope: 'none' | 'model' | 'provider'
+  globalLabel?: string
+}> = {
+  http: { label: 'HTTP 请求', scope: 'none', globalLabel: '所有 HTTP 请求' },
+  websocket: { label: 'WebSocket 消息', scope: 'none', globalLabel: '所有 WebSocket 消息' },
+  service: { label: '服务调用', scope: 'none', globalLabel: '所有服务调用' },
+  request: { label: '请求开始', scope: 'model' },
+  attempt: { label: '每次尝试', scope: 'provider' },
+  upstream: { label: '上游调用', scope: 'provider' },
+  routing: { label: '模型路由', scope: 'model' },
+  scheduling: { label: '账号调度', scope: 'provider' },
+  retry: { label: '重试决策', scope: 'provider' },
+  observation: { label: '事件观察', scope: 'provider' },
+}
+
+export function pluginRequestBindingEntries(metadata: PluginArtifactMetadata) {
+  return pluginContributionEntries(metadata).flatMap(([capability, contribution]) =>
+    contribution.stages.flatMap((stage) => {
+      const description = PLUGIN_REQUEST_STAGES[stage]
+      if (!description)
+        return []
+      const events: { event?: PluginObserverEvent, label: string }[] = capability === 'observer'
+        ? Object.entries(PLUGIN_OBSERVER_EVENT_LABELS).map(([event, label]) => ({ event: event as PluginObserverEvent, label }))
+        : [{ label: description.label }]
+      return events.map(({ event, label }) => ({ ...description, capability, contribution: contribution.id, stage, event, label }))
+    }),
+  )
 }
 
 export function pluginCapabilityLabel(capability: string) {

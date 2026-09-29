@@ -1,7 +1,7 @@
 use gateway_admin::{
     model::{
         client_keys::{SetClientKeyEnabled, UpdateClientKey},
-        plugins::{instances::PluginPermissionGrant, management::PluginManagementRequest},
+        plugins::management::PluginManagementRequest,
     },
     ports::plugin_management::PluginManagement,
 };
@@ -25,7 +25,7 @@ async fn key_facts_read_current_database_groups_without_secrets() {
             {"method":"host.data.keys.get","query":{"client_key_id":"key_missing"}},
             {"method":"host.data.keys.get","query":{"client_key_id":id,"secret":true}}
         ]
-    }), vec![PluginPermissionGrant { permission: "data".into() }]).await;
+    })).await;
     let access = gateway_admin::initialize_plugin_client_keys(
         crate::support::native::admin_registry(),
         environment.store.admin_ports().client_keys(),
@@ -81,6 +81,7 @@ async fn key_facts_read_current_database_groups_without_secrets() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),
                     query: String::new(),

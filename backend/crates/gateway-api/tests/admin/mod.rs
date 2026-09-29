@@ -184,6 +184,7 @@ impl AdminTestFixture {
             ClientConfig::default(),
             stores,
             gateway_admin::AdminRuntimePorts {
+                service_middleware: std::sync::Arc::new(|| None),
                 plugin_preparation: plugin_ports.clone(),
                 plugin_management: plugin_ports.clone(),
                 published_snapshot: published_snapshot.clone(),
@@ -535,6 +536,13 @@ impl SettingsStore for MemorySettingsStore {
         _: &MutationContext,
     ) -> AdminStoreResult<RuntimeSettings> {
         let mut settings = self.settings.lock().expect("settings");
+        if command.expected_revision != settings.config_revision {
+            return Err(AdminStoreError::new(
+                AdminStoreErrorKind::Conflict,
+                "runtime settings",
+                "settings revision changed",
+            ));
+        }
         let mut request_profiles = settings.request_profiles.clone();
         for (provider, profile) in command.request_profile_updates {
             if let Some(profile) = profile {

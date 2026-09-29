@@ -252,10 +252,11 @@ fn version_bindings(
         let previous = capability.and_then(|capability| current.contributes.get(capability));
         previous.is_none_or(|contribution| {
             !contribution.stages.contains(&binding.stage)
-                || instance
-                    .bindings
-                    .iter()
-                    .any(|old| old.contribution == contribution.id && old.stage == binding.stage)
+                || instance.bindings.iter().any(|old| {
+                    old.contribution == contribution.id
+                        && old.stage == binding.stage
+                        && old.event == binding.event
+                })
         })
     });
     for previous in &instance.bindings {
@@ -276,7 +277,9 @@ fn version_bindings(
         let mut binding = previous.clone();
         binding.contribution.clone_from(&contribution.id);
         if let Some(default) = bindings.iter_mut().find(|default| {
-            default.contribution == binding.contribution && default.stage == binding.stage
+            default.contribution == binding.contribution
+                && default.stage == binding.stage
+                && default.event == binding.event
         }) {
             *default = binding;
         } else {

@@ -107,7 +107,7 @@ impl gateway_admin::ports::proxy::ProxyStore for TestPluginPorts {
 
 #[async_trait]
 impl gateway_admin::ports::plugin_management::PluginManagement for TestPluginPorts {
-    async fn authorize_models(
+    async fn validate_target(
         &self,
         _: &gateway_core::runtime::extensions::ExtensionSetReference,
         _: &gateway_admin::model::plugins::management::PluginManagementTarget,

@@ -105,6 +105,7 @@ pub(super) struct AdminHarness {
     plugin_store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
     plugin_inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
+    service_middleware: gateway_admin::service::PlanSource,
 }
 
 impl AdminHarness {
@@ -132,6 +133,7 @@ impl AdminHarness {
             plugin_store: Arc::new(plugins::TestPluginPorts),
             plugin_inspector: Arc::new(plugins::TestPluginPorts),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
+            service_middleware: Arc::new(|| None),
         }
     }
 
@@ -187,6 +189,11 @@ impl AdminHarness {
 
     pub(super) fn settings(mut self, store: Arc<dyn SettingsStore>) -> Self {
         self.settings = store;
+        self
+    }
+
+    pub(super) fn service_middleware(mut self, source: gateway_admin::service::PlanSource) -> Self {
+        self.service_middleware = source;
         self
     }
 
@@ -261,6 +268,7 @@ impl AdminHarness {
                 Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
                 plugin_management: Arc::new(plugins::TestPluginPorts),
                 published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle::default(),
@@ -1101,3 +1109,4 @@ fn unavailable_system() -> SystemOperationError {
         "unavailable in this test",
     )
 }
+mod service_contract;

@@ -65,10 +65,10 @@ use crate::routing::{
     RoutingContext, RuntimeSnapshot, UpstreamModelId,
 };
 use crate::runtime::{RuntimeSnapshotHandle, RuntimeSnapshotPublisher};
+use crate::settings::RequestSettings;
 
 const MODEL_REQUEST_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const COORDINATION_TIMEOUT: Duration = Duration::from_millis(100);
-const MAX_NESTED_DEPTH: usize = 4;
 const MAX_NESTED_EXECUTIONS: usize = 16;
 const MAX_CONCURRENT_NESTED_EXECUTIONS: usize = 4;
 
@@ -108,12 +108,32 @@ pub struct ExecutionRequestMetadata {
 
 #[derive(Clone)]
 pub struct AuthenticatedClient {
+    settings: Option<RequestSettings>,
     snapshot: Arc<RuntimeSnapshot>,
     policy: ClientPolicy,
     authentication: Option<ClientAuthenticationRequest>,
 }
 
 impl AuthenticatedClient {
+    fn execution_timeout(&self) -> Duration {
+        self.settings
+            .as_ref()
+            .and_then(|settings| settings.execution_timeout(self.policy.key_id()))
+            .unwrap_or(MODEL_REQUEST_DEADLINE)
+    }
+
+    #[must_use]
+    pub fn request_settings(&self) -> Option<&RequestSettings> {
+        self.settings.as_ref()
+    }
+
+    /// 后续仍须重新认证；这里只更新下一次认证使用的冻结配置。
+    #[must_use]
+    pub fn with_request_settings(mut self, settings: RequestSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
     #[must_use]
     pub const fn snapshot(&self) -> &Arc<RuntimeSnapshot> {
         &self.snapshot
@@ -157,6 +177,7 @@ pub struct StartExecution {
 /// 中间件短路时本值直接释放；调用 `next` 后必须原样交回
 /// [`ExecutionService::start_prepared`]，不能重新认证为另一个 Key。
 pub struct PreparedRootExecution {
+    extension_scope: ExtensionCallScope,
     response_control: super::response_control::ResponseControl,
     client: AuthenticatedClient,
     request_id: ModelRequestId,
@@ -169,6 +190,51 @@ pub struct PreparedRootExecution {
 
 impl PreparedRootExecution {
     #[must_use]
+    pub fn request_settings(&self) -> RequestSettings {
+        self.client
+            .settings
+            .clone()
+            .unwrap_or_else(|| RequestSettings::new(self.client.snapshot.clone()))
+            .with_execution(
+                &self.client.policy,
+                duration_ms(
+                    self.deadline_at
+                        .duration_since(self.started_at)
+                        .unwrap_or_default(),
+                ),
+            )
+    }
+
+    /// 入口延续发起实例集合；保留已经交给调用方的取消句柄。
+    #[must_use]
+    pub fn with_extension_scope(mut self, scope: ExtensionCallScope) -> Self {
+        self.extension_scope = scope;
+        self
+    }
+
+    #[must_use]
+    pub fn extension_scope(&self) -> ExtensionCallScope {
+        self.extension_scope.clone()
+    }
+
+    /// 设置已经在改写时完成编译；此处只将同一份结果应用到冻结身份和生命周期。
+    pub fn apply_settings(&mut self, settings: &RequestSettings) -> Result<(), GatewayError> {
+        let deadline = settings
+            .execution_deadline(self.client.policy.key_id(), self.started_at)
+            .map_err(|_| {
+                GatewayError::new(
+                    GatewayErrorKind::InvalidRequest,
+                    "execution settings are invalid",
+                )
+            })?;
+        self.client.policy = settings.apply_policy(self.client.policy.clone());
+        self.client.snapshot = settings.snapshot();
+        self.client.settings = Some(settings.clone());
+        self.deadline_at = deadline;
+        Ok(())
+    }
+
+    #[must_use]
     pub fn response_control(&self) -> super::response_control::ResponseControl {
         self.response_control.clone()
     }
@@ -176,13 +242,14 @@ impl PreparedRootExecution {
     fn new(client: AuthenticatedClient) -> Result<Self, GatewayError> {
         let started_at = SystemTime::now();
         let deadline_at = started_at
-            .checked_add(MODEL_REQUEST_DEADLINE)
+            .checked_add(client.execution_timeout())
             .ok_or_else(|| {
                 GatewayError::new(GatewayErrorKind::Internal, "system clock is invalid")
             })?;
         let execution_effects = Arc::new(ExecutionEffects::default());
         let execution_effects_baseline = execution_effects.epoch();
         Ok(Self {
+            extension_scope: ExtensionCallScope::default(),
             client,
             response_control: super::response_control::ResponseControl::default(),
             request_id: new_request_id()?,
@@ -433,13 +500,18 @@ pub struct BoundModelExecutionContext {
     authority: Arc<BoundModelExecutionAuthority>,
 }
 
+impl BoundModelExecutionContext {
+    #[must_use]
+    pub fn request_settings(&self) -> Option<&RequestSettings> {
+        self.authority.client.request_settings()
+    }
+}
+
 struct BoundModelExecutionAuthority {
     client: AuthenticatedClient,
     account_scope: Arc<FrozenAccountScope>,
-    deadline_at: SystemTime,
     cancellation: CancellationToken,
     extension_scope: ExtensionCallScope,
-    graph: Arc<NestedExecutionGraph>,
     initiating_plugin_instance_id: String,
 }
 
@@ -452,7 +524,6 @@ impl fmt::Debug for BoundModelExecutionContext {
                 "initiating_plugin_instance_id",
                 &self.authority.initiating_plugin_instance_id,
             )
-            .field("deadline_at", &self.authority.deadline_at)
             .finish_non_exhaustive()
     }
 }
@@ -523,6 +594,11 @@ pub trait ExecutionSession: Send {
 }
 
 pub trait ExecutionService: Send + Sync {
+    /// 未就绪时管理与健康接口仍可运行，模型认证按既有路径报告不可用。
+    fn request_settings(&self) -> Option<RequestSettings> {
+        None
+    }
+
     fn authenticate(
         &self,
         plaintext: &str,
@@ -771,7 +847,9 @@ impl DefaultExecutionService {
             .find(|policy| policy.authorize().is_ok())
             .cloned()
             .ok_or(ClientAuthenticationError::InvalidKey)?;
+        let policy = RequestSettings::new(snapshot.clone()).apply_policy(policy);
         Ok(AuthenticatedClient {
+            settings: None,
             snapshot,
             policy,
             authentication: Some(authentication),
@@ -780,12 +858,15 @@ impl DefaultExecutionService {
 
     async fn authenticate_request_without_usage(
         &self,
-        authentication: ClientAuthenticationRequest,
+        mut authentication: ClientAuthenticationRequest,
     ) -> Result<AuthenticatedClient, ClientAuthenticationError> {
-        let snapshot = self
-            .snapshots
-            .acquire()
-            .map_err(|_| ClientAuthenticationError::SnapshotUnavailable)?;
+        let snapshot = match authentication.settings() {
+            Some(settings) => settings.snapshot(),
+            None => self
+                .snapshots
+                .acquire()
+                .map_err(|_| ClientAuthenticationError::SnapshotUnavailable)?,
+        };
         let frontend = self
             .frontend_authentication
             .as_ref()
@@ -819,7 +900,12 @@ impl DefaultExecutionService {
         } else {
             native_policy(&snapshot, &authentication)?
         };
+        let policy = match authentication.settings() {
+            Some(settings) => settings.apply_policy(policy),
+            None => RequestSettings::new(snapshot.clone()).apply_policy(policy),
+        };
         Ok(AuthenticatedClient {
+            settings: authentication.take_settings(),
             snapshot,
             policy,
             authentication: Some(authentication),
@@ -879,6 +965,10 @@ impl DefaultExecutionService {
                 "bound execution identity cannot enter the public start path",
             )
         })?;
+        let authentication = match client.settings.clone() {
+            Some(settings) => authentication.with_settings(settings),
+            None => authentication,
+        };
         client = self
             .authenticate_request_without_usage(authentication)
             .await
@@ -901,6 +991,7 @@ impl DefaultExecutionService {
         metadata: ExecutionRequestMetadata,
     ) -> Result<StartedExecution, GatewayError> {
         let PreparedRootExecution {
+            extension_scope,
             client,
             response_control,
             request_id,
@@ -915,7 +1006,7 @@ impl DefaultExecutionService {
             account_scope: Arc::clone(client.policy.account_scope()),
             deadline_at,
             cancellation,
-            extension_scope: ExtensionCallScope::default(),
+            extension_scope,
             required_provider: None,
             required_account: None,
             nested: None,
@@ -973,6 +1064,11 @@ impl DefaultExecutionService {
             .iter()
             .map(|group| group.id().clone())
             .collect::<Vec<_>>();
+        let upstream_adapters = request
+            .client
+            .snapshot
+            .extensions()
+            .and_then(|set| set.upstream_adapters());
         let middleware = self.middlewares.as_ref().and_then(|middlewares| {
             let generation = request.client.snapshot.extensions()?.clone();
             middlewares.resolve(&generation)
@@ -1167,6 +1263,7 @@ impl DefaultExecutionService {
                 CoordinationExtensions::new(continuation, request_observation.clone())
                     .with_response_control(authorization.response_control.clone())
                     .with_request_policy(request_policy)
+                    .with_upstream_adapters(upstream_adapters)
                     .with_execution_effects(
                         execution_effects,
                         authorization.execution_effects_baseline,
@@ -1490,7 +1587,7 @@ impl DefaultExecutionService {
             parent_account,
         } = request;
         let parent = self.active_request(&parent_request_id)?;
-        if parent.extension_scope.len() >= MAX_NESTED_DEPTH {
+        if parent.extension_scope.len() >= ExtensionCallScope::MAXIMUM_DEPTH {
             return Err(GatewayError::new(
                 GatewayErrorKind::PolicyDenied,
                 "nested model execution depth is exhausted",
@@ -1554,8 +1651,11 @@ impl DefaultExecutionService {
     async fn client_for_key_id(
         &self,
         client_key_id: &ClientApiKeyId,
+        settings: Option<RequestSettings>,
     ) -> Result<AuthenticatedClient, GatewayError> {
-        if let Some(refresh) = &self.snapshot_refresh {
+        if settings.is_none()
+            && let Some(refresh) = &self.snapshot_refresh
+        {
             refresh.refresh().await.map_err(|_| {
                 GatewayError::new(
                     GatewayErrorKind::Internal,
@@ -1563,12 +1663,16 @@ impl DefaultExecutionService {
                 )
             })?;
         }
-        let snapshot = self.snapshots.acquire().map_err(|_| {
-            GatewayError::new(
-                GatewayErrorKind::Internal,
-                "current runtime snapshot is unavailable",
-            )
-        })?;
+        let snapshot = settings
+            .as_ref()
+            .map(|settings| settings.snapshot())
+            .map_or_else(|| self.snapshots.acquire(), Ok)
+            .map_err(|_| {
+                GatewayError::new(
+                    GatewayErrorKind::Internal,
+                    "current runtime snapshot is unavailable",
+                )
+            })?;
         let policy = snapshot
             .client_policy(client_key_id)
             .cloned()
@@ -1582,8 +1686,12 @@ impl DefaultExecutionService {
             GatewayError::new(GatewayErrorKind::PolicyDenied, "client API key is disabled")
         })?;
         Ok(AuthenticatedClient {
+            policy: match &settings {
+                Some(settings) => settings.apply_policy(policy),
+                None => RequestSettings::new(snapshot.clone()).apply_policy(policy),
+            },
+            settings,
             snapshot,
-            policy,
             authentication: None,
         })
     }
@@ -1592,19 +1700,10 @@ impl DefaultExecutionService {
         &self,
         binding: BoundModelExecutionBinding,
     ) -> Result<BoundModelExecutionContext, GatewayError> {
-        if binding.timeout.is_zero() {
-            return Err(GatewayError::new(
-                GatewayErrorKind::InvalidRequest,
-                "bound model execution timeout is invalid",
-            ));
-        }
-        let client = self.client_for_key_id(&binding.client_key_id).await?;
-        let deadline_at = SystemTime::now()
-            .checked_add(binding.timeout.min(MODEL_REQUEST_DEADLINE))
-            .ok_or_else(|| {
-                GatewayError::new(GatewayErrorKind::Internal, "system clock is invalid")
-            })?;
-        if binding.extension_scope.len() >= MAX_NESTED_DEPTH {
+        let client = self
+            .client_for_key_id(&binding.client_key_id, binding.settings)
+            .await?;
+        if binding.extension_scope.len() >= ExtensionCallScope::MAXIMUM_DEPTH {
             return Err(GatewayError::new(
                 GatewayErrorKind::PolicyDenied,
                 "plugin model execution depth exceeded",
@@ -1624,12 +1723,8 @@ impl DefaultExecutionService {
             authority: Arc::new(BoundModelExecutionAuthority {
                 client,
                 account_scope,
-                deadline_at,
                 cancellation: binding.cancellation,
                 extension_scope,
-                graph: Arc::new(NestedExecutionGraph::new(Arc::new(
-                    ExecutionEffects::default(),
-                ))),
                 initiating_plugin_instance_id: binding.initiating_plugin_instance_id,
             }),
         })
@@ -1654,25 +1749,25 @@ impl DefaultExecutionService {
                 "bound plugin invocation was cancelled",
             ));
         }
-        if authority
-            .deadline_at
-            .duration_since(SystemTime::now())
-            .unwrap_or_default()
-            .is_zero()
-        {
-            return Err(GatewayError::new(
-                GatewayErrorKind::Timeout,
-                "bound plugin invocation deadline elapsed",
-            ));
-        }
+        let now = SystemTime::now();
+        let deadline_at = now
+            .checked_add(authority.client.execution_timeout())
+            .ok_or_else(|| {
+                GatewayError::new(GatewayErrorKind::Internal, "system clock is invalid")
+            })?;
         let (account_scope, required_provider) = restrict_model_execution_scope(
             authority.account_scope.as_ref(),
             provider,
             account.as_ref(),
             None,
         )?;
-        let permit = authority.graph.acquire()?;
-        let execution_effects_baseline = authority.graph.effects.epoch();
+        // 连接承载多个独立执行；递归预算和副作用只在本次执行的子调用图内共享。
+        // 父连接的取消仍通过 authority 传播，不能因新建执行丢失扩展调用链。
+        let graph = Arc::new(NestedExecutionGraph::new(Arc::new(
+            ExecutionEffects::default(),
+        )));
+        let permit = graph.acquire()?;
+        let execution_effects_baseline = graph.effects.epoch();
         metadata.endpoint = "host.model".to_owned();
         metadata.transport = ClientTransport::InternalPlugin;
         metadata.client_ip = None;
@@ -1689,7 +1784,7 @@ impl DefaultExecutionService {
             AuthorizedExecution {
                 account_scope,
                 response_control: None,
-                deadline_at: authority.deadline_at,
+                deadline_at,
                 cancellation: authority.cancellation.child_token(),
                 extension_scope: authority.extension_scope.clone(),
                 required_provider,
@@ -1698,11 +1793,11 @@ impl DefaultExecutionService {
                 bound: Some(BoundExecutionFacts {
                     initiating_plugin_instance_id: authority.initiating_plugin_instance_id.clone(),
                 }),
-                graph: Some(Arc::clone(&authority.graph)),
+                graph: Some(graph),
                 execution_effects_baseline,
                 nested_permit: Some(permit),
             },
-            SystemTime::now(),
+            now,
             None,
         )
         .await
@@ -2078,6 +2173,10 @@ impl ExecutionStore for TransientExecutionStore {
 }
 
 impl ExecutionService for DefaultExecutionService {
+    fn request_settings(&self) -> Option<RequestSettings> {
+        self.snapshots.acquire().ok().map(RequestSettings::new)
+    }
+
     fn authenticate(
         &self,
         plaintext: &str,
@@ -2218,7 +2317,7 @@ impl ExecutionService for DefaultExecutionService {
     ) -> BoxFuture<'_, Result<PreparedRootExecution, GatewayError>> {
         let client_key_id = client_key_id.clone();
         Box::pin(async move {
-            let client = self.client_for_key_id(&client_key_id).await?;
+            let client = self.client_for_key_id(&client_key_id, None).await?;
             self.client_api_key_usage
                 .record_used(client.policy.key_id());
             PreparedRootExecution::new(client)
@@ -2287,12 +2386,8 @@ impl NestedModelExecutionPort for DefaultExecutionService {
     ) -> BoxFuture<'_, Result<Vec<PublicModelId>, GatewayError>> {
         Box::pin(async move {
             let authority = &context.authority;
-            let remaining = authority
-                .deadline_at
-                .duration_since(SystemTime::now())
-                .unwrap_or_default();
             let cancellation = authority.cancellation.cancelled().fuse();
-            let timeout = Delay::new(remaining).fuse();
+            let timeout = Delay::new(MODEL_REQUEST_DEADLINE).fuse();
             let catalog = self
                 .client_model_catalog(&authority.client, &protocol, &client_version)
                 .fuse();

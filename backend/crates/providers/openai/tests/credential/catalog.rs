@@ -1351,14 +1351,40 @@ async fn slow_api_key_catalogs_share_a_deadline_and_preserve_healthy_catalogs() 
     let service = service_with_catalog_cache(&store, upstream.uri(), catalog_cache());
     let scope = client_scope(&accounts);
     let slow_id = ProviderAccountId::new("acct_slow_0").expect("account ID");
-    let (client, refresh) = tokio::time::timeout(Duration::from_secs(17), async {
-        tokio::join!(
-            service.client_model_catalog(&scope, "1.0.0"),
-            service.refresh_account_catalog(&slow_id)
-        )
+    let execution = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(17), async {
+            tokio::join!(
+                service.client_model_catalog(&scope, "1.0.0"),
+                service.refresh_account_catalog(&slow_id)
+            )
+        })
+        .await
+        .expect("catalog deadline must bound both client reads and account refreshes")
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/slow/models")
+                .count()
+                >= 5
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    .expect("catalog deadline must bound both client reads and account refreshes");
+    .expect("healthy API catalog completed and released a concurrency slot");
+    // 四个并发读取中，健康 API 目录完成后才会发出第四个慢请求，另有一次独立刷新。
+    // 只快进慢目录的共享期限，随后恢复实时时钟让 OAuth 冷请求完整通过真实 HTTP。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    let (client, refresh) = execution.await.unwrap();
     let models = client.expect("healthy catalogs remain available");
     assert_eq!(
         models

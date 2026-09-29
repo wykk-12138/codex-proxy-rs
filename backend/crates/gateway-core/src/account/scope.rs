@@ -272,6 +272,11 @@ impl FrozenAccountScope {
         self.request_profiles.get(provider)
     }
 
+    #[must_use]
+    pub fn request_profiles(&self) -> &BTreeMap<ProviderKind, super::OpaqueProviderData> {
+        &self.request_profiles
+    }
+
     /// Key 绑定分组的冻结 Fast 限制，与账号成员资格无关。
     #[must_use]
     pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {

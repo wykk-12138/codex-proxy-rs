@@ -85,10 +85,6 @@ impl SystemUpdatePreflight for PluginSystemUpdatePreflight {
                     .any(|(capability, version)| {
                         !compatibility.supports_capability(capability, *version)
                     })
-                || requirements
-                    .permissions
-                    .iter()
-                    .any(|permission| !compatibility.supports_permission(permission))
             {
                 return Err(incompatible(&instance.id));
             }

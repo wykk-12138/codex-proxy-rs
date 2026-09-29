@@ -10,7 +10,7 @@ use crate::{
         plugins::instances::{
             ConfigurePluginInstance, PluginInstance, PluginInstanceMutation,
             PluginInstanceReplacement, PluginInstanceRuntime, PluginInstanceRuntimeStatus,
-            PluginInstanceSnapshot, PluginInstanceView, PluginPermissionGrant,
+            PluginInstanceSnapshot, PluginInstanceView,
         },
         plugins::state::{PluginStateCommit, PluginStateConfiguration},
     },
@@ -225,13 +225,6 @@ impl PluginsService {
                         .as_ref()
                         .map_or_else(Default::default, |instance| instance.secrets.clone())
                 }),
-            grants: artifact
-                .metadata
-                .requested_permissions
-                .iter()
-                .cloned()
-                .map(|permission| PluginPermissionGrant { permission })
-                .collect(),
             bindings: input.bindings,
             revision: candidate_revision,
         };
@@ -690,7 +683,6 @@ fn validate_input(instance: &PluginInstance) -> Result<(), AdminError> {
         || !instance.configuration.is_object()
         || serde_json::to_vec(&instance.configuration).map_or(true, |bytes| bytes.len() > 48 * 1024)
         || instance.secrets.len() > 64
-        || instance.grants.len() > 32
         || instance.bindings.len() > 64
     {
         return Err(AdminError::invalid("插件实例配置不合法或超过大小限制"));

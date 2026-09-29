@@ -6,7 +6,7 @@ use gateway_admin::{
         plugins::{
             instances::{
                 PluginInstance, PluginInstanceMutation, PluginInstanceReplacement,
-                PluginInstanceSnapshot, PluginPermissionGrant, PluginVersionConfiguration,
+                PluginInstanceSnapshot, PluginVersionConfiguration,
             },
             state::PluginStateCommit,
         },
@@ -106,7 +106,6 @@ fn decode(row: &sqlx::postgres::PgRow) -> AdminStoreResult<PluginInstance> {
         .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at")
         .map_err(|_| unavailable())?
         .is_some();
-    let metadata = super::artifacts::decode_metadata(row)?;
     Ok(PluginInstance {
         id: id.to_string(),
         name: row.try_get("name").map_err(|_| unavailable())?,
@@ -120,15 +119,6 @@ fn decode(row: &sqlx::postgres::PgRow) -> AdminStoreResult<PluginInstance> {
             .try_get::<sqlx::types::Json<_>, _>("secrets_json")
             .map_err(|_| unavailable())?
             .0,
-        grants: if accepted {
-            metadata
-                .requested_permissions
-                .into_iter()
-                .map(|permission| PluginPermissionGrant { permission })
-                .collect()
-        } else {
-            Vec::new()
-        },
         bindings: row
             .try_get::<sqlx::types::Json<_>, _>("bindings_json")
             .map_err(|_| unavailable())?
@@ -164,20 +154,11 @@ async fn validate_artifact_acceptance(
     .await
     .map_err(|_| unavailable())?
     .ok_or_else(not_found)?;
-    let metadata = super::artifacts::decode_metadata(&row)?;
     let accepted = row
         .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("accepted_at")
         .map_err(|_| unavailable())?
         .is_some();
-    let expected_grants = metadata
-        .requested_permissions
-        .into_iter()
-        .map(|permission| PluginPermissionGrant { permission })
-        .collect::<Vec<_>>();
-    if instance.trusted_process != accepted
-        || instance.grants != expected_grants
-        || (instance.enabled && !accepted)
-    {
+    if instance.trusted_process != accepted || (instance.enabled && !accepted) {
         return Err(AdminStoreError::new(
             AdminStoreErrorKind::Invalid,
             "plugin",

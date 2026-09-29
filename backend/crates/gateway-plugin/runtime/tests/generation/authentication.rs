@@ -5,7 +5,7 @@ use gateway_core::{
 };
 use serde_json::{Value, json};
 
-use crate::support::environment::{Environment, account_grant, mutation};
+use crate::support::environment::{Environment, mutation};
 
 async fn authenticate(
     configuration: Value,
@@ -20,9 +20,7 @@ async fn authenticate(
     environment
         .client_key("key_frontend", "sk-native-fixture")
         .await;
-    let (runtime, core) = environment
-        .plugin(configuration, vec![account_grant("accounts")])
-        .await;
+    let (runtime, core) = environment.plugin(configuration).await;
     let result = core
         .execution_service()
         .authenticate_request(ClientAuthenticationRequest::new(authorization).unwrap())

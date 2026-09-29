@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 use gateway_plugin_runtime::{
     CallbackHandler, PackageLimits, RpcError, RpcLimits, RpcReply, RpcSession, ValidatedPackage,
 };
-use gateway_plugin_sdk::{CallContext, ErrorCode, Handshake, Permission, PluginFault, Stage};
+use gateway_plugin_sdk::{CallContext, ErrorCode, Handshake, PluginFault, Stage};
 use serde_json::json;
 use tokio::sync::{Barrier, Notify};
 
@@ -174,14 +174,11 @@ impl CallbackHandler for Callbacks {
     }
 }
 
-async fn session<C>(
-    permissions: Vec<Permission>,
-    callbacks: Arc<C>,
-) -> (tempfile::TempDir, Arc<RpcSession>)
+async fn session<C>(callbacks: Arc<C>) -> (tempfile::TempDir, Arc<RpcSession>)
 where
     C: CallbackHandler + 'static,
 {
-    let (cache, prepared, handshake, processes) = prepared_session(permissions);
+    let (cache, prepared, handshake, processes) = prepared_session();
     let session = RpcSession::start(
         prepared,
         handshake,
@@ -194,9 +191,7 @@ where
     (cache, Arc::new(session))
 }
 
-fn prepared_session(
-    permissions: Vec<Permission>,
-) -> (
+fn prepared_session() -> (
     tempfile::TempDir,
     Arc<gateway_plugin_runtime::PreparedPackage>,
     Handshake,
@@ -205,7 +200,7 @@ fn prepared_session(
     let cache = tempfile::tempdir().unwrap();
     let package = Arc::new(
         ValidatedPackage::read(
-            crate::support::package_with_permissions(crate::support::worker(), permissions.clone()),
+            crate::support::package(crate::support::worker()),
             None,
             PackageLimits::default(),
         )
@@ -225,7 +220,6 @@ fn prepared_session(
         incarnation: uuid::Uuid::new_v4().to_string(),
         configuration: json!({}),
         contributes: gateway_plugin_sdk::Contributions::new(),
-        permissions,
     };
     let processes =
         gateway_host::process::ProcessSupervisor::new(std::num::NonZeroUsize::new(128).unwrap());
@@ -235,7 +229,7 @@ fn prepared_session(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn newly_unpacked_busy_executable_recovers_within_startup_deadline() {
-    let (_cache, prepared, handshake, processes) = prepared_session(vec![]);
+    let (_cache, prepared, handshake, processes) = prepared_session();
     let writer = std::fs::OpenOptions::new()
         .write(true)
         .open(prepared.executable())
@@ -260,7 +254,7 @@ async fn newly_unpacked_busy_executable_recovers_within_startup_deadline() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn persistently_busy_executable_stops_retrying_and_releases_capacity() {
-    let (_cache, prepared, handshake, _) = prepared_session(vec![]);
+    let (_cache, prepared, handshake, _) = prepared_session();
     let processes =
         gateway_host::process::ProcessSupervisor::new(std::num::NonZeroUsize::new(1).unwrap());
     let writer = std::fs::OpenOptions::new()
@@ -308,7 +302,7 @@ async fn persistently_busy_executable_stops_retrying_and_releases_capacity() {
 #[tokio::test]
 async fn shutdown_returns_after_in_flight_callback_future_is_dropped() {
     let callbacks = Arc::new(BlockingCallbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let callback_started = callbacks.started.notified();
     let calling = {
         let session = Arc::clone(&session);
@@ -339,7 +333,7 @@ async fn shutdown_returns_after_in_flight_callback_future_is_dropped() {
 #[tokio::test]
 async fn real_process_round_trips_raw_bytes_and_reentrant_callbacks() {
     let callbacks = Arc::new(Callbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     assert_eq!(
         session
             .context(Stage::Registration, Duration::MAX)
@@ -365,7 +359,7 @@ async fn real_process_round_trips_raw_bytes_and_reentrant_callbacks() {
 
 #[tokio::test]
 async fn slow_management_call_does_not_block_an_independent_call() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let context = session.context(Stage::Management, Duration::from_secs(2));
     let slow_session = Arc::clone(&session);
     let slow =
@@ -386,7 +380,7 @@ async fn slow_management_call_does_not_block_an_independent_call() {
 #[tokio::test]
 async fn large_binary_payload_round_trips_through_calls_and_callbacks() {
     let callbacks = Arc::new(Callbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let payload = (0..4 * 1024 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -410,7 +404,7 @@ async fn large_binary_payload_round_trips_through_calls_and_callbacks() {
 #[tokio::test]
 async fn oversized_call_frames_do_not_close_the_session_or_begin_callbacks() {
     let callbacks = Arc::new(LifecycleCallbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let cases = [(json!({"text": "x".repeat(64 * 1024)}), vec![])];
     for (params, payload) in cases {
         let begun = callbacks.begun.load(Ordering::Relaxed);
@@ -455,7 +449,7 @@ async fn oversized_call_frames_do_not_close_the_session_or_begin_callbacks() {
 
 #[tokio::test]
 async fn oversized_callback_metadata_only_fails_its_parent_call() {
-    let (_cache, session) = session(vec![], Arc::new(OversizedReplyCallbacks)).await;
+    let (_cache, session) = session(Arc::new(OversizedReplyCallbacks)).await;
     for error in [false, true] {
         assert!(matches!(
             session
@@ -487,7 +481,7 @@ async fn oversized_callback_metadata_only_fails_its_parent_call() {
 async fn concurrent_calls_keep_their_wire_ids_monotonic() {
     let callbacks = Arc::new(GatedFirstBegin::default());
     let entered = callbacks.entered.notified();
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let ready = Arc::new(Barrier::new(17));
     let mut calls = Vec::with_capacity(16);
     for index in 0..16 {
@@ -533,7 +527,7 @@ async fn concurrent_calls_keep_their_wire_ids_monotonic() {
 async fn cancelling_a_call_waiting_for_send_order_does_not_block_following_calls() {
     let callbacks = Arc::new(GatedFirstBegin::default());
     let entered = callbacks.entered.notified();
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let first = {
         let session = Arc::clone(&session);
         tokio::spawn(async move {
@@ -590,7 +584,7 @@ async fn cancelling_a_call_waiting_for_send_order_does_not_block_following_calls
 async fn waiting_for_send_order_consumes_the_original_call_deadline() {
     let callbacks = Arc::new(GatedFirstBegin::default());
     let entered = callbacks.entered.notified();
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let first = {
         let session = Arc::clone(&session);
         tokio::spawn(async move {
@@ -633,9 +627,9 @@ async fn waiting_for_send_order_consumes_the_original_call_deadline() {
 }
 
 #[tokio::test]
-async fn undeclared_callback_permission_never_reaches_the_host_handler() {
+async fn callback_reaches_host_without_permission_declarations() {
     let callbacks = Arc::new(Callbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let reply = session
         .call(
             "callback_method",
@@ -644,21 +638,15 @@ async fn undeclared_callback_permission_never_reaches_the_host_handler() {
             vec![],
         )
         .await;
-    assert!(matches!(
-        reply,
-        Err(RpcError::Remote(PluginFault {
-            code: ErrorCode::PermissionDenied,
-            ..
-        }))
-    ));
-    assert_eq!(callbacks.called.load(Ordering::Relaxed), 0);
+    assert!(reply.is_ok());
+    assert_eq!(callbacks.called.load(Ordering::Relaxed), 1);
     session.shutdown(Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
-async fn unknown_parent_cannot_borrow_another_calls_permissions() {
+async fn unknown_parent_cannot_borrow_another_calls_resources() {
     let callbacks = Arc::new(Callbacks::default());
-    let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+    let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let reply = session
         .call(
             "forged_callback",
@@ -673,7 +661,7 @@ async fn unknown_parent_cannot_borrow_another_calls_permissions() {
 
 #[tokio::test]
 async fn explicit_policy_denial_keeps_its_error_kind_and_status() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let reply = session
         .call(
             "deny",
@@ -695,7 +683,7 @@ async fn explicit_policy_denial_keeps_its_error_kind_and_status() {
 
 #[tokio::test]
 async fn ignored_cancellation_closes_the_incarnation_and_settles_other_calls() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let first = session.call(
         "hang_uncancellable",
         session.context(Stage::Request, Duration::from_millis(100)),
@@ -716,7 +704,7 @@ async fn ignored_cancellation_closes_the_incarnation_and_settles_other_calls() {
 
 #[tokio::test]
 async fn child_crash_fails_the_call_without_waiting_for_its_deadline() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let call = session.call(
         "crash",
         session.context(Stage::Request, Duration::from_secs(30)),
@@ -733,7 +721,7 @@ async fn child_crash_fails_the_call_without_waiting_for_its_deadline() {
 async fn malformed_worker_frames_fail_boundedly_and_release_call_resources() {
     for method in ["malformed_truncated_frame", "malformed_frame_length"] {
         let callbacks = Arc::new(LifecycleCallbacks::default());
-        let (_cache, session) = session(vec![], Arc::clone(&callbacks)).await;
+        let (_cache, session) = session(Arc::clone(&callbacks)).await;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             session.call(
@@ -755,7 +743,7 @@ async fn malformed_worker_frames_fail_boundedly_and_release_call_resources() {
 
 #[tokio::test]
 async fn slow_stream_consumer_backpressures_the_child_without_blocking_control_calls() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let mut stream = session
         .call_stream(
             "stream",
@@ -790,7 +778,7 @@ async fn slow_stream_consumer_backpressures_the_child_without_blocking_control_c
 #[tokio::test]
 async fn stream_window_and_sequence_violations_fail_closed() {
     for method in ["stream_overflow", "stream_sequence"] {
-        let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+        let (_cache, session) = session(Arc::new(Callbacks::default())).await;
         let mut stream = session
             .call_stream(
                 method,
@@ -807,7 +795,7 @@ async fn stream_window_and_sequence_violations_fail_closed() {
 
 #[tokio::test]
 async fn dropping_a_backpressured_stream_cancels_only_that_call() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let stream = session
         .call_stream(
             "stream",
@@ -834,7 +822,7 @@ async fn dropping_a_backpressured_stream_cancels_only_that_call() {
 
 #[tokio::test]
 async fn acknowledged_timeout_does_not_interrupt_another_call() {
-    let (_cache, session) = session(vec![], Arc::new(Callbacks::default())).await;
+    let (_cache, session) = session(Arc::new(Callbacks::default())).await;
     let first = session.call(
         "hang",
         session.context(Stage::Management, Duration::from_millis(100)),

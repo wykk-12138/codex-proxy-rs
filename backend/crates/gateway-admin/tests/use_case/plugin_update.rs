@@ -103,7 +103,7 @@ impl PluginStore for Fixture {
                 trusted_process: true,
                 configuration: serde_json::json!({}),
                 secrets: BTreeMap::new(),
-                grants: Vec::new(),
+
                 bindings: Vec::new(),
                 revision: Revision::new(1).expect("revision"),
             }],
@@ -126,7 +126,7 @@ impl PluginStore for Fixture {
                 platforms: Vec::new(),
                 icon: None,
                 contributes: BTreeMap::new(),
-                requested_permissions: Vec::new(),
+
                 configuration_schema: serde_json::json!({}),
                 secret_fields: Vec::new(),
                 state_namespaces: Vec::new(),
@@ -285,11 +285,11 @@ impl SystemOperations for PreflightingSystem {
 
 #[tokio::test]
 async fn system_update_accepts_compatible_enabled_plugins_at_the_same_revision() {
-    let fixture = Fixture::new(requirements("^1.0", "executor", "log"), &[7]);
+    let fixture = Fixture::new(requirements("^1.0", "executor"), &[7]);
     let services = super::AdminHarness::new()
         .plugins(fixture.clone(), fixture)
         .system(Arc::new(PreflightingSystem {
-            candidate: candidate("executor", "log"),
+            candidate: candidate("executor"),
         }))
         .build()
         .await;
@@ -303,11 +303,11 @@ async fn system_update_accepts_compatible_enabled_plugins_at_the_same_revision()
 
 #[tokio::test]
 async fn system_update_rejects_missing_target_capability_and_revision_changes() {
-    let incompatible = Fixture::new(requirements("^1.0", "executor", "log"), &[7]);
+    let incompatible = Fixture::new(requirements("^1.0", "executor"), &[7]);
     let services = super::AdminHarness::new()
         .plugins(incompatible.clone(), incompatible)
         .system(Arc::new(PreflightingSystem {
-            candidate: candidate("models", "log"),
+            candidate: candidate("models"),
         }))
         .build()
         .await;
@@ -319,11 +319,11 @@ async fn system_update_rejects_missing_target_capability_and_revision_changes() 
             .is_err()
     );
 
-    let stale = Fixture::new(requirements("^1.0", "executor", "log"), &[7, 8]);
+    let stale = Fixture::new(requirements("^1.0", "executor"), &[7, 8]);
     let services = super::AdminHarness::new()
         .plugins(stale.clone(), stale)
         .system(Arc::new(PreflightingSystem {
-            candidate: candidate("executor", "log"),
+            candidate: candidate("executor"),
         }))
         .build()
         .await;
@@ -336,32 +336,26 @@ async fn system_update_rejects_missing_target_capability_and_revision_changes() 
     );
 }
 
-fn requirements(
-    host_version: &str,
-    capability: &str,
-    permission: &str,
-) -> PluginCompatibilityRequirements {
+fn requirements(host_version: &str, capability: &str) -> PluginCompatibilityRequirements {
     PluginCompatibilityRequirements {
         host_version: host_version.into(),
         manifest_schema_version: 2,
         protocol_version: 3,
         capabilities: vec![(capability.into(), 1)],
-        permissions: vec![permission.into()],
     }
 }
 
-fn candidate(capability: &str, permission: &str) -> SystemUpdateCandidate {
+fn candidate(capability: &str) -> SystemUpdateCandidate {
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
         "sealed": true,
         "gateway_version": "1.2.0",
         "gateway_git_sha": "a".repeat(40),
         "plugin_host": {
-            "schema_version": 1,
+            "schema_version": 2,
             "manifest_schema_versions": [2],
             "protocol_versions": [3],
             "capabilities": [{ "capability": capability, "versions": [1] }],
-            "permissions": [permission],
         },
         "plugins": [],
     }))

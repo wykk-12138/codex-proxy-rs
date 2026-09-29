@@ -37,6 +37,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 fn update_body() -> Value {
     json!({
+        "configRevision": 7,
         "requestLocationEnabled": false,
         "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
         "modelMappings": {
@@ -249,6 +250,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "configRevision": 7,
             "providerRequestProfiles": {},
             "openaiClientProfile": null,
             "xaiClientProfile": null,
@@ -424,7 +426,7 @@ async fn settings_post_should_replace_global_model_mappings() {
         .expect("settings update response");
     let data = response_json(response).await["data"].clone();
 
-    assert!(data.get("configRevision").is_none());
+    assert_eq!(data["configRevision"], 8);
     assert_eq!(data["modelMappings"]["gpt-5.4"], "gpt-5.5");
     assert_eq!(data["modelMappings"]["grok-latest"], "grok-4.5");
 }
@@ -612,12 +614,12 @@ async fn request_location_should_normalize_toggle_and_round_trip() {
         .oneshot(request(Method::GET, "/api/admin/settings", None))
         .await
         .unwrap();
-    assert_eq!(
-        response_json(response).await["data"]["requestLocation"],
-        expected
-    );
+    let data = response_json(response).await["data"].clone();
+    assert_eq!(data["requestLocation"], expected);
+    let mut revision = data["configRevision"].clone();
     for enabled in [false, true] {
         let mut body = update_body();
+        body["configRevision"] = revision.clone();
         body["requestLocationEnabled"] = json!(enabled);
         body["requestLocation"] = expected.clone();
         let response = app(fixture.state())
@@ -634,6 +636,7 @@ async fn request_location_should_normalize_toggle_and_round_trip() {
             .await
             .unwrap();
         let data = response_json(response).await["data"].clone();
+        revision = data["configRevision"].clone();
         assert_eq!(data["requestLocationEnabled"], json!(enabled));
         assert_eq!(data["requestLocation"], expected);
     }
@@ -1218,4 +1221,54 @@ async fn pricing_endpoints_require_administrator_authentication() {
             StatusCode::UNAUTHORIZED
         );
     }
+}
+
+#[tokio::test]
+async fn settings_update_rejects_a_stale_version_without_replacing_the_saved_value() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let router = app(fixture.state());
+    let first = router
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(update_body()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await["data"].clone();
+    let mut stale = update_body();
+    stale["refreshMarginSeconds"] = json!(9999);
+    let conflict = router
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(stale.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let current = router
+        .clone()
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(response_json(current).await["data"], first);
+    stale["configRevision"] = first["configRevision"].clone();
+    let retry = router
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(stale),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(retry).await["data"]["refreshMarginSeconds"],
+        9999
+    );
 }

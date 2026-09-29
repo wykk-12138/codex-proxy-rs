@@ -25,6 +25,66 @@ struct PricingSettingsStore {
 }
 
 #[tokio::test]
+async fn explicit_service_calls_freeze_empty_plan_and_cancel_before_entering_terminal() {
+    use gateway_admin::service::{Origin, Plan, scope};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let source_calls = resolutions.clone();
+    let store = Arc::new(PricingSettingsStore::default());
+    let services = super::AdminHarness::new()
+        .settings(store.clone())
+        .service_middleware(Arc::new(move || {
+            source_calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }))
+        .build()
+        .await;
+    let context = MutationContext {
+        actor: gateway_admin::model::MutationActor::System,
+        request_id: "empty-plan".into(),
+    };
+    let command = UpdatePricing {
+        provider: "xai".into(),
+        models: vec!["example-model".into()],
+        change: PricingChange::Reset,
+    };
+    for expected in 1..=2 {
+        services
+            .public_services()
+            .call(
+                "settings.update_pricing",
+                serde_json::to_value((&context, command.clone())).unwrap(),
+            )
+            .await
+            .unwrap();
+        // 内部 pricing 不再单独进入插件链；显式调用只解析一次发布集合。
+        assert_eq!(resolutions.load(Ordering::SeqCst), expected);
+    }
+    store.updated.lock().unwrap().take();
+    let cancellation = gateway_core::lifecycle::CancellationToken::new();
+    cancellation.cancel();
+    let error = scope(
+        Origin {
+            request_id: "cancelled-native".into(),
+            call_id: "entry".into(),
+            cancellation,
+            extensions: Default::default(),
+            plan: Plan::Frozen(None),
+        },
+        services.public_services().call(
+            "settings.update_pricing",
+            serde_json::to_value((context, command)).unwrap(),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, "unavailable");
+    assert!(store.updated.lock().unwrap().is_none());
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn client_profile_preview_rejects_unknown_provider_before_loading_settings() {
     let services = super::AdminHarness::new()
         .settings(Arc::new(UnusedSettingsStore))
@@ -213,6 +273,7 @@ async fn settings_should_reject_zero_refresh_margin_before_store_call() {
                 request_id: "request-settings".to_owned(),
             },
             ReplaceRuntimeSettings {
+                expected_revision: gateway_admin::model::Revision::new(1).unwrap(),
                 request_profile_updates: Default::default(),
                 request_location_enabled: false,
                 request_location: Default::default(),

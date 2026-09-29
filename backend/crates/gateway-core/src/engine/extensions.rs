@@ -12,6 +12,8 @@ pub struct ExtensionCallScope {
 }
 
 impl ExtensionCallScope {
+    pub const MAXIMUM_DEPTH: usize = 4;
+
     #[must_use]
     pub fn contains(&self, instance_id: &str) -> bool {
         self.instance_ids.contains(instance_id)

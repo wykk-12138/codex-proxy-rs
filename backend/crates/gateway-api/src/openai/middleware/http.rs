@@ -1,6 +1,6 @@
 //! 未提交响应的 HTTP 交付；只验证协议边界，不解释或重算 Core 的业务事实。
 
-use super::request::{decode_headers, request_headers};
+use crate::middleware::headers::{decode_headers, encode_headers};
 use crate::openai::error::{
     gateway_error_from_engine, gateway_error_response, openai_error_response,
 };
@@ -18,7 +18,6 @@ use gateway_core::{
     },
     error::GatewayError,
 };
-use gateway_protocol::openai::response_header_is_forwardable;
 
 /// 只读目录/用量与协议错误共用的单帧响应；没有 Provider attempt 或计量副作用。
 pub(crate) async fn buffered_response(
@@ -37,7 +36,7 @@ pub(crate) async fn buffered_response(
     Ok(MiddlewareResponse::new(
         protocol.to_owned(),
         parts.status.as_u16(),
-        request_headers(&parts.headers),
+        encode_headers(&parts.headers),
         Box::new(BufferedBody(Some(MiddlewareFrame::new(
             bytes, framing, true,
         )))),
@@ -221,29 +220,8 @@ fn response_head(
     if status.is_informational() {
         return Err(MiddlewareError::InvalidState);
     }
-    let mut result = decode_headers(headers)?;
-    let connection_options = result
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    // Content-Type 由协议 adapter 生成；其余字段在最终交付边界统一剥离认证与传输信息。
-    let blocked = result
-        .keys()
-        .filter(|name| {
-            *name != header::CONTENT_TYPE
-                && !response_header_is_forwardable(name.as_str(), &connection_options)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in blocked {
-        result.remove(name);
-    }
-    Ok((status, result))
+    // 原生上游头已在协议终端处理；插件返回后的字段只做 HTTP 类型校验。
+    Ok((status, decode_headers(headers)?))
 }
 
 async fn fail_before_commit(mut body: Box<dyn MiddlewareBody>, error: MiddlewareError) -> Response {
@@ -262,19 +240,23 @@ pub(crate) fn error_response(error: MiddlewareError) -> Response {
         MiddlewareError::Provider(error) => {
             gateway_error_response(&GatewayError::from_provider(&error))
         }
-        MiddlewareError::Rejected => openai_error_response(
-            StatusCode::FORBIDDEN,
-            "Request rejected by middleware",
-            "invalid_request_error",
-            "middleware_rejected",
-        )
-        .into_response(),
-        MiddlewareError::Fault | MiddlewareError::InvalidState => openai_error_response(
-            StatusCode::BAD_GATEWAY,
-            "Request middleware failed",
-            "server_error",
-            "middleware_failed",
-        )
-        .into_response(),
+        MiddlewareError::Rejected | MiddlewareError::Remote { rejected: true, .. } => {
+            openai_error_response(
+                StatusCode::FORBIDDEN,
+                "Request rejected by middleware",
+                "invalid_request_error",
+                "middleware_rejected",
+            )
+            .into_response()
+        }
+        MiddlewareError::Fault | MiddlewareError::Remote { .. } | MiddlewareError::InvalidState => {
+            openai_error_response(
+                StatusCode::BAD_GATEWAY,
+                "Request middleware failed",
+                "server_error",
+                "middleware_failed",
+            )
+            .into_response()
+        }
     }
 }

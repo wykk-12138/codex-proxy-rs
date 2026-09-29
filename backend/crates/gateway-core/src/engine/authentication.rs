@@ -18,11 +18,27 @@ pub const MAXIMUM_AUTHORIZATION_BYTES: usize = 8 * 1024;
 /// API 从数据面 Authorization 头构造的有界认证信封。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientAuthenticationRequest {
+    settings: Option<crate::settings::RequestSettings>,
     authorization: Arc<str>,
     native_bearer: Option<PlaintextClientApiKey>,
 }
 
 impl ClientAuthenticationRequest {
+    #[must_use]
+    pub fn with_settings(mut self, settings: crate::settings::RequestSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> Option<&crate::settings::RequestSettings> {
+        self.settings.as_ref()
+    }
+
+    pub(crate) fn take_settings(&mut self) -> Option<crate::settings::RequestSettings> {
+        self.settings.take()
+    }
+
     /// 创建入口认证信封；HTTP 语法与缺失头仍由 API owner 负责。
     pub fn new(authorization: impl Into<String>) -> Result<Self, ClientAuthenticationRequestError> {
         let authorization = authorization.into();
@@ -39,6 +55,7 @@ impl ClientAuthenticationRequest {
             .filter(|value| !value.is_empty())
             .and_then(|value| PlaintextClientApiKey::new(value.to_owned()).ok());
         Ok(Self {
+            settings: None,
             authorization: authorization.into(),
             native_bearer,
         })

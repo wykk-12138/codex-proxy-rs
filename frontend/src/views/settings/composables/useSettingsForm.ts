@@ -24,6 +24,7 @@ export function useSettingsForm() {
   const savedRequestLocation = shallowRef<RequestLocation>()
   const smartSchedulingDefaults = shallowRef<SmartSchedulingConfig>()
   const form = reactive({
+    configRevision: 0,
     smartScheduling: undefined as SmartSchedulingConfig | undefined,
     providerRequestProfiles: {} as ProviderRequestProfiles,
     requestLocationEnabled: false,
@@ -119,6 +120,7 @@ export function useSettingsForm() {
   }
 
   function applySettings(data: Awaited<ReturnType<typeof getSettings>>) {
+    form.configRevision = data.configRevision
     savedRequestLocation.value = { ...data.requestLocation }
     form.requestLocationEnabled = data.requestLocationEnabled
     form.requestLocation = { ...data.requestLocation }
@@ -275,6 +277,7 @@ export function useSettingsForm() {
     }
     await saveAction.run(async () => {
       const result = await updateSettings({
+        configRevision: savedSettings.form.configRevision,
         providerRequestProfiles: requestProfileUpdates(
           savedSettings.form.providerRequestProfiles,
           form.providerRequestProfiles,
@@ -313,7 +316,7 @@ export function useSettingsForm() {
       toast.success('设置已保存')
     }, {
       onError: (cause) => {
-        if (cause instanceof ApiError)
+        if (cause instanceof ApiError && cause.status !== 409)
           void loadSettings(true)
       },
     })

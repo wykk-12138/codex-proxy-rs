@@ -176,23 +176,6 @@ pub trait PluginDistribution: Send + Sync {
 /// Runtime 只解释插件包格式；安装事务与来源选择归 Admin。
 #[async_trait]
 pub trait PluginPackageInspector: Send + Sync {
-    /// 当前宿主对权限标识的说明，供展示投影使用，不属于不可变制品元数据。
-    fn permission_descriptions(
-        &self,
-        permissions: &[String],
-    ) -> Vec<crate::model::plugins::PluginPermissionDescription> {
-        permissions
-            .iter()
-            .map(
-                |permission| crate::model::plugins::PluginPermissionDescription {
-                    permission: permission.clone(),
-                    label: permission.clone(),
-                    description: String::new(),
-                },
-            )
-            .collect()
-    }
-
     async fn inspect(
         &self,
         archive: Arc<[u8]>,
@@ -314,7 +297,7 @@ pub trait PluginStore: Send + Sync {
         source: PluginSource,
         context: &MutationContext,
     ) -> AdminStoreResult<PluginArtifactMutation>;
-    /// 接受不可变制品声明的全部能力域；接受事实不随实例设置变化。
+    /// 确认信任并安装精确摘要的制品；安装事实不随实例设置变化。
     async fn accept_artifact(
         &self,
         digest: &str,

@@ -1496,7 +1496,7 @@ fn initialized_provider_request(operation: Operation, account_id: &str) -> Provi
     let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        account_policy(),
+        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider,

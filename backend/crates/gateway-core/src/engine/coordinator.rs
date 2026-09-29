@@ -59,6 +59,7 @@ pub(super) struct CoordinationExtensions {
     execution_effects: Option<Arc<ExecutionEffects>>,
     execution_effects_baseline: usize,
     middleware: Option<super::middleware::FrozenMiddlewarePlan>,
+    upstream_adapters: Option<super::upstream_adapter::FrozenUpstreamAdapterPlan>,
     account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
     endpoint: String,
     client_transport: super::execution::ClientTransport,
@@ -66,6 +67,14 @@ pub(super) struct CoordinationExtensions {
 }
 
 impl CoordinationExtensions {
+    pub(super) fn with_upstream_adapters(
+        mut self,
+        plan: Option<super::upstream_adapter::FrozenUpstreamAdapterPlan>,
+    ) -> Self {
+        self.upstream_adapters = plan;
+        self
+    }
+
     pub(super) fn with_response_control(
         mut self,
         control: Option<super::response_control::ResponseControl>,
@@ -86,6 +95,7 @@ impl CoordinationExtensions {
             execution_effects: None,
             execution_effects_baseline: 0,
             middleware: None,
+            upstream_adapters: None,
             account_group_ids: Arc::from([]),
             endpoint: String::new(),
             client_transport: super::execution::ClientTransport::InternalProbe,
@@ -247,6 +257,7 @@ where
             execution_effects,
             execution_effects_baseline,
             middleware,
+            upstream_adapters,
             account_group_ids,
             endpoint,
             client_transport,
@@ -304,6 +315,7 @@ where
                     .unwrap_or(Duration::ZERO),
             )
             .fuse(),
+            requested_model: request.requested_model.clone(),
             pending_request: Some(request),
             request_persisted: false,
             response_control,
@@ -313,6 +325,7 @@ where
             execution_effects,
             execution_effects_baseline,
             middleware,
+            upstream_adapters,
             account_group_ids,
             endpoint,
             client_transport,
@@ -420,6 +433,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     /// 会话级 deadline 计时器；deadline 固定，帧循环内复用而非逐事件新建。
     deadline_timer: Fuse<Delay>,
     pending_request: Option<NewModelRequest>,
+    requested_model: Option<crate::routing::PublicModelId>,
     request_persisted: bool,
     response_control: Option<super::response_control::ResponseControl>,
     operation: Operation,
@@ -428,6 +442,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     execution_effects: Option<Arc<ExecutionEffects>>,
     execution_effects_baseline: usize,
     middleware: Option<super::middleware::FrozenMiddlewarePlan>,
+    upstream_adapters: Option<super::upstream_adapter::FrozenUpstreamAdapterPlan>,
     account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
     endpoint: String,
     client_transport: super::execution::ClientTransport,
@@ -756,7 +771,16 @@ where
                 provider,
                 account,
             )
-            .with_scope(NativeContinuationScope::Persisted)
+            .with_scope(
+                if state
+                    .extension_owner()
+                    .is_some_and(|owner| owner.connection_local)
+                {
+                    NativeContinuationScope::ConnectionLocal
+                } else {
+                    NativeContinuationScope::Persisted
+                },
+            )
             .with_session_state(state.clone()),
         )
     }
@@ -1022,6 +1046,8 @@ where
                 .with_timing_started_at(self.observation.timing_started_at)
                 .with_request_policy(self.request_policy.clone())
                 .with_execution_effects(self.execution_effects.as_ref().map(Arc::clone))
+                .with_upstream_adapters(self.upstream_adapters.clone())
+                .with_requested_model(self.requested_model.clone())
                 .with_middleware(
                     self.middleware.clone(),
                     Arc::clone(&self.account_group_ids),

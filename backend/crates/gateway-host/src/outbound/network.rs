@@ -12,9 +12,19 @@ use super::{HttpError, HttpErrorKind};
 #[derive(Clone, Default)]
 pub struct NetworkPolicy {
     additional: Vec<IpNet>,
+    unrestricted: bool,
 }
 
 impl NetworkPolicy {
+    /// 完整信任的宿主调用方可以访问任意地址；仍使用相同的 DNS 与传输实现。
+    #[must_use]
+    pub const fn unrestricted() -> Self {
+        Self {
+            additional: Vec::new(),
+            unrestricted: true,
+        }
+    }
+
     pub fn new(networks: &[String]) -> Result<Self, HttpError> {
         if networks.len() > 32 {
             return Err(HttpError::invalid("network limits"));
@@ -27,7 +37,10 @@ impl NetworkPolicy {
                     .map_err(|_| HttpError::invalid("network range"))
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self { additional })
+        Ok(Self {
+            additional,
+            unrestricted: false,
+        })
     }
 
     #[must_use]
@@ -38,7 +51,8 @@ impl NetworkPolicy {
                 .map_or(IpAddr::V6(address), IpAddr::V4),
             other => other,
         };
-        public_address(address)
+        self.unrestricted
+            || public_address(address)
             || self
                 .additional
                 .iter()

@@ -24,12 +24,6 @@ export interface PluginContribution {
 
 export type PluginIconAsset = string | { light: string, dark: string }
 
-export interface PluginPermissionDescription {
-  permission: string
-  label: string
-  description: string
-}
-
 export interface PluginArtifactMetadata {
   pluginId: string
   version: string
@@ -43,8 +37,6 @@ export interface PluginArtifactMetadata {
   sha256: string
   platforms: string[]
   contributes: Record<string, PluginContribution>
-  requestedPermissions: string[]
-  permissionDescriptions: PluginPermissionDescription[]
   configurationSchema: Record<string, unknown>
   secretFields: string[]
   stateNamespaces: {
@@ -180,7 +172,10 @@ export interface PluginFrontendIdentityBinding {
   clientKeyId: string
 }
 
+export type PluginObserverEvent = 'request_completed' | 'websocket_response'
+
 export interface PluginCapabilityBinding {
+  event?: PluginObserverEvent | null
   contribution: string
   stage: string
   order: number

@@ -32,10 +32,10 @@ use gateway_protocol::openai::sse::{DONE_SSE_FRAME, response_failed_sse_event_wi
 use tokio::time::Instant;
 
 use crate::ApiState;
+use crate::middleware::headers::encode_headers;
 use crate::openai::middleware::{
-    ExpectedBody, HttpMiddlewareInput, PendingExecution, error_response, finalize_session,
-    into_http_response, invoke_http_middleware, pending_execution_response, request_headers,
-    request_parts,
+    ExpectedBody, PendingExecution, RequestInput, error_response, finalize_session,
+    into_http_response, invoke_request, pending_execution_response, request_parts,
 };
 use crate::openai::service::OpenAiService;
 use crate::openai::{
@@ -98,7 +98,6 @@ pub(crate) async fn responses(
             headers,
             decoded,
             middleware_body,
-            maximum_body_bytes,
         },
         None,
     )
@@ -112,7 +111,6 @@ pub(crate) struct ResponsesHttpRequest {
     pub headers: HeaderMap,
     pub decoded: DecodedResponsesRequest,
     pub middleware_body: Bytes,
-    pub maximum_body_bytes: usize,
 }
 
 pub(crate) async fn execute_prepared_responses(
@@ -127,7 +125,6 @@ pub(crate) async fn execute_prepared_responses(
         headers,
         decoded,
         middleware_body,
-        maximum_body_bytes,
     } = request;
     let (client_ip, user_agent) = request_client_context(&headers, peer_address);
     let stream = decoded.metadata().stream();
@@ -146,19 +143,19 @@ pub(crate) async fn execute_prepared_responses(
     // 中间件正文已经由入口按上限解压；传输编码和旧长度不能与改写后的正文混用。
     middleware_headers.remove(CONTENT_ENCODING);
     middleware_headers.remove(CONTENT_LENGTH);
-    let input = HttpMiddlewareInput {
+    let input = RequestInput {
         endpoint: crate::openai::router::RESPONSES_PATH.to_owned(),
         protocol: OPENAI_PROTOCOL.to_owned(),
         operation: Some(OperationKind::Generate),
         transport,
         model_hint,
-        headers: request_headers(&middleware_headers),
+        headers: encode_headers(&middleware_headers),
         body: middleware_body,
     };
     let terminal_service = service.clone();
     let validation = ResponseValidationFacts::default();
     let terminal_validation = validation.clone();
-    let middleware = invoke_http_middleware(
+    let middleware = invoke_request(
         execution,
         prepared,
         input,
@@ -171,7 +168,10 @@ pub(crate) async fn execute_prepared_responses(
                 let decoded = decode_request_with_headers(
                     &request_body,
                     &request_headers,
-                    maximum_body_bytes,
+                    prepared
+                        .client()
+                        .snapshot()
+                        .responses_max_decompressed_body_bytes(),
                 )
                 .map_err(|_| MiddlewareError::Rejected)?
                 .with_client_context(client_ip, user_agent)
@@ -704,7 +704,7 @@ async fn guarded_http_response(
     Ok(pending_execution_response(
         OPENAI_PROTOCOL.to_owned(),
         parts.status.as_u16(),
-        request_headers(&parts.headers),
+        encode_headers(&parts.headers),
         MiddlewareFrame::new(bytes, MiddlewareFraming::RawBytes, true),
         execution,
     ))

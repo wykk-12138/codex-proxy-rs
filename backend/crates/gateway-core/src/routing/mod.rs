@@ -27,8 +27,16 @@ use crate::validation::{IdentifierError, RoutingError, validate_text};
 const MAX_REQUEST_ATTEMPTS: u32 = 32;
 
 /// 客户端请求中的模型名称。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct PublicModelId(String);
+
+impl<'de> serde::Deserialize<'de> for PublicModelId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(<String as serde::Deserialize>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 impl PublicModelId {
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
@@ -66,8 +74,16 @@ impl fmt::Display for PublicModelId {
 }
 
 /// Provider 实际接收的模型名称。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct UpstreamModelId(String);
+
+impl<'de> serde::Deserialize<'de> for UpstreamModelId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(<String as serde::Deserialize>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 impl UpstreamModelId {
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {

@@ -53,6 +53,11 @@ impl ModelRouteInput {
     }
 
     #[must_use]
+    pub fn extension_scope(&self) -> &ExtensionCallScope {
+        &self.extension_scope
+    }
+
+    #[must_use]
     pub fn suppresses_plugin(&self, instance_id: &str) -> bool {
         self.extension_scope.contains(instance_id)
     }
@@ -198,6 +203,11 @@ impl AccountScheduleInput {
     #[must_use]
     pub fn account_group_ids(&self) -> &[AccountGroupId] {
         &self.account_group_ids
+    }
+
+    #[must_use]
+    pub fn extension_scope(&self) -> &ExtensionCallScope {
+        &self.extension_scope
     }
 
     #[must_use]

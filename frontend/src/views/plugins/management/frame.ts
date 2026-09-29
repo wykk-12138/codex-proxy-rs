@@ -473,12 +473,6 @@ function createBridgeScript(input: {
     const initial = ${initial};
     const pending = new Map();
     const modelOperations = new Map();
-    const safeModelHeaders = new Set([
-      'content-type', 'openai-processing-ms', 'openai-request-id', 'request-id', 'retry-after',
-      'x-client-request-id', 'x-gateway-request-id', 'x-oai-request-id', 'x-openai-request-id', 'x-processing-ms', 'x-request-id',
-      'x-ratelimit-limit-requests', 'x-ratelimit-limit-tokens', 'x-ratelimit-remaining-requests',
-      'x-ratelimit-remaining-tokens', 'x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens',
-    ]);
     let sequence = 0;
     let resizeObserver;
     let resizeFrame = 0;
@@ -635,18 +629,12 @@ function createBridgeScript(input: {
     }
 
     function validateResponseHeaders(value) {
-      if (!Array.isArray(value) || value.length > 32) throw new Error('模型响应头无效');
-      const headers = [];
-      let total = 0;
+      if (!Array.isArray(value)) throw new Error('模型响应头无效');
       for (const entry of value) {
         if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || typeof entry[1] !== 'string') throw new Error('模型响应头无效');
-        const name = entry[0].toLowerCase();
-        const headerValue = entry[1];
-        total += name.length + headerValue.length;
-        if (!safeModelHeaders.has(name) || headerValue.length > 8192 || total > 32768 || /[\\u0000-\\u0008\\u000A-\\u001F\\u007F]/u.test(headerValue)) throw new Error('模型响应头无效');
-        headers.push([name, headerValue]);
       }
-      return headers;
+      // 与宿主共享浏览器的 Headers 校验，不再按插件身份过滤字段。
+      return new Headers(value);
     }
 
     function handleModelMessage(message) {

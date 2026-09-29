@@ -149,10 +149,7 @@ async fn verify<S: SessionState + Send + Sync>(
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(VerifiedArtifactView::new(
-            result,
-            state.admin_services().plugins(),
-        )),
+        AdminEnvelope::ok(VerifiedArtifactView::new(result)),
     ))
 }
 
@@ -169,10 +166,7 @@ async fn install<S: SessionState + Send + Sync>(
         .map_err(map_admin_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
-        AdminEnvelope::ok(InstallResultView::new(
-            result,
-            state.admin_services().plugins(),
-        )),
+        AdminEnvelope::ok(InstallResultView::new(result)),
     ))
 }
 

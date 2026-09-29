@@ -1,6 +1,8 @@
 use super::*;
 use std::time::SystemTime;
 
+const ROTATION_RECORDS: usize = 3;
+
 #[test]
 fn retention_preserves_complete_dates_across_compression_rotation_and_restart() {
     if env::var_os(CHILD_PROCESS_ENV).is_some() {
@@ -9,7 +11,8 @@ fn retention_preserves_complete_dates_across_compression_rotation_and_restart() 
             true,
             || {
                 let payload = "x".repeat(1024 * 1024);
-                for sequence in 0..25 {
+                // 三条记录已跨过 1 MiB 轮转边界；保留日期的 25 个分段由下方单独构造。
+                for sequence in 0..ROTATION_RECORDS {
                     tracing::info!(target: REQUEST_DUMP_LOG_TARGET, sequence, payload, "retention record");
                     tracing::info!(target: APPLICATION_LOG_TARGET, sequence, payload, "retention record");
                     tracing::info!(target: OAUTH_RECOVERY_LOG_TARGET, sequence, payload, "retention record");
@@ -89,18 +92,47 @@ fn retention_preserves_complete_dates_across_compression_rotation_and_restart() 
             REQUEST_DUMP_LOG_FILE_PREFIX,
         ] {
             let body = read_log_file_set(directory.path(), prefix);
-            for sequence in 0..25 {
-                assert_eq!(
-                    body.matches(&format!(r#""sequence":{sequence},"#)).count(),
-                    run
-                );
+            let mut sequences = [0; ROTATION_RECORDS];
+            let mut boundaries = std::collections::BTreeSet::new();
+            for line in body.lines() {
+                if let Some(segment) = line.strip_prefix("boundary-") {
+                    boundaries.insert(segment.parse::<usize>().unwrap());
+                } else if line.starts_with('{') {
+                    #[derive(serde::Deserialize)]
+                    struct Record {
+                        fields: Fields,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct Fields {
+                        sequence: Option<usize>,
+                    }
+                    if let Some(sequence) = serde_json::from_str::<Record>(line)
+                        .unwrap()
+                        .fields
+                        .sequence
+                    {
+                        sequences[sequence] += 1;
+                    }
+                }
             }
-            for segment in 1..=25 {
-                assert!(
-                    body.contains(&format!("boundary-{segment}\n")),
-                    "whole boundary date must survive"
-                );
-            }
+            assert_eq!(sequences, [run; ROTATION_RECORDS]);
+            assert_eq!(
+                boundaries,
+                (1..=25).collect(),
+                "whole boundary date must survive"
+            );
+            let today_segments = fs::read_dir(directory.path())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{prefix}{today}"))
+                })
+                .count();
+            assert!(today_segments >= 2, "records must exercise size rotation");
         }
     }
 }

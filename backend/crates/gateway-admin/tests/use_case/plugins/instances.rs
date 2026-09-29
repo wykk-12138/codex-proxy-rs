@@ -20,8 +20,7 @@ use gateway_admin::{
                 ConfigurePluginInstance, PluginCapabilityBinding, PluginFailurePolicy,
                 PluginInstance, PluginInstanceMutation, PluginInstanceReplacement,
                 PluginInstanceRuntime, PluginInstanceRuntimeFailure, PluginInstanceRuntimeStatus,
-                PluginInstanceSnapshot, PluginPermissionGrant, PluginVersionConfiguration,
-                RollbackPluginInstance,
+                PluginInstanceSnapshot, PluginVersionConfiguration, RollbackPluginInstance,
             },
             state::{
                 ApplyPluginStateMigration, DeletePluginState, PluginStateCommit,
@@ -103,7 +102,7 @@ impl LifecycleFixture {
                         trusted_process: true,
                         configuration: json!({}),
                         secrets: Default::default(),
-                        grants: vec![],
+
                         bindings: vec![],
                         revision: revision(10),
                     }],
@@ -599,7 +598,7 @@ fn artifact(digest: &str, plugin_id: &str, version: &str) -> InstalledPluginArti
                     output_formats: Vec::new(),
                 },
             )]),
-            requested_permissions: vec![],
+
             configuration_schema: json!({"type":"object"}),
             secret_fields: vec![],
             state_namespaces: vec![],
@@ -998,13 +997,12 @@ async fn failed_state_migration_never_overwrites_a_concurrent_configuration_chan
 }
 
 #[tokio::test]
-async fn rollback_restores_target_configuration_secrets_and_bindings_and_derives_permissions() {
+async fn rollback_restores_target_configuration_secrets_and_bindings() {
     use secrecy::ExposeSecret as _;
 
     let fixture = LifecycleFixture::new(MigrationBehavior::Succeed);
     {
         let mut data = fixture.data.lock().unwrap();
-        data.artifacts[1].metadata.requested_permissions = vec!["network".into()];
         let instance = &mut data.snapshot.instances[0];
         instance.configuration = json!({"label":"retained"});
         instance
@@ -1019,6 +1017,7 @@ async fn rollback_restores_target_configuration_secrets_and_bindings_and_derives
             account_group_ids: Vec::new(),
             provider_ids: Vec::new(),
             models: Vec::new(),
+            event: None,
             identity_bindings: Vec::new(),
         });
     }
@@ -1031,12 +1030,6 @@ async fn rollback_restores_target_configuration_secrets_and_bindings_and_derives
     assert_eq!(result.instance.name, before.name);
     assert_eq!(result.instance.enabled, before.enabled);
     assert_eq!(result.instance.configuration, json!({"oldVersion": true}));
-    assert_eq!(
-        result.instance.grants,
-        [PluginPermissionGrant {
-            permission: "network".into()
-        }]
-    );
     assert!(result.instance.bindings.is_empty());
     assert_eq!(
         result.instance.secrets["token"].expose_secret(),
@@ -1275,6 +1268,7 @@ async fn version_plan_keeps_explicit_values_adds_defaults_and_remaps_bindings_wi
             account_group_ids: vec![],
             provider_ids: vec![],
             models: vec!["test-model".into()],
+            event: None,
             identity_bindings: vec![],
         }];
     }
@@ -1398,4 +1392,57 @@ async fn switching_versions_uses_saved_settings_and_rejects_stale_retry() {
         .unwrap();
     assert_eq!(error.kind(), AdminErrorKind::Conflict);
     assert_eq!(fixture.snapshot().config_revision, revision);
+}
+
+#[tokio::test]
+async fn version_plan_preserves_observer_event_scopes_and_disabled_subscriptions() {
+    for include_websocket in [false, true] {
+        let fixture = LifecycleFixture::new(MigrationBehavior::Succeed);
+        {
+            let mut data = fixture.data.lock().unwrap();
+            data.history.clear();
+            for (index, artifact) in data.artifacts.iter_mut().enumerate() {
+                artifact.metadata.contributes.clear();
+                artifact.metadata.contributes.insert(
+                    "observer".into(),
+                    PluginContribution {
+                        id: format!("observer-{index}"),
+                        version: 1,
+                        stages: vec!["observation".into()],
+                        input_formats: vec![],
+                        output_formats: vec![],
+                    },
+                );
+            }
+            data.snapshot.instances[0].bindings = ["request_completed", "websocket_response"]
+                .into_iter()
+                .take(if include_websocket { 2 } else { 1 })
+                .map(|event| PluginCapabilityBinding {
+                    contribution: "observer-0".into(),
+                    stage: "observation".into(),
+                    event: Some(event.into()),
+                    order: 7,
+                    failure_policy: PluginFailurePolicy::Observe,
+                    client_key_ids: vec![],
+                    account_group_ids: vec![],
+                    provider_ids: vec![],
+                    models: vec![format!("model-{event}")],
+                    identity_bindings: vec![],
+                })
+                .collect();
+        }
+        let before = fixture.snapshot();
+        let plan = service(fixture.clone(), Arc::new(Published::default()))
+            .version_plan(&before.instances[0].id, NEW_ARTIFACT)
+            .await
+            .unwrap();
+        assert_eq!(plan.bindings.len(), before.instances[0].bindings.len());
+        for (binding, previous) in plan.bindings.iter().zip(&before.instances[0].bindings) {
+            assert_eq!(binding.contribution, "observer-1");
+            assert_eq!(binding.event, previous.event);
+            assert_eq!(binding.models, previous.models);
+            assert_eq!(binding.order, previous.order);
+        }
+        assert!(fixture.data.lock().unwrap().saves.is_empty());
+    }
 }

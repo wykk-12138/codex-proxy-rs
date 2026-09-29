@@ -72,6 +72,7 @@ use crate::{GrokCatalogCapabilityEvidence, GrokCatalogModel};
 mod continuation;
 mod failure;
 mod stream;
+mod upstream_adapter;
 mod workers;
 
 use continuation::*;
@@ -266,8 +267,17 @@ impl GrokBuildProvider {
         candidate: &ProviderCandidate,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let adapter =
+            context.upstream_adapter(candidate.provider(), candidate_upstream_model(candidate)?)?;
+        if adapter.is_none()
+            && generate
+                .provider_session_state(XAI_PROVIDER_NAME)
+                .is_some_and(|state| state.extension_owner().is_some())
+        {
+            return Err(invalid_continuation());
+        }
         let selected = self
-            .select_grok_attempt(generate, candidate, context)
+            .select_grok_attempt(generate, candidate, context, adapter.is_some())
             .await?;
         let provider_kind =
             ProviderKind::new(XAI_PROVIDER_NAME).map_err(|_| protocol_not_sent())?;
@@ -283,6 +293,14 @@ impl GrokBuildProvider {
                 account_id,
                 Box::new(move |operation, middleware_headers| {
                     Box::pin(async move {
+                        if let Some(adapter) = adapter {
+                            return provider.execute_upstream_adapter(
+                                operation,
+                                middleware_headers,
+                                selected,
+                                adapter,
+                            );
+                        }
                         provider
                             .execute_selected_grok(operation, middleware_headers, selected)
                             .await
@@ -297,10 +315,15 @@ impl GrokBuildProvider {
         generate: &GenerateRequest,
         candidate: &ProviderCandidate,
         context: AttemptContext,
+        adapted: bool,
     ) -> Result<SelectedGrokAttempt, ProviderError> {
         let upstream_model = candidate_upstream_model(candidate)?;
-        let previous_session = decode_xai_session_state(generate)?;
-        let native_source = generate.protocol_payload().protocol() == "openai";
+        let previous_session = if adapted {
+            None
+        } else {
+            decode_xai_session_state(generate)?
+        };
+        let native_source = !adapted && generate.protocol_payload().protocol() == "openai";
         let native_compaction = native_source
             && crate::transport::compaction::has_terminal_compaction_trigger(generate);
         let (selection_model, operation_account, affinity) = if native_compaction {

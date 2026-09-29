@@ -6,12 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::model::Revision;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginPermissionGrant {
-    pub permission: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginFailurePolicy {
     Reject,
@@ -26,6 +20,9 @@ pub struct PluginCapabilityBinding {
     pub stage: String,
     pub order: i32,
     pub failure_policy: PluginFailurePolicy,
+    /// 观察绑定选择事件类型；其他能力不设置事件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
     #[serde(default)]
     pub client_key_ids: Vec<String>,
     #[serde(default)]
@@ -66,7 +63,6 @@ pub struct PluginInstance {
     pub trusted_process: bool,
     pub configuration: serde_json::Value,
     pub secrets: BTreeMap<String, SecretString>,
-    pub grants: Vec<PluginPermissionGrant>,
     pub bindings: Vec<PluginCapabilityBinding>,
     pub revision: Revision,
 }

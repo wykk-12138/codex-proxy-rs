@@ -897,7 +897,6 @@ pub(super) fn map_client_error(
         )),
         CodexClientError::InvalidHeaderName(_)
         | CodexClientError::InvalidHeaderValue(_)
-        | CodexClientError::MiddlewareHeaderConflict
         | CodexClientError::WebSocketEncode(_)
         | CodexClientError::RequestBodyEncode(_)
         | CodexClientError::RequestCompression(_)
@@ -1098,11 +1097,6 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "prepare",
             "invalid_header_value",
             "OpenAI request header value is invalid".to_owned(),
-        ),
-        CodexClientError::MiddlewareHeaderConflict => (
-            "prepare",
-            "middleware_header_conflict",
-            "OpenAI middleware header conflicts with a provider-managed header".to_owned(),
         ),
         CodexClientError::WebSocketEncode(_) | CodexClientError::RequestBodyEncode(_) => (
             "prepare",

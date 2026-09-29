@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
-use gateway_admin::model::{
-    PageSize, plugins::instances::PluginPermissionGrant,
-    provider_credentials::PluginAccountListQuery,
-};
+use gateway_admin::model::{PageSize, provider_credentials::PluginAccountListQuery};
 use gateway_core::{account::ProviderAccountId, policy::ClientApiKeyId, routing::ProviderKind};
-use gateway_plugin_sdk::{CallContext, PluginFault, Stage, call::data};
+use gateway_plugin_sdk::{PluginFault, call::data};
 
 use super::{
     accounts::PluginAccountPortSlot, admin::map_admin_error, denied, invalid,
@@ -16,48 +13,22 @@ use crate::RpcReply;
 pub(super) struct PluginData {
     accounts: Arc<PluginAccountPortSlot>,
     keys: Arc<PluginClientKeyPortSlot>,
-    data_authorized: bool,
-    quota_authorized: bool,
 }
 
 impl PluginData {
     pub(super) fn new(
         accounts: Arc<PluginAccountPortSlot>,
         keys: Arc<PluginClientKeyPortSlot>,
-        grants: &[PluginPermissionGrant],
     ) -> Self {
-        Self {
-            accounts,
-            keys,
-            data_authorized: grants.iter().any(|grant| grant.permission == "data"),
-            quota_authorized: grants
-                .iter()
-                .any(|grant| grant.permission == "quota_observations"),
-        }
+        Self { accounts, keys }
     }
 
     pub(super) async fn call(
         &self,
-        context: &CallContext,
         method: &str,
         params: serde_json::Value,
         payload: &[u8],
     ) -> Result<RpcReply, PluginFault> {
-        // 基础事实读取不隐含上游访问权；管理范围也不继承到客户端请求链。
-        let authorized = match method {
-            data::ACCOUNTS_LIST | data::KEYS_GET => self.data_authorized,
-            data::QUOTA_GET => self.data_authorized || self.quota_authorized,
-            data::QUOTA_REFRESH => self.quota_authorized,
-            _ => false,
-        };
-        if !authorized
-            || !matches!(
-                context.stage,
-                Stage::Management | Stage::CommandLine | Stage::Maintenance
-            )
-        {
-            return Err(denied());
-        }
         if params != serde_json::json!({}) {
             return Err(invalid());
         }
@@ -111,6 +82,8 @@ impl PluginData {
                         .map(|account| data::AccountFacts {
                             account_id: account.id,
                             provider_id: account.provider_kind.as_str().to_owned(),
+                            name: account.name,
+                            email: account.email,
                             group_ids: account
                                 .groups
                                 .into_iter()

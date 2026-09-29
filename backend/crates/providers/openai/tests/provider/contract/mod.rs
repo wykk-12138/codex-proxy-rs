@@ -2,6 +2,7 @@ mod account_isolation;
 mod capacity;
 mod precommit;
 mod response_interrupt;
+mod upstream_adapter;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -49,6 +50,7 @@ use gateway_core::routing::{
     RuntimeAccountDirectory, RuntimeSnapshot, UpstreamModelId,
 };
 use gateway_core::runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
+use gateway_core::settings::SettingsValues;
 use gateway_core::upstream::UpstreamSendState;
 use provider_openai::config::DEFAULT_STREAM_MAX_RETRIES;
 use provider_openai::credential::{
@@ -302,7 +304,7 @@ async fn native_openai_claims_translated_session_affinity_before_send() {
 }
 
 #[tokio::test]
-async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
+async fn attempt_middleware_overrides_resolved_settings_and_headers() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let server = MockServer::start().await;
@@ -313,14 +315,14 @@ async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(CAPTURE_COMPLETED_SSE),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
         ProtocolPayload::json_object(
             "openai",
-            json!({"model":"gpt-5.6-sol", "input":"hello", "unknown":{"preserved":true}})
+            json!({"model":"gpt-5.6-sol", "input":"hello", "service_tier":"priority", "unknown":{"preserved":true}})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -337,6 +339,10 @@ async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
                     observed: Arc::clone(&observed),
                     replacement: ("service_tier".to_owned(), json!("priority")),
                     request_headers: vec![
+                        MiddlewareHeader::new(
+                            "authorization",
+                            Bytes::from_static(b"Bearer plugin-override"),
+                        ),
                         MiddlewareHeader::new(
                             "x-business-context",
                             Bytes::from_static(b"tenant-public"),
@@ -360,21 +366,26 @@ async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0]["input"], "hello");
+        assert_eq!(observed[0]["service_tier"], "default");
     }
     let requests = server.received_requests().await.unwrap();
     let sent = captured_request_body(&requests[0]);
-    assert_eq!(sent["service_tier"], "default");
+    assert_eq!(sent["service_tier"], "priority");
+    assert_eq!(
+        captured_header_values(&requests[0], "authorization"),
+        vec![b"Bearer plugin-override".to_vec()]
+    );
     assert_eq!(sent["unknown"]["preserved"], true);
     assert_eq!(
         captured_header_values(&requests[0], "x-business-context"),
         vec![b"tenant-public".to_vec(), b"trace-public".to_vec()],
     );
 
-    let mut conflict = provider_with_base_url(&store, server.uri())
+    let mut overridden = provider_with_base_url(&store, server.uri())
         .execute(
             planned_request("openai", http_generate_operation()),
             context_with_middleware(
-                "req_native_header_conflict",
+                "req_native_header_override",
                 Arc::new(RecordingMiddleware {
                     observed: Arc::default(),
                     replacement: ("service_tier".to_owned(), json!("priority")),
@@ -388,12 +399,15 @@ async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
         )
         .await
         .expect("header validation remains on the cold Provider stream");
-    let Some(Err(error)) = conflict.next().await else {
-        panic!("a Provider-managed header collision must fail before send")
-    };
-    assert_eq!(error.kind(), ProviderErrorKind::Protocol);
-    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    while let Some(event) = overridden.next().await {
+        event.unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        captured_header_values(&requests[1], "x-codex-routing-hint"),
+        vec![b"plugin-value".to_vec()]
+    );
 }
 
 #[tokio::test]
@@ -1255,7 +1269,7 @@ fn planned_request_for_model(
     ));
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        account_policy(),
+        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider,
@@ -1289,7 +1303,7 @@ fn planned_provider_endpoint_request(provider_name: &str, operation: Operation) 
     ));
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        account_policy(),
+        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
         vec![provider.clone()],
         Vec::new(),
         Vec::new(),
@@ -1391,7 +1405,7 @@ impl MiddlewarePlan for TranslationMiddleware {
         &self,
         context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         assert_eq!(context.mount(), MiddlewareMount::Attempt);
         assert!(context.account_id().is_some());
@@ -1413,7 +1427,7 @@ impl MiddlewarePlan for PassThroughMiddleware {
         &self,
         _: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         next.run(request)
     }
@@ -1431,7 +1445,7 @@ impl MiddlewarePlan for RecordingMiddleware {
         &self,
         context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         assert_eq!(context.mount(), MiddlewareMount::Attempt);
         assert_eq!(request.protocol(), "openai");
@@ -11919,10 +11933,15 @@ async fn lost_http_response_after_payload_does_not_request_connection_replay() {
 async fn stalled_proxy_connections_share_thirty_seconds_instead_of_resetting_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = format!("socks5h://{}", listener.local_addr().unwrap());
+    let (accepted, connected) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        let mut accepted = Some(accepted);
         let mut sockets = Vec::new();
         loop {
             sockets.push(listener.accept().await.unwrap().0);
+            if let Some(accepted) = accepted.take() {
+                let _ = accepted.send(());
+            }
         }
     });
     let store = Arc::new(MemoryAccountStore::default());
@@ -11933,32 +11952,62 @@ async fn stalled_proxy_connections_share_thirty_seconds_instead_of_resetting_tim
         None,
     );
     let provider = provider_with_base_url(&store, "http://upstream.invalid".to_owned());
-    let context = fallback_transport_context("req_socks_timeout");
-    let started = std::time::Instant::now();
-    timeout(Duration::from_secs(32), async {
-        for _ in 0..4 {
-            let mut stream = provider
-                .clone()
-                .execute(
-                    planned_request("openai", generate_operation()),
-                    context.clone(),
-                )
-                .await
-                .unwrap();
-            let mut failure = None;
-            while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    failure = Some(error);
-                    break;
+    let context = AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new("req_socks_timeout").unwrap(),
+            ClientApiKeyId::new("key_openai_contract").unwrap(),
+        )
+        .with_request_location(Some(global_request_location()))
+        .with_connection_budget(
+            gateway_core::engine::connection::ConnectionBudget::with_clock(|| {
+                tokio::time::Instant::now().into_std()
+            }),
+        ),
+        NonZeroU32::MIN,
+        SystemTime::now() + Duration::from_secs(30),
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None)
+            .with_account_scope(contract_account_scope()),
+        None,
+        CancellationToken::new(),
+    )
+    .with_transport(AttemptTransport::Fallback);
+    let started = tokio::time::Instant::now();
+    let execution_context = context.clone();
+    let execution = tokio::spawn(async move {
+        timeout(Duration::from_secs(32), async {
+            for _ in 0..4 {
+                let mut stream = provider
+                    .clone()
+                    .execute(
+                        planned_request("openai", generate_operation()),
+                        execution_context.clone(),
+                    )
+                    .await
+                    .unwrap();
+                let mut failure = None;
+                while let Some(event) = stream.next().await {
+                    if let Err(error) = event {
+                        failure = Some(error);
+                        break;
+                    }
                 }
+                let failure = failure.unwrap();
+                assert_eq!(failure.kind(), ProviderErrorKind::Timeout);
+                assert_eq!(failure.send_state(), UpstreamSendState::NotSent);
             }
-            let failure = failure.unwrap();
-            assert_eq!(failure.kind(), ProviderErrorKind::Timeout);
-            assert_eq!(failure.send_state(), UpstreamSendState::NotSent);
-        }
-    })
-    .await
-    .expect("shared recovery window must not become four 15-second timeouts");
+        })
+        .await
+        .expect("shared recovery window must not become four 15-second timeouts");
+    });
+    timeout(Duration::from_secs(5), connected)
+        .await
+        .expect("proxy accepted the real socket")
+        .unwrap();
+    // 先确认真实连接已建立，再推进共享预算与 transport 的同一单调时钟。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(29)).await;
+    execution.await.unwrap();
     assert!(started.elapsed() >= Duration::from_secs(25));
     assert!(context.connection_budget().exhausted());
     server.abort();
@@ -12190,8 +12239,8 @@ async fn public_catalog_filters_each_api_account_before_union_without_gating_inf
     use gateway_core::account::{AccountModelAccess, AccountModelAccessMode};
     use gateway_core::engine::provider::{Provider, ProviderRegistry};
     use gateway_core::routing::snapshot::{
-        RuntimeSnapshotCompiler, SnapshotFacts, SnapshotProviderAccountFacts,
-        SnapshotSettingsFacts, SnapshotStoreError, SnapshotStorePort,
+        RuntimeSnapshotCompiler, SnapshotFacts, SnapshotProviderAccountFacts, SnapshotStoreError,
+        SnapshotStorePort,
     };
 
     struct CatalogStore(SnapshotFacts);
@@ -12262,7 +12311,7 @@ async fn public_catalog_filters_each_api_account_before_union_without_gating_inf
         let facts = SnapshotFacts::new(
             revision,
             revision,
-            SnapshotSettingsFacts::new(
+            SettingsValues::new(
                 3,
                 0,
                 "smart",

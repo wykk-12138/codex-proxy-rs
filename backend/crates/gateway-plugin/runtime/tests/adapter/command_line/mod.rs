@@ -32,7 +32,6 @@ async fn setup_with_limits(
     let directory = tempfile::tempdir().unwrap();
     let archive = crate::support::package_with_contributions(
         crate::support::worker(),
-        vec![],
         Contributions::from([crate::support::contribution(
             Capability::CommandLine,
             vec![Stage::CommandLine],
@@ -52,7 +51,7 @@ async fn setup_with_limits(
         trusted_process: true,
         configuration,
         secrets: BTreeMap::new(),
-        grants: vec![],
+
         bindings: vec![],
         revision: Revision::new(1).unwrap(),
     };

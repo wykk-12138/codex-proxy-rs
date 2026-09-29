@@ -36,7 +36,7 @@ pub(super) async fn reset_client_key_budget(
             )
         })?,
         ClientKeyBudgetMutationOrigin::Plugin(owner) => {
-            super::plugins::begin_authorized_mutation(pool, owner, "key_budgets").await?
+            super::plugins::begin_plugin_mutation(pool, owner).await?
         }
     };
     reset_client_key_budget_in_transaction(&mut tx, &command, context)

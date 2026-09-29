@@ -16,6 +16,7 @@ export interface SmartSchedulingConfig {
 }
 
 export interface RuntimeSettings {
+  configRevision: number
   smartScheduling: SmartSchedulingConfig
   smartSchedulingDefaults: SmartSchedulingConfig
   providerRequestProfiles: ProviderRequestProfiles

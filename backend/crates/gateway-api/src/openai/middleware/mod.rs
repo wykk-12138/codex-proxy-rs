@@ -5,7 +5,5 @@ mod request;
 mod session;
 
 pub(crate) use http::{ExpectedBody, buffered_response, error_response, into_http_response};
-pub(crate) use request::{
-    HttpMiddlewareInput, invoke_http_middleware, query_response, request_headers, request_parts,
-};
+pub(crate) use request::{RequestInput, invoke_request, query_response, request_parts};
 pub(crate) use session::{PendingExecution, finalize_session, pending_execution_response};

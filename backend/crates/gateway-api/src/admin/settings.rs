@@ -37,6 +37,7 @@ pub type ProviderRequestProfileUpdates =
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsView {
+    pub config_revision: u64,
     pub smart_scheduling_defaults: gateway_core::account::SmartSchedulingConfig,
     pub provider_request_profiles: ProviderRequestProfiles,
     /// 固定兼容字段；值始终从 provider_request_profiles 派生。
@@ -79,6 +80,7 @@ pub struct RuntimeSettingsView {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRuntimeSettingsRequest {
+    pub config_revision: u64,
     #[serde(default)]
     pub provider_request_profiles: ProviderRequestProfileUpdates,
     /// 兼容既有 wire；与泛化字段冲突时拒绝整个请求。
@@ -215,6 +217,8 @@ impl UpdateRuntimeSettingsRequest {
             self.xai_client_profile,
         )?;
         Ok(ReplaceRuntimeSettings {
+            expected_revision: gateway_admin::model::Revision::new(self.config_revision)
+                .map_err(|_| WireValidationError::new("configRevision"))?,
             request_profile_updates,
             request_location_enabled: self.request_location_enabled,
             request_location: self
@@ -267,6 +271,7 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
             .map(|(provider, profile)| (provider.as_str().to_owned(), profile.into_inner()))
             .collect::<ProviderRequestProfiles>();
         Self {
+            config_revision: settings.config_revision.get(),
             openai_client_profile: provider_request_profiles.get("openai").cloned(),
             xai_client_profile: provider_request_profiles.get("xai").cloned(),
             provider_request_profiles,

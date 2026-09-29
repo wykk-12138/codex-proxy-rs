@@ -61,6 +61,10 @@ impl ManagementEntry {
                 owner.update(admin_user_id.as_bytes());
             }
             AdminPrincipal::ApiKey => owner.update(b"admin-api-key"),
+            AdminPrincipal::Plugin { instance_id } => {
+                owner.update(b"plugin:");
+                owner.update(instance_id.as_bytes());
+            }
         }
         owner.update(self.view.target.instance_id.as_bytes());
         owner.update(command.path.as_bytes());
@@ -168,6 +172,16 @@ impl ManagementEntry {
             path: request.path,
             query: request.query,
             content_type: None,
+            headers: request
+                .headers
+                .iter()
+                .map(
+                    |header| gateway_plugin_sdk::call::middleware::MiddlewareHeader {
+                        name: header.name().to_owned(),
+                        value: header.value().to_vec(),
+                    },
+                )
+                .collect(),
         })
         .map_err(|_| unavailable())?;
         let reply = self

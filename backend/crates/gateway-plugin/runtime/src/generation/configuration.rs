@@ -7,13 +7,13 @@ use gateway_admin::model::{
         state::PluginStateConfiguration,
     },
 };
-use gateway_plugin_sdk::{Capability, Manifest, Permission, Stage};
+use gateway_plugin_sdk::{Capability, Manifest, Stage};
 use secrecy::ExposeSecret as _;
 
 pub(super) fn validate(
     instance: &PluginInstance,
     manifest: &Manifest,
-) -> Result<(serde_json::Value, Vec<Permission>, PluginStateConfiguration), AdminError> {
+) -> Result<(serde_json::Value, PluginStateConfiguration), AdminError> {
     if instance.enabled && !instance.trusted_process {
         return Err(AdminError::invalid("插件制品尚未接受安装"));
     }
@@ -24,15 +24,6 @@ pub(super) fn validate(
     )?;
     if instance.enabled && !ready {
         return Err(AdminError::invalid("请填写插件必填配置"));
-    }
-    let mut permissions = BTreeSet::new();
-    for grant in &instance.grants {
-        let permission: Permission =
-            serde_json::from_value(serde_json::Value::String(grant.permission.clone()))
-                .map_err(|_| AdminError::invalid("插件权限标识不合法"))?;
-        if !manifest.permissions.contains(&permission) || !permissions.insert(permission) {
-            return Err(AdminError::invalid("插件权限未声明或重复"));
-        }
     }
     let mut bindings = BTreeSet::new();
     for binding in &instance.bindings {
@@ -46,8 +37,13 @@ pub(super) fn validate(
         }
         let stage: Stage = serde_json::from_value(serde_json::Value::String(binding.stage.clone()))
             .map_err(|_| AdminError::invalid("插件调用阶段不合法"))?;
-        if !bindings.insert((capability, stage)) || !resolved.declaration.stages.contains(&stage) {
+        if (capability != Capability::Observer && !bindings.insert((capability, stage)))
+            || !resolved.declaration.stages.contains(&stage)
+        {
             return Err(AdminError::invalid("插件能力或阶段未声明，或者重复绑定"));
+        }
+        if capability != Capability::Observer && binding.event.is_some() {
+            return Err(AdminError::invalid("事件订阅只能用于观察绑定"));
         }
         let frontend_authentication = capability == Capability::FrontendAuthentication;
         if frontend_authentication
@@ -72,7 +68,6 @@ pub(super) fn validate(
     }
     Ok((
         configuration,
-        permissions.into_iter().collect(),
         crate::callback::private_state::configuration(manifest)?,
     ))
 }

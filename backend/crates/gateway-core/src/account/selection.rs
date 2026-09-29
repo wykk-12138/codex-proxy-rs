@@ -14,7 +14,8 @@ use super::{
 };
 
 /// `runtime_settings.rotation_strategy` 的稳定值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RotationStrategy {
     Smart,
     QuotaResetPriority,

@@ -107,7 +107,10 @@ impl AdminError {
 }
 
 /// PostgreSQL 中所有正整数 revision 的管理层表示。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct Revision(NonZeroU64);
 
 impl Revision {
@@ -156,7 +159,8 @@ impl PageSize {
 }
 
 /// 可审计管理写操作的发起者。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MutationActor {
     AdminSession { admin_user_id: String },
     AdminApiKey,
@@ -164,7 +168,8 @@ pub enum MutationActor {
 }
 
 /// 管理写操作必须携带的审计上下文。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MutationContext {
     pub actor: MutationActor,
     pub request_id: String,

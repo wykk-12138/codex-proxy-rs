@@ -16,10 +16,10 @@ use gateway_core::{
     operation::Operation,
 };
 
+use crate::middleware::headers::encode_headers;
 use crate::openai::middleware::{
-    ExpectedBody, HttpMiddlewareInput, PendingExecution, buffered_response, error_response,
-    into_http_response, invoke_http_middleware, pending_execution_response, request_headers,
-    request_parts,
+    ExpectedBody, PendingExecution, RequestInput, buffered_response, error_response,
+    into_http_response, invoke_request, pending_execution_response, request_parts,
 };
 use gateway_core::event::{ProviderEvent, ProviderResponseHeader};
 
@@ -33,7 +33,7 @@ use super::{
 pub(super) async fn provider_endpoint_response<F>(
     service: OpenAiService,
     client: AuthenticatedClient,
-    input: HttpMiddlewareInput,
+    input: RequestInput,
     client_ip: Option<IpAddr>,
     user_agent: Option<String>,
     decode: F,
@@ -48,7 +48,7 @@ where
     };
     let request_id = prepared.request_id().clone();
     let endpoint = input.endpoint.clone();
-    let result = invoke_http_middleware(
+    let result = invoke_request(
         execution,
         prepared,
         input,
@@ -125,7 +125,7 @@ async fn collect_raw_json_response(
     Ok(pending_execution_response(
         "openai".to_owned(),
         parts.status.as_u16(),
-        request_headers(&parts.headers),
+        encode_headers(&parts.headers),
         MiddlewareFrame::new(bytes, framing, true).with_transformed(transformed),
         execution,
     ))

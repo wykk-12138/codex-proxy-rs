@@ -118,6 +118,9 @@ pub trait CallbackHandler: Send + Sync {
     /// 调用结束或取消时立即撤销其句柄；实现必须幂等且不能阻塞。
     fn finish(&self, _context: &CallContext) {}
 
+    /// 首个流式结果已到达；资源仍绑定原调用并在终态统一回收。
+    fn streaming(&self, _context: &CallContext) {}
+
     fn call(
         &self,
         context: CallContext,
@@ -226,6 +229,7 @@ impl Shared {
         }
         if call.stream.is_some() && result.is_ok() {
             let initial = call.result.take().ok_or(RpcError::Protocol)?;
+            call.handler.streaming(&call.context);
             let _ = initial.send(result);
         } else {
             let pending = state.calls.remove(&id).ok_or(RpcError::Protocol)?;
@@ -417,6 +421,10 @@ impl Shared {
 }
 
 impl RpcSession {
+    pub(crate) const fn maximum_call_timeout(&self) -> Duration {
+        self.limits.maximum_call_timeout
+    }
+
     pub async fn start(
         package: Arc<PreparedPackage>,
         handshake: Handshake,
@@ -476,10 +484,6 @@ impl RpcSession {
             || handshake.plugin_id != plugin_id
             || handshake.artifact_sha256 != package.package().digest()
             || handshake.contributes != manifest.contributes
-            || handshake
-                .permissions
-                .iter()
-                .any(|permission| !manifest.permissions.contains(permission))
             || handshake.instance_id.is_empty()
             || handshake.incarnation.is_empty()
             || handshake.generation == 0
@@ -580,7 +584,6 @@ impl RpcSession {
             control_receiver,
             Arc::clone(&shared),
             callbacks.clone(),
-            handshake.permissions.clone(),
         );
         let monitor = Arc::clone(&shared);
         let instance_id = handshake.instance_id.clone();
@@ -654,6 +657,7 @@ impl RpcSession {
             incarnation: self.handshake.incarnation.clone(),
             stage,
             timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            resource_stream: false,
             resource_scope_id: uuid::Uuid::new_v4().to_string(),
             request_id: None,
             attempt_id: None,
@@ -831,6 +835,7 @@ impl RpcSession {
         let bytes = self.limits.maximum_buffered_body_bytes.min(256 * 1024) as u32;
         let frames = 32;
         let (stream, chunks, terminal) = StreamIngress::new(bytes, frames);
+        let resource_stream = context.resource_stream;
         let completed = self
             .send_call(
                 method,
@@ -845,7 +850,7 @@ impl RpcSession {
             initial: completed.reply,
             chunks,
             terminal: Some(terminal),
-            deadline: completed.deadline,
+            deadline: (!resource_stream).then_some(completed.deadline),
             id: completed.id,
             shared: Arc::clone(&self.shared),
             _slot: slot,

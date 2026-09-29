@@ -103,6 +103,7 @@ use crate::transport::{
 mod execution;
 mod failure;
 mod observation;
+mod upstream_adapter;
 mod workers;
 pub(crate) use workers::ClientReleaseServices;
 
@@ -188,8 +189,6 @@ impl CodexProvider {
         let continuation_requested = generate.native_continuation_requested();
         let mut upstream = encode_generate_request(generate, upstream_model.as_str(), None)
             .map_err(map_request_error)?;
-        // 插件加工后仍重新应用宿主强制策略与本地会话身份。
-        upstream.apply_fast_policy(context.disable_fast());
         if let Some(conversation_id) = previous_session
             .as_ref()
             .and_then(|state| state.conversation_id.as_ref())
@@ -466,15 +465,51 @@ impl Provider for CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         };
+        // 请求设置先形成原生正文基线；attempt 的显式改写进入终端后不再次被覆盖。
+        let mut operation = Operation::Generate(generate.clone());
+        if context.disable_fast()
+            && let Operation::Generate(generate) = &operation
+            && generate.protocol_payload().protocol() == PROVIDER_NAME
+        {
+            let mut request =
+                CodexResponsesRequest::from_body(generate.protocol_payload().body().clone());
+            request.apply_fast_policy(true);
+            let body = serde_json::to_vec(request.body()).map_err(|_| {
+                provider_error(
+                    ProviderErrorKind::InvalidRequest,
+                    UpstreamSendState::NotSent,
+                )
+            })?;
+            operation = operation
+                .replace_middleware_wire(PROVIDER_NAME, body.into())
+                .map_err(|_| {
+                    provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    )
+                })?;
+        }
+        let Operation::Generate(generate) = &operation else {
+            unreachable!("generate settings keep the operation kind")
+        };
         let Some(upstream_model) = candidate.upstream_model() else {
             return Err(provider_error(
                 ProviderErrorKind::Protocol,
                 UpstreamSendState::NotSent,
             ));
         };
+        let adapter = context.upstream_adapter(candidate.provider(), upstream_model)?;
+        if adapter.is_none()
+            && generate
+                .provider_session_state(PROVIDER_NAME)
+                .is_some_and(|state| state.extension_owner().is_some())
+        {
+            return Err(continuation_replay_required_error("scope_unavailable"));
+        }
         // 其他协议必须先取得真实账号，再按固定 attempt 阶段调用转换器；选号前不能
         // 把未知正文当成 OpenAI wire 解释会话、亲和或传输字段。
-        let preselection = (generate.protocol_payload().protocol() == PROVIDER_NAME)
+        let preselection = (adapter.is_none()
+            && generate.protocol_payload().protocol() == PROVIDER_NAME)
             .then(|| self.prepare_generate_request(generate, upstream_model, &context))
             .transpose()?;
         let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
@@ -539,6 +574,18 @@ impl Provider for CodexProvider {
                 account_id,
                 Box::new(move |operation, middleware_headers| {
                     Box::pin(async move {
+                        if let Some(adapter) = adapter {
+                            return provider.execute_upstream_adapter(
+                                operation,
+                                middleware_headers,
+                                terminal_model,
+                                terminal_context,
+                                lease,
+                                account_selection_wait_ms,
+                                frozen_requirements,
+                                adapter,
+                            );
+                        }
                         provider
                             .execute_selected_generate(
                                 operation,

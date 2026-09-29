@@ -81,13 +81,10 @@ impl SettingsStore for AdminSettingsStoreAdapter {
         command: ReplaceRuntimeSettings,
         context: &MutationContext,
     ) -> AdminStoreResult<AdminRuntimeSettings> {
-        let current = postgres::ControlPlaneRepository::load_control_plane(&self.control_plane)
-            .await
-            .map_err(|error| admin_store_error("runtime settings", error))?;
         let replacement = postgres::ControlPlaneReplacement {
+            expected_revision: store_revision(command.expected_revision)?,
             settings: postgres::RuntimeSettingsUpdate {
                 request_profile_updates: command.request_profile_updates,
-                admin_api_key: current.settings.admin_api_key,
                 refresh_margin_seconds: command.refresh_margin_seconds,
                 refresh_concurrency: command.refresh_concurrency,
                 max_concurrent_per_account: command.max_concurrent_per_account,

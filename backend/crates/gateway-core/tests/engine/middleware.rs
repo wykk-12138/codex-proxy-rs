@@ -19,7 +19,6 @@ use gateway_core::engine::middleware::{
 use gateway_core::engine::provider::{
     ProviderCallMetadata, ProviderMiddlewareTerminal, ProviderStream, execute_attempt_middleware,
 };
-use gateway_core::error::{ProviderError, ProviderErrorKind};
 use gateway_core::event::{GatewayEvent, ProtocolWireEvent, ProviderEvent, ResponseMeta};
 use gateway_core::identity::ProviderKind;
 use gateway_core::lifecycle::CancellationToken;
@@ -27,7 +26,7 @@ use gateway_core::operation::{GenerateRequest, Operation, OperationKind, Protoco
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::routing::UpstreamModelId;
 use gateway_core::runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
-use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
+use gateway_core::upstream::UpstreamTransport;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -40,7 +39,7 @@ impl MiddlewarePlan for RewritingPlan {
         &self,
         context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         assert_eq!(context.mount(), MiddlewareMount::Attempt);
         assert_eq!(context.attempt_index(), NonZeroU32::new(1));
@@ -427,7 +426,7 @@ impl MiddlewarePlan for AddingHeaderPlan {
         &self,
         _context: MiddlewareContext,
         request: MiddlewareRequest,
-        next: Box<dyn MiddlewareNext>,
+        next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         let added_headers = self.headers.clone();
         Box::pin(async move {
@@ -505,7 +504,7 @@ fn attempt_passthrough_preserves_parsed_wire_for_every_client_transport() {
 }
 
 #[test]
-fn attempt_middleware_forwards_business_headers_but_rejects_authentication_headers() {
+fn attempt_middleware_preserves_multi_value_and_authentication_headers() {
     futures::executor::block_on(async {
         let allowed_calls = Arc::new(AtomicUsize::new(0));
         let allowed_terminal: ProviderMiddlewareTerminal = {
@@ -544,39 +543,37 @@ fn attempt_middleware_forwards_business_headers_but_rejects_authentication_heade
         .unwrap();
         assert_eq!(allowed_calls.load(Ordering::SeqCst), 1);
 
-        let rejected_calls = Arc::new(AtomicUsize::new(0));
-        let rejected_terminal: ProviderMiddlewareTerminal = {
-            let rejected_calls = Arc::clone(&rejected_calls);
-            Box::new(move |_operation, _headers| {
-                rejected_calls.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async {
-                    Err(ProviderError::new(
-                        ProviderErrorKind::Unavailable,
-                        UpstreamSendState::NotSent,
-                    ))
+        let calls = Arc::new(AtomicUsize::new(0));
+        let terminal: ProviderMiddlewareTerminal = {
+            let calls = calls.clone();
+            Box::new(move |_, headers| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    assert_eq!(headers[0].name(), "authorization");
+                    assert_eq!(
+                        headers[0].value(),
+                        &Bytes::from_static(b"Bearer fixture-override")
+                    );
+                    Ok(empty_provider_stream())
                 })
             })
         };
-        let rejected = header_plan(
+        let plan = header_plan(
             "middleware-authentication-header",
             vec![MiddlewareHeader::new(
                 "authorization",
-                Bytes::from_static(b"Bearer forbidden"),
+                Bytes::from_static(b"Bearer fixture-override"),
             )],
         );
-
-        let error = execute_attempt_middleware(
-            Some(&rejected),
+        execute_attempt_middleware(
+            Some(&plan),
             context(),
             operation(),
             ClientTransport::HttpJson,
-            rejected_terminal,
+            terminal,
         )
         .await
-        .err()
-        .expect("protected headers must fail before the Provider terminal");
-        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
-        assert_eq!(error.send_state(), UpstreamSendState::NotSent);
-        assert_eq!(rejected_calls.load(Ordering::SeqCst), 0);
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     });
 }

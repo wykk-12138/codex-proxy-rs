@@ -918,12 +918,19 @@ impl CodexCredentialQuotaService {
     }
 
     pub async fn synchronize(&self) -> Result<CodexQuotaSyncSummary, CodexCredentialQuotaError> {
+        self.synchronize_at(SystemTime::now()).await
+    }
+
+    /// 按本轮调度时刻选择到期账号；实际 HTTP 观察与落库仍使用发生时刻。
+    pub async fn synchronize_at(
+        &self,
+        now: SystemTime,
+    ) -> Result<CodexQuotaSyncSummary, CodexCredentialQuotaError> {
         let mut accounts = self.repository.list_for_provider().await?;
         accounts.retain(|account| {
             account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
         });
         let mut summary = CodexQuotaSyncSummary::default();
-        let now = SystemTime::now();
         let account_ids = accounts
             .iter()
             .map(|account| account.id().clone())

@@ -34,5 +34,5 @@ pub(super) fn map_admin_error(error: AdminError) -> PluginFault {
         AdminErrorKind::BadGateway => ErrorCode::Upstream,
         AdminErrorKind::Unavailable | AdminErrorKind::Internal => ErrorCode::Fault,
     };
-    PluginFault::new(code, "admin callback failed")
+    PluginFault::new(code, error.message())
 }

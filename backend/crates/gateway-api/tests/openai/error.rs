@@ -703,8 +703,12 @@ mod model_routing {
             ),
         ] {
             for stream in [false, true] {
-                let snapshot = crate::openai::snapshot("sk_model_routing", "openai")
+                let snapshot = crate::openai::snapshot("sk_model_routing", "openai");
+                let settings = snapshot
+                    .settings()
+                    .clone()
                     .with_model_mappings(mappings.clone());
+                let snapshot = snapshot.with_settings(&settings).unwrap();
                 let response = request_model(snapshot, model, stream).await;
 
                 assert_eq!(

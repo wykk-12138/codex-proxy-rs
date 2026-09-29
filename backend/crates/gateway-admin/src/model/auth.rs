@@ -14,8 +14,14 @@ pub fn admin_session_actor_ref(admin_user_id: &str) -> String {
 /// 已认证的管理主体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminPrincipal {
-    Session { admin_user_id: String },
+    Session {
+        admin_user_id: String,
+    },
     ApiKey,
+    /// 安装者完整信任的插件；身份仅由内部 HTTP 分派端口签发。
+    Plugin {
+        instance_id: String,
+    },
 }
 
 /// 传给管理用例的安全请求上下文。
@@ -33,6 +39,7 @@ impl AdminRequestContext {
                 admin_user_id: admin_user_id.clone(),
             },
             AdminPrincipal::ApiKey => MutationActor::AdminApiKey,
+            AdminPrincipal::Plugin { .. } => MutationActor::System,
         };
         MutationContext {
             actor,

@@ -678,7 +678,16 @@ fn plan_with_profiles(
     ));
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("config revision"),
-        account_selection_policy,
+        gateway_core::settings::SettingsValues::new(
+            account_selection_policy.max_concurrent_per_account().get(),
+            u64::try_from(account_selection_policy.request_interval().as_millis()).unwrap(),
+            account_selection_policy.strategy().as_str(),
+            Default::default(),
+            None,
+            None,
+        )
+        .with_smart_scheduling(account_selection_policy.smart_scheduling())
+        .with_request_location(request_location, true),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider.clone(),
@@ -688,7 +697,6 @@ fn plan_with_profiles(
         Vec::new(),
     )
     .expect("snapshot")
-    .with_request_location(Some(request_location))
     .with_account_directory(Arc::clone(&directory));
     snapshot
         .plan(

@@ -140,8 +140,12 @@ fn client_authentication_request(
         .ok_or(ClientApiKeyAuthError::MissingAuthorization)?
         .to_str()
         .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?;
-    ClientAuthenticationRequest::new(raw.to_owned())
-        .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)
+    let request = ClientAuthenticationRequest::new(raw.to_owned())
+        .map_err(|_| ClientApiKeyAuthError::MalformedAuthorization)?;
+    Ok(match crate::middleware::current_settings() {
+        Some(settings) => request.with_settings(settings),
+        None => request,
+    })
 }
 
 pub(crate) fn client_access_error_response(error: ClientAccessError) -> Response {

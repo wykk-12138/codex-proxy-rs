@@ -6,7 +6,7 @@ use crate::model::Revision;
 
 /// 已由 Runtime 校验的命名空间 schema 与配额事实。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginStateSchema {
     pub namespace: String,
     pub schema_version: u32,
