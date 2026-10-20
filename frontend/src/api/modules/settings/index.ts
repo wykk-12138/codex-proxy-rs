@@ -63,6 +63,7 @@ export interface RuntimeSettings {
   rotationStrategy: RotationStrategy
   minCodexDesktopVersion: string | null
   minCodexCliVersion: string | null
+  codexPublicOrigin: string | null
   usageRetentionDays: number
   opsEventRetentionDays: number
   auditRetentionDays: number

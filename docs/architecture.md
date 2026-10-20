@@ -343,6 +343,8 @@ Client Key 费用账本独立累计各次 attempt 的实际费用，不能因请
 
 概览的数据请求和刷新由 `useDashboard` 持有，`views/dashboard/presenter.ts` 生成展示模型。
 Key 创建与编辑共用 `useApiKeyEditor` 和 `ApiKeyFormModal`，创建结果与密钥使用弹窗各自管理明文生命周期。
+原生 Codex 绑定在同一个 Key 表单内编辑：已存在的绑定只读，仅可切换启停；候选账号取自账号目录中的 OpenAI OAuth 账号，
+范围仍由服务端最终校验。公共入口地址属于运行设置的字段，页面只负责编辑与格式提示
 用量表格的列、展示投影及健康时间线规则集中在 `components/usage/shared/`，管理页面与 Key 用量页共用展示，
 各自的查询仍使用对应身份允许的 API
 
@@ -809,6 +811,21 @@ Arc 随 RoutingPlan 冻结并进入所有 attempt，不在推理请求中读取�
 本地计算费用携带当次拆分、有效单价和倍率，终态观测将其写入版本化费用快照。查询优先还原快照，
 不使用新配置解释历史；无快照的旧记录保留总额核对后补充拆分的路径。Client Key 账本使用同一费用
 结果沿既有幂等结算流程累计，不依赖请求明细写入成功
+
+### 原生 Codex 访问
+
+Client Key 的 `codexAccess` 是一份持久绑定事实，由 Store 的 `client_api_key_codex_bindings` 独占，
+随 Key 创建、更新事务、审计和配置 revision 提交，快照编译进 ClientPolicy。一个 Key 对应最多一个账号，
+绑定只能切换启停；首次建立关系时校验 OpenAI OAuth、已识别身份和当前分组范围，之后是否放行由每次请求重新求交集，
+不因保存开关而重建关系。账号行 FK restrict 保护被绑定账号，凭据替换、导入与重新授权在账号行锁内核对身份，
+不允许已绑定账号更换上游用户或 workspace
+
+Core 在原生入口完成认证后读取绑定、重新求 Key 范围、OpenAI 账号与绑定账号的交集，再按普通准入与
+Provider 执行合同发送；普通 `/v1` 入口不自动应用绑定，仍按原策略选号。冻结快照决定已开始请求，
+不承诺停用后中断在途请求。辅助操作与身份查询通过 Provider 的受限能力完成，Provider 决定官方路径、
+OAuth 与出口，Core 只传入已授权账号上下文与原始 query、body 和业务头，不提供任意 URL、跨号 fallback 或重试
+
+公共入口地址属于运行设置，不从请求头推导；原生入口路径清单与投影字段见 [API](api.md#原生-codex-入口)
 
 ## 7. 控制面与 revision
 

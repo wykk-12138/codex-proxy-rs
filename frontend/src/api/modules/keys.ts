@@ -6,7 +6,14 @@ import request from '../request'
 export type ApiKeyRoutingScope = 'all' | 'groups'
 export type ApiKeyBudgetPeriod = 'daily' | 'weekly' | 'all'
 
+// 原生 Codex 访问的持久账号绑定，创建后只能切换 enabled。
+export interface ApiKeyCodexAccess {
+  enabled: boolean
+  accountId: string
+}
+
 export interface ApiKey {
+  codexAccess: ApiKeyCodexAccess | null
   providerRequestProfileOverrides: ProviderRequestProfiles
   openaiClientProfileOverride: ClientProfileSelection | null
   xaiClientProfileOverride: XaiClientProfileSelection | null
@@ -81,11 +88,14 @@ export interface ApiKeyWriteParam {
 interface ApiKeyUpdateParam extends ApiKeyWriteParam {
   id: string
   providerRequestProfileOverrides: Record<string, ProviderRequestProfile | null>
+  // 省略保留原绑定；已有绑定只接受同一 accountId。
+  codexAccess?: ApiKeyCodexAccess
 }
 
 interface ApiKeyCreateParam extends ApiKeyWriteParam {
   providerRequestProfileOverrides: ProviderRequestProfiles
   customKey?: string
+  codexAccess?: ApiKeyCodexAccess | null
 }
 
 interface ApiKeyIdParam {

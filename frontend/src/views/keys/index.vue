@@ -21,6 +21,7 @@ import { useApiKeyEditor } from './composables/useApiKeyEditor'
 import { useApiKeyMutations } from './composables/useApiKeyMutations'
 import { useApiKeysQuery } from './composables/useApiKeysQuery'
 import { useApiKeyUse } from './composables/useApiKeyUse'
+import { useCodexAccountCandidates } from './composables/useCodexAccountCandidates'
 import { apiKeyColumns } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
@@ -48,6 +49,12 @@ const {
   loading: loadingGroups,
   loadGroups,
 } = useAccountGroupCatalog({ immediate: false })
+
+const {
+  accounts: codexAccounts,
+  loading: loadingCodexAccounts,
+  loadAccounts: loadCodexAccounts,
+} = useCodexAccountCandidates({ immediate: false })
 
 const {
   showUseKeyModal,
@@ -99,7 +106,12 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
 
 watch(
   showFormModal,
-  open => open && void loadGroups(),
+  (open) => {
+    if (!open)
+      return
+    void loadGroups()
+    void loadCodexAccounts()
+  },
 )
 </script>
 
@@ -164,6 +176,10 @@ watch(
             <template #scope="{ row }">
               <ApiKeyScopeCell :api-key="row" />
             </template>
+            <template #codexAccess="{ row }">
+              <ApiKeyStatusBadge v-if="row.codexAccess" :api-key="row.codexAccess" />
+              <span v-else class="text-cp-text-quaternary">—</span>
+            </template>
             <template #budget="{ row }">
               <ApiKeyBudgetCell :api-key="row" />
             </template>
@@ -219,6 +235,9 @@ watch(
       v-model:form="form"
       :groups="groups"
       :group-loading="loadingGroups"
+      :accounts="codexAccounts"
+      :account-loading="loadingCodexAccounts"
+      :codex-locked="Boolean(editingKey?.codexAccess)"
       :editing="Boolean(editingKey)"
       :saving="savingKey"
       @save="requestSave"

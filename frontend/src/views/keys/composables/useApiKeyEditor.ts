@@ -9,6 +9,8 @@ import { useAsyncAction } from '@/composables/useAsyncAction'
 export interface ApiKeyFormValue {
   providerRequestProfileOverrides: ProviderRequestProfiles
   customKey: string
+  codexAccountId: string
+  codexAccessEnabled: boolean
   name: string
   label: string
   groupIds: string[]
@@ -40,6 +42,8 @@ export function useApiKeyEditor(options: {
     form.value = {
       providerRequestProfileOverrides: cloneDeep(key.providerRequestProfileOverrides),
       customKey: '',
+      codexAccountId: key.codexAccess?.accountId ?? '',
+      codexAccessEnabled: key.codexAccess?.enabled ?? false,
       name: key.name,
       label: key.label ?? '',
       groupIds: key.groups.map(group => group.id),
@@ -82,11 +86,18 @@ export function useApiKeyEditor(options: {
           weeklyLimitUsd: form.value.weeklyLimitUsd.trim() || '0',
         }
         const current = editingKey.value
+        // 已有绑定只能切换启停，账号 ID 始终沿用原值
+        const boundAccountId = current?.codexAccess?.accountId ?? null
+        const codexAccountId = boundAccountId ?? (form.value.codexAccessEnabled ? form.value.codexAccountId : '')
+        const codexAccess = codexAccountId
+          ? { enabled: form.value.codexAccessEnabled, accountId: codexAccountId }
+          : undefined
         let created: { key: string, name: string } | undefined
         if (current) {
           await updateApiKey({
             id: current.id,
             ...payload,
+            codexAccess,
             providerRequestProfileOverrides: profileOverrideUpdates(
               current.providerRequestProfileOverrides,
               form.value.providerRequestProfileOverrides,
@@ -96,6 +107,7 @@ export function useApiKeyEditor(options: {
         else {
           const result = await createApiKey({
             ...payload,
+            codexAccess,
             providerRequestProfileOverrides: cloneDeep(form.value.providerRequestProfileOverrides),
             customKey: form.value.customKey || undefined,
           })
@@ -127,6 +139,10 @@ export function useApiKeyEditor(options: {
       ZNotification.warning({ message: '请输入 API Key 名称' })
       return false
     }
+    if (!editingKey.value?.codexAccess && form.value.codexAccessEnabled && !form.value.codexAccountId) {
+      ZNotification.warning({ message: '请选择原生 Codex 绑定账号' })
+      return false
+    }
     if (!editingKey.value && form.value.customKey && !/^[\x21-\x7E]+$/.test(form.value.customKey)) {
       ZNotification.warning({ message: '自定义 Key 只能包含 HTTP 可传输的可见字符，不能包含空格或换行' })
       return false
@@ -155,6 +171,8 @@ function emptyForm(): ApiKeyFormValue {
   return {
     providerRequestProfileOverrides: {},
     customKey: '',
+    codexAccountId: '',
+    codexAccessEnabled: false,
     name: '',
     label: '',
     groupIds: [],

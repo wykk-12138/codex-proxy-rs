@@ -82,6 +82,7 @@ const {
 
   minCodexDesktopVersionError,
   minCodexCliVersionError,
+  codexPublicOriginError,
   saveSettings,
   loadSettings,
 } = useSettingsForm()
@@ -151,11 +152,13 @@ watch(section, (value) => {
         v-show="section === 'access'"
         v-model:min-codex-desktop-version="form.minCodexDesktopVersion"
         v-model:min-codex-cli-version="form.minCodexCliVersion"
+        v-model:codex-public-origin="form.codexPublicOrigin"
         v-model:responses-max-decompressed-body-mi-b="responsesMaxDecompressedBodyMiBValue"
         :disabled="disabled"
         :loading="loading"
         :desktop-error="minCodexDesktopVersionError"
         :cli-error="minCodexCliVersionError"
+        :origin-error="codexPublicOriginError"
       />
 
       <fieldset v-show="section !== 'access'" :disabled="disabled" class="m-0 grid min-w-0 gap-5 border-0 p-0" aria-label="基础设置">

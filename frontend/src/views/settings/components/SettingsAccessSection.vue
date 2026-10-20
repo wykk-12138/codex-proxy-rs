@@ -5,6 +5,7 @@ import { useAdminApiKey } from '../composables/useAdminApiKey'
 import AdminApiKeyCard from './AdminApiKeyCard.vue'
 import AdminPasswordCard from './AdminPasswordCard.vue'
 import ClientVersionSettings from './client-version/index.vue'
+import CodexPublicOriginCard from './CodexPublicOriginCard.vue'
 import ResponseBodyLimitCard from './ResponseBodyLimitCard.vue'
 
 defineProps<{
@@ -12,10 +13,12 @@ defineProps<{
   loading: boolean
   desktopError: string
   cliError: string
+  originError: string
 }>()
 
 const minCodexDesktopVersion = defineModel<string>('minCodexDesktopVersion', { required: true })
 const minCodexCliVersion = defineModel<string>('minCodexCliVersion', { required: true })
+const codexPublicOrigin = defineModel<string>('codexPublicOrigin', { required: true })
 const responsesMaxDecompressedBodyMiB = defineModel<string>('responsesMaxDecompressedBodyMiB', { required: true })
 
 const {
@@ -58,6 +61,7 @@ onMounted(loadStatus)
         :cli-error="cliError"
       />
       <ResponseBodyLimitCard v-model="responsesMaxDecompressedBodyMiB" />
+      <CodexPublicOriginCard v-model="codexPublicOrigin" :error="originError" />
     </fieldset>
 
     <ZConfirmDialog

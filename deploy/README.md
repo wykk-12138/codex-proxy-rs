@@ -287,7 +287,7 @@ Compose 默认只绑定 `127.0.0.1`。从其他设备访问时，在应用前配
 HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 会话 Cookie 合同见 [管理接口鉴权](../docs/api.md#管理接口)
 
-反向代理需要保留 `Authorization`，支持 `/v1/responses` 的 WebSocket Upgrade，
+反向代理需要保留 `Authorization`，支持 `/v1/responses` 与 `/codex/backend-api/codex/responses` 的 WebSocket Upgrade，
 并关闭 SSE 响应缓冲。读取超时应覆盖长时间生成任务。
 客户端使用部署地址下的 `/v1`，协议与部署一致，不要使用前端开发服务的 `5173/dev/v1`。
 当前应用只支持单副本，不能通过复制容器扩容
@@ -382,6 +382,32 @@ V2 远程压缩通过 Responses 接口发送 `compaction_trigger`，网关和上
 需要指定完整模型目录时，在账号的模型列表中导出所选 Codex 模型，并在 `config.toml` 顶层设置
 `model_catalog_json = "/absolute/path/to/cpr-model-catalog.json"`。导出文件不含账号凭据；
 它是一次目录快照，调整选择或上游模型能力变化后需重新导出
+
+### 原生 Codex 接入
+
+官方 Codex 客户端可以不用 `model_providers` 而直接连 `/codex` 原生入口。先完成两项管理端配置：
+在「API 密钥」创建或编辑时开启「原生 Codex 访问」并选择已识别身份的 OpenAI OAuth 账号，
+在「系统设置」的「安全与访问」填写原生 Codex 公共地址
+
+绑定后只能切换启停，换账号需要新建 Key；删除 Key 一并解除绑定。绑定账号不在 Key 的有效分组范围、
+账号凭据失效或停止启用时，原生请求被拒绝，不会改用其他账号
+
+客户端使用独立目录和独立 Key，不覆盖官方登录：
+
+```bash
+# 地址与 Key 换成当前部署和新建的客户端密钥
+export CODEX_HOME="$HOME/.codex-native"
+export CODEX_ACCESS_TOKEN="<client-api-key>"
+export CODEX_AUTHAPI_BASE_URL="https://cpr.example.com/codex/auth"
+codex -c 'openai_base_url="https://cpr.example.com/codex/backend-api/codex"' \
+      -c 'chatgpt_base_url="https://cpr.example.com/codex/backend-api"'
+```
+
+三个地址分别对应身份查询、模型与 Responses 请求以及其他后台请求，前缀固定。
+`CODEX_ACCESS_TOKEN` 是本机的客户端密钥，不需要另写 `auth.json`，也不要写入 `config.toml` 或提交到仓库。
+history、notes 与账号信息仍由官方保存，网关不保存副本。
+普通 `/v1` 写法与原生入口可以同时使用同一个 Key，各自按该 Key 的账号范围与限额执行，
+原生入口的路径与方法清单见 [原生 Codex 入口](../docs/api.md#原生-codex-入口)
 
 ### 生图和 WebSocket
 
@@ -723,6 +749,10 @@ macOS arm64 提供构建产物；部署前需验证目标平台的插件运行�
 ## 备份与恢复
 
 数据库可用管理端的 S3/R2 逻辑备份，或停止 PostgreSQL 后备份数据目录
+
+数据库 schema 只向前迁移。新版本应用迁移后，旧版本程序在自己维护的迁移清单中找不到这些已应用记录，
+启动时的迁移校验会失败。因此回滚不能只替换程序文件，需要同时恢复升级前的一致数据库备份，
+并先在隔离库确认该组合可启动
 
 不要在 PostgreSQL 写入期间直接复制数据目录作为一致性备份
 

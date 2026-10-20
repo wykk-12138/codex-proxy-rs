@@ -597,6 +597,38 @@ call 与账号的绑定保存在网关进程内，未连接时一小时过期；
 - 标准实时 WebSocket（`GET /v1/realtime?model=…`）、realtime client secrets、legacy sessions、
   transcription/translation 会话与 SIP 控制返回 `501 realtime_capability_not_supported`。
 
+### 原生 Codex 入口
+
+固定前缀 `/codex` 供官方 Codex 客户端原生接入，只转发下表列出的路径与方法，其余 `/codex` 路径返回 `404`，
+不进入管理端页面，也不作为任意上游代理：
+
+| 方法 | 路由 | 说明 |
+| --- | --- | --- |
+| `GET` | `/codex/auth/v1/user-auth-credential/whoami` | 绑定账号的身份投影 |
+| `GET` | `/codex/backend-api/wham/accounts/check` | 账号检查与工作区路由地址 |
+| `GET` | `/codex/backend-api/codex/models` | 模型目录，保留 `client_version` 与已支持的 query |
+| `POST` | `/codex/backend-api/codex/responses` | Responses 请求，支持 SSE |
+| `GET` | `/codex/backend-api/codex/responses` | Responses WebSocket |
+| `POST` | `/codex/backend-api/codex/alpha/search` | 搜索 |
+| `POST` | `/codex/backend-api/codex/alpha/history/v2/{list_windows,list_items,read_item,search_contents}` | history 读取 |
+| `POST` | `/codex/backend-api/codex/alpha/notes/v2/{thread_hint,list_files_by_prefix,read_file,search_contents,append_to_file,write_file}` | notes 读取与写入 |
+| `GET` | `/codex/backend-api/wham/{usage,profiles/me,settings/user,workspace-messages,config/bundle}` | 只读账号信息 |
+
+入口认证与 `/v1` 一致，使用 `Authorization: Bearer <Client Key>`。只有启用
+[codexAccess](#7-client-key) 的 Key 可以使用原生入口，每次请求重新求 Key 有效分组、OpenAI OAuth 账号和
+绑定账号的交集，范围失效时拒绝，不扩大范围或改用其他账号；WebSocket 在每轮 `response.create`
+后执行同样的认证与绑定收窄。上游 OAuth 凭据不出网关，下游 Cookie、Client Key 与账号身份头不向上游透传
+
+whoami 与 accounts/check 由绑定账号的真实 Provider 事实投影，只公布该账号。套餐沿用 Provider 的解析结果，
+FedRAMP 声明保留官方值或默认值，不补造成更高档位。accounts/check 的工作区路由地址使用运行设置中的
+[原生 Codex 公共地址](#原生-codex-公共地址)，不从 `Host` 或转发头推导
+
+模型目录、Responses 与搜索沿用 `/v1` 的 Key 限额、账号范围与并发准入。history、notes 与只读账号信息复用适用的
+Key RPM 与并发准入，不按模型额度计费；账号不可用时正常拒绝或等待，取消或丢弃响应正文时释放准入。
+这些内容仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放
+
+同一 OAuth 账号被多个 Key 绑定时共享官方账号空间，原生入口不提供 Key 级历史隔离
+
 ## 4. 浏览器认证
 
 ### 统一登录与会话
@@ -1365,7 +1397,7 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 | `POST` | `/api/admin/client-keys/delete` | `{ id }` | 删除 |
 
 创建字段为 `name`、可选 `label`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
-`dailyLimitUsd`、`weeklyLimitUsd`、`customKey` 和 `providerRequestProfileOverrides`。更新请求携带 `id`，不接受 `customKey`。
+`dailyLimitUsd`、`weeklyLimitUsd`、`customKey`、可选 `codexAccess` 和 `providerRequestProfileOverrides`。更新请求携带 `id`，不接受 `customKey`。
 `groupIds` 必须显式提交：空数组派生 `routingScope: "all"`，非空数组派生
 `routingScope: "groups"`。响应同时返回分组引用 `groups`，以及从当前有效账号池派生、仅供展示的
 `providerKinds`。创建和 reveal 响应会返回完整明文 Key，调用方
@@ -1378,6 +1410,13 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 兼容字段 `openaiClientProfileOverride` 和 `xaiClientProfileOverride` 分别对应上述映射中的 `openai`、`xai`。
 创建时省略或 `null` 表示无覆盖；更新时省略保留、`null` 清除。与通用字段同时提交时必须一致，否则拒绝整个请求；
 响应中的兼容字段从同一映射派生，不是第二份配置
+
+`codexAccess` 是可选的原生 Codex 账号绑定：`{"enabled": true, "accountId": "<CPRS 账号 ID>"}`。
+创建时省略或 `null` 表示不绑定；更新时省略保留，`null` 拒绝。已建立的绑定只能修改 `enabled`，
+换 `accountId` 会被拒绝，需要其他账号时新建 Key；删除 Key 一并解除绑定，列表无绑定时返回 `codexAccess: null`。
+首次绑定要求账号存在、已识别 user 与 workspace、属于 OpenAI OAuth，并在该 Key 的有效分组范围内，
+无分组表示全部账号。每次原生请求重新求范围交集，因此分组停用或成员移除后，同值保存、停用和重新启用仍可执行，
+是否放行由请求时的范围决定。入口合同见 [原生 Codex 入口](#原生-codex-入口)
 
 密钥列表的 `search` 仅匹配名称和标签，不匹配密钥值或可见前缀；搜索不区分大小写，使用字面量前缀匹配。
 创建和更新时去除名称首尾空白，并按忽略大小写、首尾空格的名称查重，重复返回 `409`。
@@ -1495,6 +1534,7 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 | [调度策略](#智能调度) | `rotationStrategy`、`smartScheduling` |
 | [请求解压](#请求解压上限) | `responsesMaxDecompressedBodyBytes` |
 | [客户端门禁](#1-鉴权与公共约定) | `minCodexDesktopVersion`、`minCodexCliVersion` |
+| [原生 Codex 公共地址](#原生-codex-公共地址) | `codexPublicOrigin` |
 | [历史保留](#历史保留) | `usageRetentionDays`、`opsEventRetentionDays`、`auditRetentionDays` |
 | [账号自动冻结](#账号自动冻结) | `accountAutoFreezeEnabled`、`accountAutoFreezeThreshold`、`accountAutoFreezeWindowSeconds`、`accountAutoFreezeDurationSeconds`、`accountAutoFreezeProbeEnabled`、`accountAutoFreezeProbeModel`、`accountAutoFreezeAdaptiveConcurrency` |
 | [账号预热](#账号预热) | `accountWarmupEnabled`、`accountWarmupScheduleTime`、`accountWarmupModel` |
@@ -1630,6 +1670,14 @@ Guardian 以 `subagent_kind` 或 `client_metadata.x-openai-subagent` 值 `guardi
 67108864（64 MiB）。必须为正整数，且可表示为进程平台的 `isize`；管理端以整数 MiB 编辑。
 保存并发布成功后，新请求使用新值；已鉴权请求沿用原快照，无需重启。调高上限会增加大请求的内存占用，
 它不代表整个进程的内存预算
+
+### 原生 Codex 公共地址
+
+`codexPublicOrigin` 是[原生 Codex 入口](#原生-codex-入口)对外的本站地址，默认为 `null`，只参与原生入口请求
+
+取值必须是 HTTPS 地址，带 host，路径仅限根 `/`，不含 username、password、query 和 fragment；
+允许端口和结尾根斜杠。保存时按字符串原样存储，空值或 `null` 表示未配置，不根据请求 `Host` 或转发头推导。
+校验失败的字段为 `codexPublicOrigin`。启用原生访问时必须配置，`accounts/check` 的工作区路由地址也使用该值
 
 ### 智能调度
 

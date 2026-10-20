@@ -46,6 +46,7 @@ export function useSettingsForm() {
     rotationStrategy: '' as RotationStrategy | '',
     minCodexDesktopVersion: '',
     minCodexCliVersion: '',
+    codexPublicOrigin: '',
     usageRetentionDays: 31 as number | null,
     opsEventRetentionDays: 30,
     auditRetentionDays: 90,
@@ -113,6 +114,7 @@ export function useSettingsForm() {
 
   const minCodexDesktopVersionError = computed(() => versionError(form.minCodexDesktopVersion))
   const minCodexCliVersionError = computed(() => versionError(form.minCodexCliVersion))
+  const codexPublicOriginError = computed(() => publicOriginError(form.codexPublicOrigin))
 
   function versionError(value: string): string {
     const normalized = value.trim()
@@ -142,6 +144,7 @@ export function useSettingsForm() {
     form.minCodexDesktopVersion = data.minCodexDesktopVersion ?? ''
     form.providerRequestProfiles = cloneDeep(data.providerRequestProfiles)
     form.minCodexCliVersion = data.minCodexCliVersion ?? ''
+    form.codexPublicOrigin = data.codexPublicOrigin ?? ''
     form.usageRetentionDays = data.usageRetentionDays
     form.opsEventRetentionDays = data.opsEventRetentionDays
     form.auditRetentionDays = data.auditRetentionDays
@@ -288,6 +291,10 @@ export function useSettingsForm() {
       ZNotification.warning({ message: '请修正客户端最低版本格式' })
       return
     }
+    if (codexPublicOriginError.value) {
+      ZNotification.warning({ message: '请修正原生 Codex 公共地址' })
+      return
+    }
     // 关闭时保留已保存的自定义值，未完成的草稿不阻止停止覆盖。
     const requestLocation = form.requestLocationEnabled
       ? normalizeRequestLocation(form.requestLocation)
@@ -353,6 +360,7 @@ export function useSettingsForm() {
         smartScheduling: { ...smartScheduling },
         minCodexDesktopVersion: form.minCodexDesktopVersion.trim() || null,
         minCodexCliVersion: form.minCodexCliVersion.trim() || null,
+        codexPublicOrigin: form.codexPublicOrigin.trim() || null,
         usageRetentionDays,
         opsEventRetentionDays: form.opsEventRetentionDays,
         auditRetentionDays: form.auditRetentionDays,
@@ -411,8 +419,31 @@ export function useSettingsForm() {
     accountAutoFreezeDurationSecondsValue,
     minCodexDesktopVersionError,
     minCodexCliVersionError,
+    codexPublicOriginError,
     saveSettings,
     loadSettings,
+  }
+}
+
+// 与官方 workspace routing 一致：只接受不含账号信息、路径、查询和片段的 HTTPS 根地址
+function publicOriginError(value: string): string {
+  const normalized = value.trim()
+  if (!normalized)
+    return ''
+  const url = parseUrl(normalized)
+  if (!url)
+    return '请输入完整的 HTTPS 地址，例如 https://codex.example.com'
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/')
+    return '仅支持不含账号信息、路径、参数和片段的 HTTPS 地址'
+  return ''
+}
+
+function parseUrl(value: string): URL | null {
+  try {
+    return new URL(value)
+  }
+  catch {
+    return null
   }
 }
 

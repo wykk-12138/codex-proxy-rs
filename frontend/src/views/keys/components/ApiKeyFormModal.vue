@@ -1,16 +1,21 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyEditor'
+import type { CodexAccountCandidate } from '../composables/useCodexAccountCandidates'
 import type { AccountGroupRef } from '@/api'
-import { ZButton, ZDialog, ZForm, ZFormItem, ZInput } from '@codex-proxy/ui'
+import { ZButton, ZDialog, ZForm, ZFormItem, ZInput, ZSelect, ZSwitch } from '@codex-proxy/ui'
 
 import { DollarSign, KeyRound } from '@lucide/vue'
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import ProviderRequestProfilesEditor from '@/components/client-profile/ProviderRequestProfilesEditor.vue'
 
 const props = defineProps<{
   groups: AccountGroupRef[]
   groupLoading: boolean
+  accounts: CodexAccountCandidate[]
+  accountLoading: boolean
+  // 已存在的绑定只允许切换启停
+  codexLocked: boolean
   editing: boolean
   saving: boolean
 }>()
@@ -25,6 +30,27 @@ const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
 function updateForm<Key extends keyof ApiKeyFormValue>(key: Key, value: ApiKeyFormValue[Key]) {
   form.value = { ...form.value, [key]: value }
 }
+
+const codexOptions = computed(() => props.accounts
+  .filter(account => !form.value.groupIds.length
+    || account.groups.some(group => form.value.groupIds.includes(group.id) && group.enabled))
+  .map(account => ({ label: account.label, value: account.id })))
+
+const boundAccountLabel = computed(() =>
+  props.accounts.find(account => account.id === form.value.codexAccountId)?.label ?? form.value.codexAccountId,
+)
+
+const codexDescription = computed(() => props.codexLocked
+  ? '已绑定的账号不能更换，需要其他账号时新建密钥'
+  : '只列出当前分组范围内已识别身份的 OpenAI OAuth 账号')
+
+// 分组变化后已选账号不在绑定范围时清空选择，避免提交服务端会拒绝的组合
+watch(() => form.value.groupIds, () => {
+  if (props.codexLocked || !form.value.codexAccountId)
+    return
+  if (!codexOptions.value.some(option => option.value === form.value.codexAccountId))
+    updateForm('codexAccountId', '')
+})
 </script>
 
 <template>
@@ -84,6 +110,39 @@ function updateForm<Key extends keyof ApiKeyFormValue>(key: Key, value: ApiKeyFo
           :disabled="saving"
           @update:model-value="updateForm('groupIds', $event)"
         />
+      </ZFormItem>
+
+      <ZFormItem label="原生 Codex 访问" :description="codexDescription">
+        <div class="grid gap-4">
+          <ZSwitch
+            :model-value="form.codexAccessEnabled"
+            label="启用原生访问"
+            :disabled="saving"
+            @update:model-value="updateForm('codexAccessEnabled', $event)"
+          />
+
+          <div
+            v-if="codexLocked"
+            class="flex min-w-0 items-center gap-2 rounded-cp bg-cp-fill-quaternary px-3 py-2"
+          >
+            <span class="min-w-0 truncate text-cp-sm text-cp-text" :title="boundAccountLabel">
+              {{ boundAccountLabel }}
+            </span>
+          </div>
+
+          <template v-else-if="form.codexAccessEnabled">
+            <ZSelect
+              :model-value="form.codexAccountId"
+              class="w-full"
+              :options="codexOptions"
+              :disabled="saving || accountLoading"
+              aria-label="原生 Codex 绑定账号"
+              placeholder="选择 OpenAI OAuth 账号"
+              empty-text="暂无 OpenAI OAuth 账号"
+              @update:model-value="updateForm('codexAccountId', $event)"
+            />
+          </template>
+        </div>
       </ZFormItem>
 
       <ZFormItem label="上游身份">
