@@ -62,12 +62,14 @@ impl MiddlewareBody for BufferedBody {
 pub(crate) enum ExpectedBody {
     SingleJson,
     SinglePayload,
+    RawStream,
     Sse,
 }
 
 impl ExpectedBody {
     fn validate(self, frame: &MiddlewareFrame) -> Result<(), MiddlewareError> {
         let valid = match self {
+            Self::RawStream => frame.framing() == MiddlewareFraming::RawBytes,
             Self::SingleJson => {
                 frame.framing() == MiddlewareFraming::JsonDocument
                     && frame.terminal()
@@ -109,12 +111,13 @@ pub(crate) async fn into_http_response(
         Err(error) => return fail_before_commit(body, error).await,
     };
     let empty = matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
-    let expected = if status.is_success() {
+    let expected = if status.is_success() || matches!(expected, ExpectedBody::RawStream) {
         expected
     } else {
         ExpectedBody::SinglePayload
     };
     let validation = match (&first, empty) {
+        (None, _) if matches!(expected, ExpectedBody::RawStream) => Ok(()),
         (None, true) => Ok(()),
         (Some(frame), false) => expected.validate(frame),
         _ => Err(MiddlewareError::InvalidState),
@@ -139,7 +142,7 @@ pub(crate) async fn into_http_response(
         );
         headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     }
-    let exhausted = empty || !matches!(expected, ExpectedBody::Sse);
+    let exhausted = empty || !matches!(expected, ExpectedBody::Sse | ExpectedBody::RawStream);
     if !empty && exhausted {
         match body.next_frame().await {
             Ok(None) => {}
@@ -206,7 +209,7 @@ impl HttpDelivery {
             Ok(Some((frame.into_bytes(), self)))
         } else {
             self.body.close().await;
-            if self.terminal_seen {
+            if self.terminal_seen || matches!(self.expected, ExpectedBody::RawStream) {
                 Ok(None)
             } else {
                 Err(MiddlewareError::InvalidState)

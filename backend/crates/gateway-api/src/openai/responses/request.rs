@@ -567,6 +567,19 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn passthrough_headers(headers: &HeaderMap) -> Vec<Value> {
+    forwardable_request_headers(headers)
+        .map(|(name, value)| {
+            Value::Array(vec![
+                Value::String(name.as_str().to_owned()),
+                Value::String(STANDARD.encode(value.as_bytes())),
+            ])
+        })
+        .collect()
+}
+
+pub(crate) fn forwardable_request_headers(
+    headers: &HeaderMap,
+) -> impl Iterator<Item = (&axum::http::HeaderName, &axum::http::HeaderValue)> {
     let connection_headers = headers
         .get_all("connection")
         .iter()
@@ -576,17 +589,9 @@ fn passthrough_headers(headers: &HeaderMap) -> Vec<Value> {
         .filter(|name| !name.is_empty())
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-
     headers
         .iter()
-        .filter(|(name, _)| passthrough_header_name(name.as_str(), &connection_headers))
-        .map(|(name, value)| {
-            Value::Array(vec![
-                Value::String(name.as_str().to_owned()),
-                Value::String(STANDARD.encode(value.as_bytes())),
-            ])
-        })
-        .collect()
+        .filter(move |(name, _)| passthrough_header_name(name.as_str(), &connection_headers))
 }
 
 fn passthrough_header_name(name: &str, connection_headers: &[String]) -> bool {

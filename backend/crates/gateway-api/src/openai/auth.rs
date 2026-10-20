@@ -5,7 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use gateway_core::engine::{
-    authentication::ClientAuthenticationRequest, execution::AuthenticatedClient,
+    authentication::{ClientAuthenticationPurpose, ClientAuthenticationRequest},
+    execution::AuthenticatedClient,
 };
 use gateway_core::policy::{ClientVersionRejection, CodexClientKind, CodexClientVersion};
 
@@ -88,7 +89,15 @@ pub(crate) async fn authenticate_client(
     service: &OpenAiService,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedClient, ClientAccessError> {
-    let request = client_authentication_request(headers)?;
+    authenticate_client_with_purpose(service, headers, ClientAuthenticationPurpose::Models).await
+}
+
+pub(crate) async fn authenticate_client_with_purpose(
+    service: &OpenAiService,
+    headers: &HeaderMap,
+    purpose: ClientAuthenticationPurpose,
+) -> Result<AuthenticatedClient, ClientAccessError> {
+    let request = client_authentication_request(headers)?.with_purpose(purpose);
     let client = service.authenticate(request).await?;
     if let Some(identified) = identify_codex_client(headers) {
         client

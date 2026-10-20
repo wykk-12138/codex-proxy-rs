@@ -3,7 +3,7 @@
 use crate::{
     engine::{
         CoordinatedEvent, EngineError, ModelRequestId,
-        authentication::ClientAuthenticationRequest,
+        authentication::{ClientAuthenticationPurpose, ClientAuthenticationRequest},
         continuation::PreviousResponseId,
         extensions::ExtensionCallScope,
         middleware::{
@@ -74,6 +74,40 @@ pub struct AuthenticatedClient {
 }
 
 impl AuthenticatedClient {
+    #[must_use]
+    pub fn authentication_purpose(&self) -> ClientAuthenticationPurpose {
+        self.authentication.as_ref().map_or(
+            ClientAuthenticationPurpose::Models,
+            ClientAuthenticationRequest::purpose,
+        )
+    }
+
+    /// 认证及请求设置派生都重新施加同一绑定交集，普通模型入口保持原范围
+    pub(super) fn restrict_codex_access(&mut self) -> Result<(), ClientAuthenticationError> {
+        if self.authentication_purpose() != ClientAuthenticationPurpose::Codex {
+            return Ok(());
+        }
+        let binding = self
+            .policy
+            .codex_access()
+            .filter(|binding| binding.enabled)
+            .ok_or(ClientAuthenticationError::InvalidKey)?;
+        let provider = ProviderKind::new("openai")
+            .map_err(|_| ClientAuthenticationError::ProviderUnavailable)?;
+        let scope = self.policy.account_scope().restricted_to(
+            &std::collections::BTreeSet::from([provider]),
+            &std::collections::BTreeSet::from([binding.account_id.clone()]),
+        );
+        if !scope.allows(&binding.account_id) {
+            return Err(ClientAuthenticationError::InvalidKey);
+        }
+        if self.snapshot.settings().codex_public_origin().is_none() {
+            return Err(ClientAuthenticationError::SnapshotUnavailable);
+        }
+        self.policy = self.policy.clone().with_account_scope(Arc::new(scope));
+        Ok(())
+    }
+
     pub(super) fn execution_timeout(&self) -> Option<Duration> {
         self.settings
             .as_ref()
@@ -186,6 +220,9 @@ impl PreparedRootExecution {
         self.client.policy = settings.apply_policy(self.client.policy.clone());
         self.client.snapshot = settings.snapshot();
         self.client.settings = Some(settings.clone());
+        self.client
+            .restrict_codex_access()
+            .map_err(super::failure::authentication_gateway_error)?;
         self.deadline_at = deadline;
         Ok(())
     }
@@ -195,7 +232,10 @@ impl PreparedRootExecution {
         self.response_control.clone()
     }
 
-    pub(super) fn new(client: AuthenticatedClient) -> Result<Self, GatewayError> {
+    pub(super) fn new(mut client: AuthenticatedClient) -> Result<Self, GatewayError> {
+        client
+            .restrict_codex_access()
+            .map_err(super::failure::authentication_gateway_error)?;
         let started_at = SystemTime::now();
         let deadline_at = Deadline::from_timeout(started_at, client.execution_timeout())
             .ok_or_else(|| {
@@ -348,7 +388,10 @@ pub trait ExecutionService: Send + Sync {
             let plaintext = request
                 .native_bearer()
                 .ok_or(ClientAuthenticationError::InvalidKey)?;
-            self.authenticate(plaintext.expose_for_auth())
+            let mut client = self.authenticate(plaintext.expose_for_auth())?;
+            client.authentication = Some(request);
+            client.restrict_codex_access()?;
+            Ok(client)
         })
     }
     /// 只验证入口认证信封，不记录 Key 使用事实或执行推理准入
@@ -450,6 +493,33 @@ pub trait ExecutionService: Send + Sync {
         &self,
         request: StartProviderExecution,
     ) -> BoxFuture<'_, Result<StartedExecution, GatewayError>>;
+
+    /// 原生身份读取也经过 Key 的 RPM/并发准入，不创建模型费用
+    fn codex_identity(
+        &self,
+        _prepared: PreparedRootExecution,
+    ) -> BoxFuture<'_, Result<crate::engine::codex::CodexIdentity, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Unsupported,
+                "Codex access is unavailable",
+            ))
+        })
+    }
+
+    /// 消费已认证入口，准入租约随惰性辅助正文完成或丢弃而释放
+    fn codex_auxiliary(
+        &self,
+        _prepared: PreparedRootExecution,
+        _request: crate::engine::codex::CodexAuxiliaryRequest,
+    ) -> BoxFuture<'_, Result<crate::engine::middleware::MiddlewareResponse, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Unsupported,
+                "Codex access is unavailable",
+            ))
+        })
+    }
 
     /// 返回 Provider 注册表中首个声明 Live sideband 能力的网关。
     /// `None` 表示当前组合不含语音 sideband；协议 adapter 据此回退到稳定 501。

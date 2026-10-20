@@ -41,7 +41,7 @@ use crate::openai::middleware::{
 };
 use crate::openai::service::OpenAiService;
 use crate::openai::{
-    auth::{authenticate_client, client_access_error_response},
+    auth::{authenticate_client_with_purpose, client_access_error_response},
     error::{
         engine_error_response, gateway_error_contract, gateway_error_from_engine,
         gateway_error_response, protocol_error_response,
@@ -67,11 +67,20 @@ pub(crate) async fn responses(
     State(state): State<ApiState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     ingress_id: Option<Extension<tower_http::request_id::RequestId>>,
+    purpose: Option<Extension<gateway_core::engine::authentication::ClientAuthenticationPurpose>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let service = state.openai().clone();
-    let client = match authenticate_client(&service, &headers).await {
+    let client = match authenticate_client_with_purpose(
+        &service,
+        &headers,
+        purpose
+            .map(|Extension(purpose)| purpose)
+            .unwrap_or_default(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
     };
@@ -139,6 +148,7 @@ pub(crate) async fn execute_prepared_responses(
     // 终端会重新校验中间件改写后的正文，初步解码不必保留到响应交付
     drop(decoded);
     let execution = service.execution();
+    let endpoint = crate::openai::codex::responses_path(prepared.client());
     let request_id = prepared.request_id().clone();
     let cancellation = prepared.cancellation();
     let started_request_id = Arc::new(OnceLock::new());
@@ -149,7 +159,7 @@ pub(crate) async fn execute_prepared_responses(
     middleware_headers.remove(CONTENT_ENCODING);
     middleware_headers.remove(CONTENT_LENGTH);
     let input = RequestInput {
-        endpoint: crate::openai::router::RESPONSES_PATH.to_owned(),
+        endpoint: endpoint.to_owned(),
         protocol: OPENAI_PROTOCOL.to_owned(),
         operation: Some(OperationKind::Generate),
         transport,
@@ -194,12 +204,7 @@ pub(crate) async fn execute_prepared_responses(
                     None
                 };
                 let started = terminal_service
-                    .start_prepared_response(
-                        prepared,
-                        decoded,
-                        transport,
-                        crate::openai::router::RESPONSES_PATH,
-                    )
+                    .start_prepared_response(prepared, decoded, transport, endpoint)
                     .await
                     .map_err(MiddlewareError::Gateway)?;
                 let _ = terminal_request_id.set(started.request_id.clone());

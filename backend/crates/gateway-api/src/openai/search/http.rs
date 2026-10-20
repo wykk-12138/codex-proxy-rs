@@ -16,7 +16,7 @@ use crate::ApiState;
 use crate::middleware::headers::encode_headers;
 use crate::openai::middleware::RequestInput;
 use crate::openai::{
-    auth::{authenticate_client, client_access_error_response},
+    auth::{authenticate_client_with_purpose, client_access_error_response},
     endpoint::provider_endpoint_response,
     responses::{OpenAiRequestHeaders, request_client_context},
     router::SEARCH_PATH,
@@ -28,13 +28,29 @@ const OPENAI_PROTOCOL: &str = "openai";
 pub(crate) async fn standalone_search(
     State(state): State<ApiState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    purpose: Option<Extension<gateway_core::engine::authentication::ClientAuthenticationPurpose>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let service = state.openai();
-    let client = match authenticate_client(service, &headers).await {
+    let client = match authenticate_client_with_purpose(
+        service,
+        &headers,
+        purpose
+            .map(|Extension(purpose)| purpose)
+            .unwrap_or_default(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
+    };
+    let endpoint = if client.authentication_purpose()
+        == gateway_core::engine::authentication::ClientAuthenticationPurpose::Codex
+    {
+        crate::openai::codex::SEARCH_PATH
+    } else {
+        SEARCH_PATH
     };
     let (client_ip, user_agent) = request_client_context(
         &headers,
@@ -44,7 +60,7 @@ pub(crate) async fn standalone_search(
         service.clone(),
         client,
         RequestInput {
-            endpoint: SEARCH_PATH.to_owned(),
+            endpoint: endpoint.to_owned(),
             protocol: OPENAI_PROTOCOL.to_owned(),
             operation: Some(OperationKind::Search),
             transport: ClientTransport::HttpJson,

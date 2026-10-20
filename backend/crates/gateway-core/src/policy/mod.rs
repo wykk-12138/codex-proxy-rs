@@ -137,6 +137,12 @@ pub struct ClientPolicy {
 }
 
 impl ClientPolicy {
+    /// 执行入口只回写已求交集的有效范围，保留 Key 默认设置与持久绑定
+    pub(crate) fn with_account_scope(mut self, scope: Arc<FrozenAccountScope>) -> Self {
+        self.account_scope = scope;
+        self
+    }
+
     #[must_use]
     pub fn with_codex_access(mut self, binding: Option<CodexAccessBinding>) -> Self {
         self.codex_access = binding;

@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    auth::{authenticate_client, client_access_error_response},
+    auth::{authenticate_client, authenticate_client_with_purpose, client_access_error_response},
     error::{model_not_found_response, openai_error_response},
 };
 
@@ -36,18 +36,34 @@ pub(crate) struct ModelsQuery {
 pub(crate) async fn models(
     State(state): State<ApiState>,
     Query(query): Query<ModelsQuery>,
+    purpose: Option<Extension<gateway_core::engine::authentication::ClientAuthenticationPurpose>>,
     headers: HeaderMap,
 ) -> Response {
     let service = state.openai();
-    let client = match authenticate_client(service, &headers).await {
+    let client = match authenticate_client_with_purpose(
+        service,
+        &headers,
+        purpose
+            .map(|Extension(purpose)| purpose)
+            .unwrap_or_default(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
     };
 
+    let endpoint = if client.authentication_purpose()
+        == gateway_core::engine::authentication::ClientAuthenticationPurpose::Codex
+    {
+        super::codex::MODELS_PATH
+    } else {
+        super::router::MODELS_PATH
+    };
     middleware::query_response(
         service.execution(),
         client,
-        RequestInput::query(super::router::MODELS_PATH.to_owned(), None, &headers),
+        RequestInput::query(endpoint.to_owned(), None, &headers),
         move |client| models_response(state, client, query),
     )
     .await

@@ -2,7 +2,7 @@
 
 use super::failure::{authentication_gateway_error, gateway_error_from_engine, map_routing_error};
 
-use super::admission::{AdmissionLease, settle_budget};
+use super::admission::{AdmissionLease, AdmissionPurpose, settle_budget};
 use super::contract::{
     AuthenticatedClient, ClientApiKeyUsageSink, ClientAuthenticationError, ClientKeyVerifier,
     ClientTransport, ExecutionRequestMetadata, ExecutionService, PreparedExecutionRequest,
@@ -81,7 +81,7 @@ pub struct DefaultExecutionService {
     /// probe 自身走 transient store，探测失败仍写入持久 store 的 ops_events
     observations: Arc<dyn ExecutionStore>,
     diagnostics: Arc<dyn crate::diagnostics::OperationalDiagnostics>,
-    providers: ProviderRegistry,
+    pub(super) providers: ProviderRegistry,
     admissions: Arc<dyn ClientAdmissionPort>,
     admission_waiting: ConcurrencyWaitQueue<ClientApiKeyId>,
     continuation: Arc<dyn NativeContinuationPort>,
@@ -265,12 +265,14 @@ impl DefaultExecutionService {
             Some(settings) => settings.apply_policy(policy),
             None => RequestSettings::new(snapshot.clone()).apply_policy(policy),
         };
-        Ok(AuthenticatedClient {
+        let mut client = AuthenticatedClient {
             settings: authentication.take_settings(),
             snapshot,
             policy,
             authentication: Some(authentication),
-        })
+        };
+        client.restrict_codex_access()?;
+        Ok(client)
     }
 
     async fn start_inner(&self, request: StartExecution) -> Result<StartedExecution, GatewayError> {
@@ -346,11 +348,35 @@ impl DefaultExecutionService {
 
     async fn start_prepared_with_target(
         &self,
-        prepared: PreparedRootExecution,
+        mut prepared: PreparedRootExecution,
         target: ExecutionTarget,
         operation: Operation,
         metadata: ExecutionRequestMetadata,
     ) -> Result<StartedExecution, GatewayError> {
+        prepared
+            .client
+            .restrict_codex_access()
+            .map_err(authentication_gateway_error)?;
+        let codex_account = (prepared.client.authentication_purpose()
+            == crate::engine::authentication::ClientAuthenticationPurpose::Codex)
+            .then(|| {
+                prepared
+                    .client
+                    .policy
+                    .codex_access()
+                    .map(|binding| binding.account_id.clone())
+            })
+            .flatten();
+        let required_provider = codex_account
+            .as_ref()
+            .and_then(|account| {
+                prepared
+                    .client
+                    .policy
+                    .account_scope()
+                    .account_provider(account)
+            })
+            .cloned();
         let PreparedRootExecution {
             extension_scope,
             client,
@@ -368,8 +394,8 @@ impl DefaultExecutionService {
             deadline_at,
             cancellation,
             extension_scope,
-            required_provider: None,
-            required_account: None,
+            required_provider,
+            required_account: codex_account,
             nested: None,
             bound: None,
             graph: client
@@ -725,6 +751,7 @@ impl DefaultExecutionService {
                     authorization.deadline_at,
                     authorization.cancellation.clone(),
                     &concurrency_wait_budget,
+                    AdmissionPurpose::Model,
                 )
                 .await?;
             let admission = if let Some(permit) = authorization.nested_permit.take() {
@@ -1236,13 +1263,14 @@ impl DefaultExecutionService {
         Ok(Some(AffinityLookupResult::new(provider, account)))
     }
 
-    async fn acquire_client_admission(
+    pub(super) async fn acquire_client_admission(
         &self,
         client: &AuthenticatedClient,
         request_id: &ModelRequestId,
         deadline_at: Deadline,
         cancellation: CancellationToken,
         budget: &ConcurrencyWaitBudget,
+        purpose: AdmissionPurpose,
     ) -> Result<AdmissionLease, GatewayError> {
         let policy = client.snapshot.client_queue_policy();
         let limits = client.policy.limits();
@@ -1311,7 +1339,8 @@ impl DefaultExecutionService {
                             "request exceeds client API key limits",
                         ));
                     }
-                    if waiting.elapsed().is_zero()
+                    if purpose == AdmissionPurpose::Model
+                        && waiting.elapsed().is_zero()
                         && let Some(budget) = &self.budget
                     {
                         budget.admit(key.clone()).await?;
@@ -1510,6 +1539,21 @@ impl DefaultExecutionService {
 }
 
 impl ExecutionService for DefaultExecutionService {
+    fn codex_identity(
+        &self,
+        prepared: PreparedRootExecution,
+    ) -> BoxFuture<'_, Result<crate::engine::codex::CodexIdentity, GatewayError>> {
+        Box::pin(self.codex_identity_inner(prepared))
+    }
+
+    fn codex_auxiliary(
+        &self,
+        prepared: PreparedRootExecution,
+        request: crate::engine::codex::CodexAuxiliaryRequest,
+    ) -> BoxFuture<'_, Result<crate::engine::middleware::MiddlewareResponse, GatewayError>> {
+        Box::pin(self.codex_auxiliary_inner(prepared, request))
+    }
+
     fn request_settings(&self) -> Option<RequestSettings> {
         self.snapshots.acquire().ok().map(RequestSettings::new)
     }

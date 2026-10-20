@@ -1,6 +1,7 @@
 //! 数据面执行入口与请求、作用域、会话的单一所有权
 
 mod admission;
+mod codex;
 mod contract;
 mod delivery;
 pub use delivery::ResponseCommit;

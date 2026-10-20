@@ -15,6 +15,14 @@ use crate::{
 
 pub const MAXIMUM_AUTHORIZATION_BYTES: usize = 8 * 1024;
 
+/// 入口用途由受信协议路由选择，不从客户端头或 endpoint 字符串推断
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClientAuthenticationPurpose {
+    #[default]
+    Models,
+    Codex,
+}
+
 /// API 从数据面 Authorization 头构造的有界认证信封
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientAuthenticationRequest {
@@ -22,9 +30,21 @@ pub struct ClientAuthenticationRequest {
     settings: Option<crate::routing::request_settings::RequestSettings>,
     authorization: Arc<str>,
     native_bearer: Option<PlaintextClientApiKey>,
+    purpose: ClientAuthenticationPurpose,
 }
 
 impl ClientAuthenticationRequest {
+    #[must_use]
+    pub const fn with_purpose(mut self, purpose: ClientAuthenticationPurpose) -> Self {
+        self.purpose = purpose;
+        self
+    }
+
+    #[must_use]
+    pub const fn purpose(&self) -> ClientAuthenticationPurpose {
+        self.purpose
+    }
+
     #[must_use]
     pub fn with_request_context(
         mut self,
@@ -83,6 +103,7 @@ impl ClientAuthenticationRequest {
             request_context: None,
             authorization: authorization.into(),
             native_bearer,
+            purpose: ClientAuthenticationPurpose::Models,
         })
     }
 

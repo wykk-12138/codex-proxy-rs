@@ -1,6 +1,7 @@
 //! OpenAI 客户端协议 adapter
 
 pub mod auth;
+mod codex;
 mod endpoint;
 pub mod error;
 pub mod images;

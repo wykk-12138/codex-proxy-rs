@@ -12,6 +12,13 @@ use crate::{
 };
 use std::sync::Arc;
 
+/// 辅助 API 共享 RPM/并发和排队，但不进入模型金额门禁
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionPurpose {
+    Model,
+    Auxiliary,
+}
+
 pub(super) struct AdmissionLease {
     pub(super) renewal: Option<Box<dyn LeaseGuard>>,
     pub(super) armed: bool,

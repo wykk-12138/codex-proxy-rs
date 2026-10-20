@@ -36,7 +36,7 @@ use crate::{
     ApiState,
     openai::middleware::{RequestInput, invoke_request, request_parts},
     openai::{
-        auth::{authenticate_client, client_access_error_response},
+        auth::{authenticate_client_with_purpose, client_access_error_response},
         error::runtime_unavailable_response,
         service::OpenAiService,
     },
@@ -63,11 +63,20 @@ pub(crate) async fn responses_websocket(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     middleware: Option<Extension<FrozenMiddlewarePlan>>,
     lifetime: Option<Extension<Arc<crate::middleware::CallLifetime>>>,
+    purpose: Option<Extension<gateway_core::engine::authentication::ClientAuthenticationPurpose>>,
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
     let service = state.openai().clone();
-    let client = match authenticate_client(&service, &headers).await {
+    let client = match authenticate_client_with_purpose(
+        &service,
+        &headers,
+        purpose
+            .map(|Extension(purpose)| purpose)
+            .unwrap_or_default(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
     };
@@ -117,10 +126,11 @@ impl ResponsesWebSocketAdapter {
             Ok(guard) => guard,
             Err(_) => return runtime_unavailable_response().into_response(),
         };
+        let endpoint = crate::openai::codex::responses_path(&client);
         let connection_id = self.service.next_request_id().replacen("req_", "ws_", 1);
         TraceContext::new(&connection_id).headers(
             "client.connection.headers",
-            serde_json::json!({"transport": "websocket", "method": "GET", "path": crate::openai::router::RESPONSES_PATH}),
+            serde_json::json!({"transport": "websocket", "method": "GET", "path": endpoint}),
             raw_headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
@@ -180,6 +190,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
         websocket_connection_id = %connection_id,
         "Responses WebSocket connected"
     );
+    let endpoint = crate::openai::codex::responses_path(&client);
     let _connection_guard = connection_guard;
     let cancellation = lifecycle.cancellation();
     let request_headers =
@@ -322,7 +333,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
         let capture = new_replay_capture();
         let validation = ResponseValidationFacts::default();
         let input = RequestInput {
-            endpoint: crate::openai::router::RESPONSES_PATH.to_owned(),
+            endpoint: endpoint.to_owned(),
             protocol: "openai".to_owned(),
             operation: Some(OperationKind::Generate),
             transport: ClientTransport::WebSocket,
@@ -364,7 +375,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
                             prepared,
                             decoded,
                             ClientTransport::WebSocket,
-                            crate::openai::router::RESPONSES_PATH,
+                            endpoint,
                         )
                         .await
                         .map_err(MiddlewareError::Gateway)?;
