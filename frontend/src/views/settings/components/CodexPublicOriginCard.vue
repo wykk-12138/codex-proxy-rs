@@ -13,7 +13,7 @@ const model = defineModel<string>({ required: true })
     <ZForm class="max-w-6xl">
       <ZFormItem
         label="公共地址"
-        description="不含路径、参数和账号信息；留空表示未配置"
+        description="不含路径、参数和账号信息，留空表示未配置"
         :error="error"
       >
         <ZInput

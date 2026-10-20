@@ -392,21 +392,53 @@ V2 远程压缩通过 Responses 接口发送 `compaction_trigger`，网关和上
 绑定后只能切换启停，换账号需要新建 Key；删除 Key 一并解除绑定。绑定账号不在 Key 的有效分组范围、
 账号凭据失效或停止启用时，原生请求被拒绝，不会改用其他账号
 
-客户端使用独立目录和独立 Key，不覆盖官方登录：
+以下配置适用于官方 Codex `0.163.0-alpha.10.2`，使用独立目录和登录上下文，不覆盖桌面默认配置。
+先创建目录，并将权限限制为仅本人访问：
 
 ```bash
-# 地址与 Key 换成当前部署和新建的客户端密钥
-export CODEX_HOME="$HOME/.codex-native"
-export CODEX_ACCESS_TOKEN="<client-api-key>"
-export CODEX_AUTHAPI_BASE_URL="https://cpr.example.com/codex/auth"
-codex -c 'openai_base_url="https://cpr.example.com/codex/backend-api/codex"' \
-      -c 'chatgpt_base_url="https://cpr.example.com/codex/backend-api"'
+mkdir -p "$HOME/.codex-native"
+chmod 700 "$HOME/.codex-native"
+```
+
+在该目录创建 `config.toml`，将示例地址替换为当前部署地址：
+
+```toml
+model_provider = "openai"
+cli_auth_credentials_store = "file"
+openai_base_url = "https://cpr.example.com/codex/backend-api/codex"
+chatgpt_base_url = "https://cpr.example.com/codex/backend-api"
+
+[features.token_budget]
+enabled = true
+use_history_notes_extension = true
+```
+
+同目录的 `auth.json` 显式使用 PAT 登录字段，将占位值替换为已开启原生访问的 CPRS Client Key：
+
+```json
+{
+  "personal_access_token": "<client-api-key>"
+}
+```
+
+普通 CPRS Key 使用此字段选择 PAT 登录流程。该版本的 `CODEX_ACCESS_TOKEN` 仅将 `at-` 前缀识别为 PAT，
+不能用它传递默认 `sk_` 格式的 CPRS Key，也不要为 Key 添加前缀。认证文件含明文密钥，不要提交到仓库
+
+限制认证文件权限，启动时仅对本次进程清除会覆盖配置的环境变量：
+
+```bash
+chmod 600 "$HOME/.codex-native/auth.json"
+env -u OPENAI_API_KEY -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_BASE_URL \
+  CODEX_HOME="$HOME/.codex-native" \
+  CODEX_AUTHAPI_BASE_URL="https://cpr.example.com/codex/auth" \
+  codex
 ```
 
 三个地址分别对应身份查询、模型与 Responses 请求以及其他后台请求，前缀固定。
-`CODEX_ACCESS_TOKEN` 是本机的客户端密钥，不需要另写 `auth.json`，也不要写入 `config.toml` 或提交到仓库。
-history、notes 与账号信息仍由官方保存，网关不保存副本。
-普通 `/v1` 写法与原生入口可以同时使用同一个 Key，各自按该 Key 的账号范围与限额执行，
+`token_budget` 配置启用客户端的 history/notes 扩展，服务端提供路由不会自动启用客户端工具。
+history、notes 与账号信息仍由官方保存，网关不保存副本
+
+普通 `/v1` 写法与原生入口可以同时使用同一个 Key，各自按该 Key 的账号范围与限额执行。
 原生入口的路径与方法清单见 [原生 Codex 入口](../docs/api.md#原生-codex-入口)
 
 ### 生图和 WebSocket

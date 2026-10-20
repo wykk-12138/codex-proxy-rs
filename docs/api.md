@@ -623,9 +623,12 @@ whoami 与 accounts/check 由绑定账号的真实 Provider 事实投影，只�
 FedRAMP 声明保留官方值或默认值，不补造成更高档位。accounts/check 的工作区路由地址使用运行设置中的
 [原生 Codex 公共地址](#原生-codex-公共地址)，不从 `Host` 或转发头推导
 
-模型目录、Responses 与搜索沿用 `/v1` 的 Key 限额、账号范围与并发准入。history、notes 与只读账号信息复用适用的
-Key RPM 与并发准入，不按模型额度计费；账号不可用时正常拒绝或等待，取消或丢弃响应正文时释放准入。
-这些内容仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放
+模型目录沿用 `/v1/models` 的只读合同，按绑定账号范围过滤，不创建推理 attempt 或计量，也不执行模型准入。
+Responses 与搜索沿用 `/v1` 的 Key 限额与并发准入。whoami、accounts/check、history、notes 与只读账号信息共享
+Key RPM、并发与排队，不进入模型金额门禁或生成模型费用，取消或丢弃响应正文时释放准入。
+辅助请求与同一 Key 的模型流重叠时也受该并发限制，容量不足按现有配置拒绝或排队，不设独立辅助并发池
+
+history、notes 仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放
 
 同一 OAuth 账号被多个 Key 绑定时共享官方账号空间，原生入口不提供 Key 级历史隔离
 
@@ -1143,8 +1146,11 @@ OAuth start 使用：
   失效后需取得新 PAT 再导入。普通 JWT 导入行为不变
 - 首次 OAuth 保留回调 `state`、PKCE 与官方 token exchange，并持久化 `idToken`、`accessToken`、
   `refreshToken`。刷新响应中的三个 token 字段均按官方语义独立轮换：返回新值时替换，省略时分别保留
-  现值。重新授权也保留这些回调保护，但只轮换目标账号的 token。回调地址只承载 `code`/`state`，
-  不以 host/path 形式作为拒绝条件
+  现值。重新授权保留这些回调保护，并将本次授权取得的凭据与真实用户/workspace 身份一并提交。
+  回调地址只承载 `code`/`state`，不以 host/path 形式作为拒绝条件
+- 管理员普通凭据替换、导入与重新授权使用本次凭据解析的身份，不从目标账号继承旧身份。
+  已被原生 Codex Key 绑定的账号不能更换上游用户或 workspace，也不能替换为无法识别身份的凭据，
+  即使绑定已停用仍受此约束；同身份替换允许提交。身份冲突时凭据与身份均不保存
 - OAuth 账号文件导入和 OAuth complete（包括重新授权）在 credential 提交后后台尝试一次额度观测，不等待
   观测完成才返回成功。观测失败只记录告警，不回滚已提交的账号；手工或后台 RT 刷新只更新 token，
   不隐式等同于手工额度刷新，也不更新既有账号资料或 OAuth principal。xAI 导入与 OAuth complete
@@ -1676,7 +1682,8 @@ Guardian 以 `subagent_kind` 或 `client_metadata.x-openai-subagent` 值 `guardi
 `codexPublicOrigin` 是[原生 Codex 入口](#原生-codex-入口)对外的本站地址，默认为 `null`，只参与原生入口请求
 
 取值必须是 HTTPS 地址，带 host，路径仅限根 `/`，不含 username、password、query 和 fragment；
-允许端口和结尾根斜杠。保存时按字符串原样存储，空值或 `null` 表示未配置，不根据请求 `Host` 或转发头推导。
+允许端口和结尾根斜杠。保存时按字符串原样存储，完整设置请求中省略或 `null` 表示未配置，空字符串校验失败，
+不根据请求 `Host` 或转发头推导。
 校验失败的字段为 `codexPublicOrigin`。启用原生访问时必须配置，`accounts/check` 的工作区路由地址也使用该值
 
 ### 智能调度
