@@ -96,6 +96,7 @@ impl ClientKeyStore for TestClientKeyStore {
         }
         self.plaintexts.lock().unwrap().push(key.plaintext);
         let record = ClientKeyRecord {
+            codex_access: key.codex_access,
             request_profile_overrides: Default::default(),
             id: key.id,
             name: key.name,
@@ -234,6 +235,7 @@ async fn plugin_client_key_list_projects_only_public_identity_and_uses_stable_na
         list_response: Mutex::new(Some(ClientKeyPage {
             config_revision: Revision::new(7).expect("revision"),
             items: vec![ClientKeyRecord {
+                codex_access: None,
                 request_profile_overrides: Default::default(),
                 id: key_id.clone(),
                 name: "Public identity".to_owned(),
@@ -370,6 +372,7 @@ async fn duplicate_names_report_the_same_actionable_conflict_on_create_and_updat
         .update(
             &mutation_context(),
             UpdateClientKey {
+                codex_access: None,
                 request_profile_override_updates: Default::default(),
                 id: ClientApiKeyId::new("key_existing").unwrap(),
                 name: "Migration".to_owned(),
@@ -390,6 +393,7 @@ async fn duplicate_names_report_the_same_actionable_conflict_on_create_and_updat
 
 fn create_command(key: Option<&str>) -> CreateClientKey {
     CreateClientKey {
+        codex_access: None,
         request_profile_overrides: Default::default(),
         custom_key: key.map(|value| PlaintextClientApiKey::new(value).unwrap()),
         name: "Migration".to_owned(),
@@ -436,6 +440,7 @@ async fn duplicate_group_ids_are_rejected_before_key_creation_or_update() {
         .update(
             &mutation_context(),
             UpdateClientKey {
+                codex_access: None,
                 request_profile_override_updates: Default::default(),
                 id: ClientApiKeyId::new("key_existing").unwrap(),
                 name: "Migration".to_owned(),

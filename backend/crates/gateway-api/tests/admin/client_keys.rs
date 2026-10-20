@@ -434,6 +434,7 @@ fn client_key_responses_should_keep_shape_and_redact_creation_debug() {
         .expect("valid time");
     let view = ClientKeyView::from((
         gateway_admin::model::client_keys::ClientKeyRecord {
+            codex_access: None,
             request_profile_overrides: Default::default(),
             budget: Default::default(),
             id: gateway_core::policy::ClientApiKeyId::new("key_visible").expect("Client Key ID"),
@@ -689,5 +690,43 @@ fn generic_profile_override_clear_rejects_conflicting_legacy_update() {
     assert_eq!(
         request.into_command().unwrap_err().field(),
         "providerRequestProfileOverrides"
+    );
+}
+
+#[test]
+fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
+    let baseline = json!({"id":"key_codex", "name":"Codex", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0});
+    let omitted = serde_json::from_value::<UpdateClientKeyRequest>(baseline.clone())
+        .unwrap()
+        .into_command()
+        .unwrap();
+    assert!(omitted.codex_access.is_none());
+    for enabled in [true, false] {
+        let mut payload = baseline.clone();
+        payload["codexAccess"] = json!({"enabled":enabled,"accountId":"acct_codex"});
+        let command = serde_json::from_value::<UpdateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .unwrap();
+        let binding = command.codex_access.unwrap();
+        assert_eq!(binding.enabled, enabled);
+        assert_eq!(binding.account_id.as_str(), "acct_codex");
+    }
+    for invalid in [
+        serde_json::Value::Null,
+        json!({"enabled":false}),
+        json!({"enabled":true,"accountId":"acct_codex","unrelated":true}),
+    ] {
+        let mut payload = baseline.clone();
+        payload["codexAccess"] = invalid;
+        assert!(serde_json::from_value::<UpdateClientKeyRequest>(payload).is_err());
+    }
+    let mut payload = baseline;
+    payload["codexAccess"] = json!({"enabled":true,"accountId":"wrong"});
+    assert!(
+        serde_json::from_value::<UpdateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .is_err()
     );
 }

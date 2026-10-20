@@ -232,10 +232,15 @@ fn prepare_replace(
         account_id,
         provider_kind,
         expected_credential_revision: Revision::new(credential_revision).map_err(|_| invalid())?,
-        replacement_identity: facts
+        identity_write: facts
             .upstream_user_id
             .clone()
-            .map(|user| ProviderAccountIdentity::new(user, facts.upstream_account_id.clone())),
+            .map(|user| {
+                gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new(user, facts.upstream_account_id.clone()),
+                )
+            })
+            .unwrap_or(gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement),
         name: facts.name,
         email: facts.email,
         plan_type: facts.plan_type,

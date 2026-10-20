@@ -251,6 +251,14 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         &self,
         update: ProviderCredentialUpdate,
     ) -> StoreResult<Revision> {
+        if !matches!(
+            update.identity_write,
+            gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
+        ) {
+            return Err(invalid(
+                "administrator credentials require an audited Admin transaction",
+            ));
+        }
         require_nonempty(ENTITY, "account_id", &update.account_id)?;
         validate_object_size(
             "provider_credentials_json",
@@ -440,7 +448,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|source| postgres_unavailable("delete disabled provider account", source))?;
+            .map_err(identity::map_account_delete_error)?;
         Ok(result.rows_affected() == 1)
     }
 }
@@ -695,6 +703,42 @@ pub(crate) async fn upsert_provider_account_in_transaction(
     account: &NewProviderAccount,
 ) -> StoreResult<(String, Revision)> {
     account.validate()?;
+    let existing: Vec<(String, i64, String)> = sqlx::query_as(
+        "select id, credential_revision, authentication_kind from provider_accounts
+         where id = $1 or (provider_kind = $2 and upstream_user_id = $3
+           and coalesce(upstream_account_id, '') = coalesce($4, ''))
+         order by id for update",
+    )
+    .bind(&account.id)
+    .bind(&account.provider_kind)
+    .bind(&account.upstream_user_id)
+    .bind(&account.upstream_account_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|source| postgres_unavailable("lock imported account identity", source))?;
+    let identity_write = account
+        .upstream_user_id
+        .as_ref()
+        .map(|user| {
+            gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                ProviderAccountIdentity::new(user.clone(), account.upstream_account_id.clone()),
+            )
+        })
+        .unwrap_or(gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement);
+    for (id, revision, authentication) in existing {
+        let write = if authentication == account.authentication_kind {
+            &identity_write
+        } else {
+            &gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement
+        };
+        identity::validate_credential_identity_in_transaction(
+            transaction,
+            &id,
+            Revision::new(to_u64(revision)?)?,
+            write,
+        )
+        .await?;
+    }
     let credential_state = account.credential_state;
     let proxy_id = match account.outbound_proxy.as_ref() {
         Some(proxy) => Some(
@@ -796,10 +840,22 @@ pub(crate) async fn rotate_provider_account_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &ProviderAccountAdminScope,
     profile: &UpdateProviderAccount,
-    replacement_identity: Option<&ProviderAccountIdentity>,
     update: &ProviderCredentialUpdate,
 ) -> StoreResult<Revision> {
-    let replace_identity = replacement_identity.is_some();
+    identity::validate_credential_identity_in_transaction(
+        transaction,
+        &update.account_id,
+        update.expected_revision,
+        &update.identity_write,
+    )
+    .await?;
+    let replacement_identity = update.identity_write.replacement_identity();
+    let replace_identity = matches!(
+        update.identity_write,
+        gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(_)
+            | gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement
+    );
+    // 无身份的新凭据清除旧投影，不能让随后创建的原生绑定借用旧身份
     let upstream_user_id = replacement_identity.map(ProviderAccountIdentity::upstream_user_id);
     let upstream_account_id =
         replacement_identity.and_then(ProviderAccountIdentity::upstream_account_id);
@@ -818,7 +874,7 @@ pub(crate) async fn rotate_provider_account_in_transaction(
              upstream_account_id = case when $11::boolean then $13::text else upstream_account_id end,
              credential_state = case
                  when $15::boolean then credential_state
-                 when $11::boolean or credential_state <> 'unknown' then 'ready'
+                 when $12::text is not null or credential_state <> 'unknown' then 'ready'
                  else 'unknown'
              end,
              credential_observed_at = case
@@ -937,9 +993,7 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
     .bind(&scope.provider_kind)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|source| {
-        postgres_unavailable("delete provider account in admin transaction", source)
-    })?;
+    .map_err(identity::map_account_delete_error)?;
     let deleted = deleted.into_iter().collect::<BTreeSet<_>>();
     let expected = account_ids.iter().cloned().collect::<BTreeSet<_>>();
     if deleted == expected {
@@ -1106,7 +1160,7 @@ pub(super) async fn rotate_provider_account_admin_in_transaction(
     command.scope.validate()?;
     require_nonempty(ENTITY, "account_id", &command.profile.id)?;
     require_nonempty(ENTITY, "name", &command.profile.name)?;
-    if let Some(identity) = &command.replacement_identity {
+    if let Some(identity) = command.credential.identity_write.replacement_identity() {
         require_nonempty(ENTITY, "upstream_user_id", identity.upstream_user_id())?;
         if let Some(account_id) = identity.upstream_account_id() {
             require_nonempty(ENTITY, "upstream_account_id", account_id)?;
@@ -1129,7 +1183,6 @@ pub(super) async fn rotate_provider_account_admin_in_transaction(
         transaction,
         &command.scope,
         &command.profile,
-        command.replacement_identity.as_ref(),
         &command.credential,
     )
     .await?;

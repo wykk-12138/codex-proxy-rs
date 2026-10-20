@@ -995,6 +995,29 @@ pub(super) fn prepare_rotation(
     context: &MutationContext,
     action: MutationAuditOperation,
 ) -> AdminStoreResult<RotateProviderAccount> {
+    use gateway_core::account::CredentialIdentityWrite;
+    let valid_source = match action {
+        MutationAuditOperation::ProviderAccountRefreshCredential => matches!(
+            prepared.identity_write,
+            CredentialIdentityWrite::RuntimeMaintenance
+        ),
+        MutationAuditOperation::ProviderAccountReauthorize => matches!(
+            prepared.identity_write,
+            CredentialIdentityWrite::VerifiedReplacement(_)
+        ),
+        MutationAuditOperation::ProviderAccountRotateCredential => !matches!(
+            prepared.identity_write,
+            CredentialIdentityWrite::RuntimeMaintenance
+        ),
+        _ => false,
+    };
+    if !valid_source {
+        return Err(AdminStoreError::new(
+            AdminStoreErrorKind::Invalid,
+            ENTITY,
+            "credential write source does not match the operation",
+        ));
+    }
     let account_id = prepared.account_id.clone();
     let scope = ProviderAccountAdminScope {
         provider_kind: prepared.provider_kind.as_str().to_owned(),
@@ -1022,8 +1045,8 @@ pub(super) fn prepare_rotation(
             email: prepared.email,
             plan_type: prepared.plan_type,
         },
-        replacement_identity: prepared.replacement_identity,
         credential: ProviderCredentialUpdate {
+            identity_write: prepared.identity_write,
             account_id: account_id.as_str().to_owned(),
             expected_revision: store_revision(prepared.expected_credential_revision)?,
             provider_credentials_json: provider_document_json(prepared.provider_material)

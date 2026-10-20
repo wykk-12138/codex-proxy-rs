@@ -156,7 +156,9 @@ async fn reauthorization_replay_keeps_the_committed_revision_and_later_profile_e
                 account_id: id.clone(),
                 provider_kind: ProviderKind::new("openai").unwrap(),
                 expected_credential_revision: gateway_admin::model::Revision::new(1).unwrap(),
-                replacement_identity: None,
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new("reauthorize-user".into(), None),
+                ),
                 name: "remote profile".into(),
                 email: None,
                 plan_type: None,

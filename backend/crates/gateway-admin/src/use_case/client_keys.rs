@@ -176,6 +176,7 @@ impl ClientKeyService for DefaultClientKeyService {
             .store
             .create_client_key(
                 NewClientKey {
+                    codex_access: command.codex_access,
                     request_profile_overrides: command.request_profile_overrides,
                     id,
                     name: command.name,

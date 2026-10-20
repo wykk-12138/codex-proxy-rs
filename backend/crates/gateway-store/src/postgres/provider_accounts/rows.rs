@@ -233,7 +233,6 @@ pub struct RotateProviderAccount {
     pub settings: Option<gateway_admin::model::accounts::UpdateAccount>,
     pub scope: ProviderAccountAdminScope,
     pub profile: UpdateProviderAccount,
-    pub replacement_identity: Option<ProviderAccountIdentity>,
     pub credential: ProviderCredentialUpdate,
     pub audit: AdminAuditEvent,
 }
@@ -245,7 +244,6 @@ impl fmt::Debug for RotateProviderAccount {
             .field("settings", &self.settings)
             .field("scope", &self.scope)
             .field("profile", &self.profile)
-            .field("replacement_identity", &self.replacement_identity)
             .field("credential", &self.credential)
             .field("audit", &self.audit)
             .finish()
@@ -286,6 +284,7 @@ pub struct ProviderAccountAdminRotation {
 
 #[derive(Clone)]
 pub struct ProviderCredentialUpdate {
+    pub identity_write: gateway_core::account::CredentialIdentityWrite,
     pub account_id: String,
     pub expected_revision: Revision,
     pub provider_credentials_json: JsonObject,

@@ -172,11 +172,10 @@ async fn credential_and_admin_writes_preserve_existing_update_time_after_clock_r
     );
     assert_eq!(
         repository
-            .compare_and_swap_credentials(credential_update(
-                account_id.as_str(),
-                1,
-                "synthetic-rotated"
-            ))
+            .compare_and_swap_credentials(ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance,
+                ..credential_update(account_id.as_str(), 1, "synthetic-rotated")
+            })
             .await
             .expect("rotate credentials")
             .get(),

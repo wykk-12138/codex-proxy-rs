@@ -116,9 +116,17 @@ pub struct ClientSettings {
     pub limits: RateLimits,
 }
 
+/// Key 的持久 Codex 账号绑定；关闭入口不解除身份关系
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAccessBinding {
+    pub enabled: bool,
+    pub account_id: crate::account::ProviderAccountId,
+}
+
 /// 从 `client_api_keys` 冻结的公开准入事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPolicy {
+    codex_access: Option<CodexAccessBinding>,
     name_snapshot: Option<String>,
     defaults: Arc<ClientSettings>,
     key_id: ClientApiKeyId,
@@ -129,6 +137,17 @@ pub struct ClientPolicy {
 }
 
 impl ClientPolicy {
+    #[must_use]
+    pub fn with_codex_access(mut self, binding: Option<CodexAccessBinding>) -> Self {
+        self.codex_access = binding;
+        self
+    }
+
+    #[must_use]
+    pub const fn codex_access(&self) -> Option<&CodexAccessBinding> {
+        self.codex_access.as_ref()
+    }
+
     #[must_use]
     pub fn defaults(&self) -> &Arc<ClientSettings> {
         &self.defaults
@@ -164,6 +183,7 @@ impl ClientPolicy {
         limits: RateLimits,
     ) -> Self {
         Self {
+            codex_access: None,
             name_snapshot: None,
             defaults: Arc::new(ClientSettings {
                 request_profiles: account_scope.request_profiles().clone(),

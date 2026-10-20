@@ -4,7 +4,8 @@ pub(crate) mod compiled;
 pub mod privacy;
 mod values;
 pub use values::{
-    SettingsValues, client_min_versions, response_body_limit, validate_request_limits,
+    SettingsValues, client_min_versions, response_body_limit, validate_codex_public_origin,
+    validate_request_limits,
 };
 
 #[derive(Debug, thiserror::Error)]

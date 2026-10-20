@@ -259,7 +259,20 @@ impl FakeProviderAdmin {
                     .current_credential_revision
                     .lock()
                     .expect("current credential revision"),
-                replacement_identity: None,
+                identity_write: account
+                    .upstream_user_id
+                    .clone()
+                    .map(|user| {
+                        gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                            gateway_core::account::ProviderAccountIdentity::new(
+                                user,
+                                account.upstream_account_id.clone(),
+                            ),
+                        )
+                    })
+                    .unwrap_or(
+                        gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement,
+                    ),
                 name: account.name.clone(),
                 email: account.email.clone(),
                 plan_type: account.plan_type.clone(),
@@ -472,7 +485,9 @@ impl ProviderAdmin for FakeProviderAdmin {
     ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
         self.record("provider.prepare_refresh");
         self.require_available()?;
-        Ok(self.prepared_rotation(&command.account))
+        let (mut facts, guard) = self.prepared_rotation(&command.account).into_parts();
+        facts.identity_write = gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance;
+        Ok(PreparedCredentialRotation::new(facts, guard))
     }
 
     async fn quota(
@@ -1169,6 +1184,7 @@ impl SettingsStore for StaticSettingsStore {
             rotation_strategy: RotationStrategy::Smart,
             updated_at: Utc::now(),
             values: gateway_admin::model::settings::RuntimeSettingsValues {
+                codex_public_origin: None,
                 codex_privacy_policy: Default::default(),
                 request_location_enabled: false,
                 request_location: Default::default(),
@@ -3274,7 +3290,18 @@ fn plugin_rotation_facts(account: &AccountRecord) -> PreparedCredentialRotationF
         account_id: ProviderAccountId::new(account.id.clone()).expect("account ID"),
         provider_kind: account.provider_kind.clone(),
         expected_credential_revision: account.credential_revision,
-        replacement_identity: None,
+        identity_write: account
+            .upstream_user_id
+            .clone()
+            .map(|user| {
+                gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    gateway_core::account::ProviderAccountIdentity::new(
+                        user,
+                        account.upstream_account_id.clone(),
+                    ),
+                )
+            })
+            .unwrap_or(gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement),
         name: "plugin refreshed account".to_owned(),
         email: account.email.clone(),
         plan_type: account.plan_type.clone(),

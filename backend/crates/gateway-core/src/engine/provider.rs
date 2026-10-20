@@ -1073,8 +1073,13 @@ pub trait Provider: Send + Sync {
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError>;
 
-    /// 返回 Provider 的 Live sideband 能力；不支持的 Provider 返回 `None`。
-    /// 实现必须只暴露已钉住账号的受限拨号，不得泄露凭据或放宽账号范围。
+    /// 原生辅助能力只消费 Core 已授权账号，不支持时返回 None
+    fn codex_gateway(&self) -> Option<Arc<dyn crate::engine::codex::CodexGateway>> {
+        None
+    }
+
+    /// 返回 Provider 的 Live sideband 能力；不支持的 Provider 返回 None
+    /// 实现必须只暴露已钉住账号的受限拨号，不得泄露凭据或放宽账号范围
     fn live_gateway(&self) -> Option<Arc<dyn crate::live::LiveGateway>> {
         None
     }

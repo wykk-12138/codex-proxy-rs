@@ -380,6 +380,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             .single()
             .expect("timestamp"),
         values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_public_origin: None,
             codex_privacy_policy: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
@@ -427,6 +428,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "providerRequestProfiles": {},
             "openaiClientProfile": null,
             "xaiClientProfile": null,
+            "codexPublicOrigin": null,
         "codexPrivacyPolicy": {"enabled":false,"onError":"skip_rule","rules":[]},
         "requestLocationEnabled": false,
         "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
@@ -1558,5 +1560,33 @@ fn reset_credit_weekly_threshold_accepts_unset_and_zero_to_one_hundred() {
         let mut body = update_body();
         body["resetCreditMaxWeeklyRemainingPercent"] = value;
         assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_err());
+    }
+}
+
+#[test]
+fn codex_public_origin_requires_a_trusted_https_origin() {
+    for origin in ["https://gateway.example", "https://gateway.example:8443/"] {
+        let mut payload = update_body();
+        payload["codexPublicOrigin"] = json!(origin);
+        let request = serde_json::from_value::<UpdateRuntimeSettingsRequest>(payload).unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.values.codex_public_origin.as_deref(), Some(origin));
+    }
+    for origin in [
+        "http://gateway.example",
+        "https://user:secret@gateway.example",
+        "https://gateway.example/codex",
+        "https://gateway.example/?q=x",
+        "https://gateway.example/#fragment",
+        "",
+    ] {
+        let mut payload = update_body();
+        payload["codexPublicOrigin"] = json!(origin);
+        assert!(
+            serde_json::from_value::<UpdateRuntimeSettingsRequest>(payload)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 }

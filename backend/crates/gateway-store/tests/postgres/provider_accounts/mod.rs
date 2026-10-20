@@ -9,6 +9,7 @@ use std::{
 mod admin_adapter;
 mod authorization;
 mod deletion;
+mod identity;
 mod quota_forecast;
 mod timestamps;
 mod usage_projection;
@@ -525,6 +526,7 @@ async fn quota_plan_changes_survive_inflight_background_and_manual_token_refresh
 
     let mut credential =
         credential_update(id.as_str(), current.revision().get(), "manual-refreshed");
+    credential.identity_write = gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance;
     credential.preserve_profile = true;
     repository
         .rotate_provider_account(RotateProviderAccount {
@@ -533,7 +535,6 @@ async fn quota_plan_changes_survive_inflight_background_and_manual_token_refresh
                 provider_kind: "openai".to_owned(),
             },
             profile: profile(id.as_str(), "stale profile"),
-            replacement_identity: None,
             credential,
             audit: audit("audit_plan_refresh", "refresh", id.as_str()),
         })
@@ -2402,7 +2403,6 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
             settings: None,
             scope: wrong_scope,
             profile: profile("acct_admin_a", "wrong scope"),
-            replacement_identity: None,
             credential: credential_update("acct_admin_a", 1, "wrong-scope-secret"),
             audit: audit("audit_wrong_scope", "rotate", "acct_admin_a"),
         })
@@ -2432,11 +2432,15 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
             settings: None,
             scope: scope.clone(),
             profile: profile("acct_admin_a", "rotated account"),
-            replacement_identity: Some(ProviderAccountIdentity::new(
-                "user-admin-rebound".to_owned(),
-                Some("workspace-admin-rebound".to_owned()),
-            )),
-            credential: credential_update("acct_admin_a", 1, "rotated-secret"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new(
+                        "user-admin-rebound".to_owned(),
+                        Some("workspace-admin-rebound".to_owned()),
+                    ),
+                ),
+                ..credential_update("acct_admin_a", 1, "rotated-secret")
+            },
             audit: audit("audit_account_rotate", "rotate", "acct_admin_a"),
         })
         .await
@@ -2465,11 +2469,12 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
             settings: None,
             scope: scope.clone(),
             profile: profile("acct_admin_a", "must roll back"),
-            replacement_identity: Some(ProviderAccountIdentity::new(
-                "user-admin-b".to_owned(),
-                None,
-            )),
-            credential: credential_update("acct_admin_a", 2, "must-not-persist"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new("user-admin-b".to_owned(), None),
+                ),
+                ..credential_update("acct_admin_a", 2, "must-not-persist")
+            },
             audit: audit(
                 "audit_account_identity_conflict",
                 "reauthorize",
@@ -2587,8 +2592,12 @@ async fn credential_rotation_and_settings_share_one_transaction() {
         .rotate_provider_account(RotateProviderAccount {
             scope: scope.clone(),
             profile: profile(ACCOUNT_ID, "combined save"),
-            replacement_identity: None,
-            credential: credential_update(ACCOUNT_ID, 1, "combined-secret"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new("combined-save-user".into(), None),
+                ),
+                ..credential_update(ACCOUNT_ID, 1, "combined-secret")
+            },
             settings: Some(settings.clone()),
             audit: audit("audit_combined_save", "rotate", ACCOUNT_ID),
         })
@@ -2649,8 +2658,13 @@ async fn credential_rotation_and_settings_share_one_transaction() {
             .rotate_provider_account(RotateProviderAccount {
                 scope: scope.clone(),
                 profile: profile(ACCOUNT_ID, "must not persist"),
-                replacement_identity: None,
-                credential: credential_update(ACCOUNT_ID, expected_revision, "must-not-persist"),
+                credential: ProviderCredentialUpdate {
+                    identity_write:
+                        gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                            ProviderAccountIdentity::new("combined-save-user".into(), None),
+                        ),
+                    ..credential_update(ACCOUNT_ID, expected_revision, "must-not-persist")
+                },
                 settings: Some(invalid_settings),
                 audit: audit(&format!("audit_{case}"), "rotate", ACCOUNT_ID),
             })
@@ -2760,8 +2774,12 @@ async fn provider_account_import_and_reauthorization_preserve_existing_membershi
             settings: None,
             scope,
             profile: profile("acct_grouped_import", "reauthorized"),
-            replacement_identity: None,
-            credential: credential_update("acct_grouped_import", 2, "reauthorized-secret"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new("user-grouped-import".into(), None),
+                ),
+                ..credential_update("acct_grouped_import", 2, "reauthorized-secret")
+            },
             audit: audit(
                 "audit_clear_groups_reauthorize",
                 "reauthorize",
@@ -2832,8 +2850,12 @@ async fn verified_credential_rotation_preserves_quota_exhaustion() {
             settings: None,
             scope,
             profile: profile("acct_rotation_quota", "reauthorized account"),
-            replacement_identity: None,
-            credential: credential_update("acct_rotation_quota", 1, "reauthorized-secret"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(
+                    ProviderAccountIdentity::new("user-rotation-quota".into(), None),
+                ),
+                ..credential_update("acct_rotation_quota", 1, "reauthorized-secret")
+            },
             audit: audit(
                 "audit_rotation_quota_rotate",
                 "reauthorize",
@@ -3067,8 +3089,10 @@ async fn disabled_account_updates_credentials_without_enabling_scheduling() {
             settings: None,
             scope,
             profile: profile(account_id.as_str(), "refreshed disabled account"),
-            replacement_identity: None,
-            credential: credential_update(account_id.as_str(), 1, "disabled-refreshed-secret"),
+            credential: ProviderCredentialUpdate {
+                identity_write: gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance,
+                ..credential_update(account_id.as_str(), 1, "disabled-refreshed-secret")
+            },
             audit: audit(
                 "audit_disabled_refresh_rotate",
                 "refresh",
@@ -3120,6 +3144,7 @@ pub(super) fn account(id: &str, upstream_user_id: &str) -> NewProviderAccount {
 
 fn credential_update(account_id: &str, revision: u64, marker: &str) -> ProviderCredentialUpdate {
     ProviderCredentialUpdate {
+        identity_write: gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement,
         preserve_profile: false,
         preserve_credential_state: false,
         account_id: account_id.to_owned(),
@@ -3654,6 +3679,7 @@ async fn connection_configuration_update_preserves_credential_health() {
             .await
             .unwrap();
     let mut credential = credential_update(ID, 1, "same-secret");
+    credential.identity_write = gateway_core::account::CredentialIdentityWrite::ConnectionSettings;
     credential.preserve_credential_state = true;
     credential.preserve_profile = true;
     repository
@@ -3662,7 +3688,6 @@ async fn connection_configuration_update_preserves_credential_health() {
                 provider_kind: "openai".to_owned(),
             },
             profile: profile(ID, "must not replace name"),
-            replacement_identity: None,
             credential,
             settings: None,
             audit: audit("audit_transport_health", "rotate", ID),

@@ -4,6 +4,7 @@ pub mod admission;
 pub mod authentication;
 pub mod budget;
 pub mod client_retry;
+pub mod codex;
 pub mod connection;
 pub mod continuation;
 pub mod coordinator;

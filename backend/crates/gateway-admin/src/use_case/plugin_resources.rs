@@ -83,6 +83,7 @@ impl PluginResourceAccess for DefaultPluginResourceAccess {
                     resource_key,
                     groups,
                     NewClientKey {
+                        codex_access: None,
                         id,
                         name: command.name,
                         label: None,

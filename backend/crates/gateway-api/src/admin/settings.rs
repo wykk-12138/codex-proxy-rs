@@ -36,6 +36,7 @@ pub type ProviderRequestProfileUpdates =
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsFields {
+    pub codex_public_origin: Option<String>,
     pub codex_privacy_policy: gateway_core::settings::privacy::CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -748,6 +749,7 @@ impl RuntimeSettingsFields {
         self,
     ) -> Result<gateway_admin::model::settings::RuntimeSettingsValues, WireValidationError> {
         let values = gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_public_origin: self.codex_public_origin,
             codex_privacy_policy: self.codex_privacy_policy,
             request_location_enabled: self.request_location_enabled,
             request_location: self
@@ -799,6 +801,7 @@ impl RuntimeSettingsFields {
 impl From<gateway_admin::model::settings::RuntimeSettingsValues> for RuntimeSettingsFields {
     fn from(settings: gateway_admin::model::settings::RuntimeSettingsValues) -> Self {
         crate::admin::settings::RuntimeSettingsFields {
+            codex_public_origin: settings.codex_public_origin,
             codex_privacy_policy: settings.codex_privacy_policy,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
@@ -865,6 +868,7 @@ fn settings_validation_error(field: &'static str) -> WireValidationError {
         "ops_event_retention_days" => "opsEventRetentionDays",
         "refresh_concurrency" => "refreshConcurrency",
         "refresh_margin_seconds" => "refreshMarginSeconds",
+        "codex_public_origin" => "codexPublicOrigin",
         "request_location" => "requestLocation",
         "request_location_enabled" => "requestLocationEnabled",
         "responses_max_decompressed_body_bytes" => "responsesMaxDecompressedBodyBytes",

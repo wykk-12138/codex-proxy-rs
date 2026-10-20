@@ -404,6 +404,7 @@ impl ProviderAccountStore for MemoryProviderAccountStore {
         update: CredentialCasUpdate,
     ) -> Result<CredentialCasOutcome, StoreError> {
         let CredentialCasUpdateParts {
+            identity_write,
             account_id,
             expected_revision,
             profile,
@@ -414,6 +415,12 @@ impl ProviderAccountStore for MemoryProviderAccountStore {
             next_refresh_at,
             account_state,
         } = update.into_parts();
+        if !matches!(
+            identity_write,
+            gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
+        ) {
+            return Err(invalid());
+        }
         let mut accounts = lock(&self.accounts);
         let stored = accounts.get_mut(&account_id).ok_or_else(invalid)?;
         if stored.account.revision() != expected_revision {

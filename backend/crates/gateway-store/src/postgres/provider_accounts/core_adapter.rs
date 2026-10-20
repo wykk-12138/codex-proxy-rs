@@ -146,6 +146,7 @@ impl ProviderAccountStore for PgProviderAccountRepository {
         update: CredentialCasUpdate,
     ) -> Result<CredentialCasOutcome, CoreStoreError> {
         let CredentialCasUpdateParts {
+            identity_write,
             account_id,
             expected_revision,
             profile,
@@ -156,6 +157,13 @@ impl ProviderAccountStore for PgProviderAccountRepository {
             next_refresh_at,
             account_state,
         } = update.into_parts();
+        // 管理员新凭据必须经过带审计和配置版本的 Admin 事务
+        if !matches!(
+            identity_write,
+            gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
+        ) {
+            return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));
+        }
         if profile.account_id != account_id {
             return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));
         }

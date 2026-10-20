@@ -152,6 +152,7 @@ impl ClientKeySort {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateClientKeyRequest {
+    codex_access: Option<CodexAccessWire>,
     #[serde(default)]
     provider_request_profile_overrides: ProviderRequestProfileOverrides,
     openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
@@ -190,6 +191,10 @@ impl CreateClientKeyRequest {
             self.xai_client_profile_override,
         )?;
         Ok(CreateClientKey {
+            codex_access: self
+                .codex_access
+                .map(CodexAccessWire::into_binding)
+                .transpose()?,
             request_profile_overrides,
             custom_key: self
                 .custom_key
@@ -217,6 +222,8 @@ impl CreateClientKeyRequest {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateClientKeyRequest {
+    #[serde(default, deserialize_with = "deserialize_codex_access")]
+    codex_access: Option<CodexAccessWire>,
     #[serde(default)]
     provider_request_profile_overrides: ProviderRequestProfileOverrideUpdates,
     #[serde(default, deserialize_with = "deserialize_profile_override")]
@@ -248,6 +255,10 @@ impl UpdateClientKeyRequest {
             self.xai_client_profile_override,
         )?;
         Ok(UpdateClientKey {
+            codex_access: self
+                .codex_access
+                .map(CodexAccessWire::into_binding)
+                .transpose()?,
             request_profile_override_updates,
             id: client_key_id(self.id, "clientKeyMutationNotFound")?,
             name: self.name,
@@ -334,6 +345,7 @@ impl ClientKeyMutationRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyView {
+    codex_access: Option<CodexAccessWire>,
     provider_request_profile_overrides: ProviderRequestProfileOverrides,
     /// 固定兼容字段；值始终从 provider_request_profile_overrides 派生
     openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
@@ -379,6 +391,7 @@ impl From<(ClientKeyRecord, crate::time::TimePresenter)> for ClientKeyView {
             .map(|(provider, profile)| (provider.as_str().to_owned(), profile.into_inner()))
             .collect::<ProviderRequestProfileOverrides>();
         Self {
+            codex_access: record.codex_access.map(CodexAccessWire::from),
             openai_client_profile_override: provider_request_profile_overrides
                 .get("openai")
                 .cloned(),
@@ -1084,4 +1097,37 @@ fn deserialize_profile_override<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Option<serde_json::Map<String, serde_json::Value>>>, D::Error> {
     Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer).map(Some)
+}
+
+/// 原生访问的持久账号绑定，更新不接受清空
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexAccessWire {
+    enabled: bool,
+    account_id: String,
+}
+
+impl CodexAccessWire {
+    fn into_binding(self) -> Result<gateway_core::policy::CodexAccessBinding, WireValidationError> {
+        Ok(gateway_core::policy::CodexAccessBinding {
+            enabled: self.enabled,
+            account_id: gateway_core::account::ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("codexAccess"))?,
+        })
+    }
+}
+
+impl From<gateway_core::policy::CodexAccessBinding> for CodexAccessWire {
+    fn from(binding: gateway_core::policy::CodexAccessBinding) -> Self {
+        Self {
+            enabled: binding.enabled,
+            account_id: binding.account_id.to_string(),
+        }
+    }
+}
+
+fn deserialize_codex_access<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<CodexAccessWire>, D::Error> {
+    CodexAccessWire::deserialize(deserializer).map(Some)
 }

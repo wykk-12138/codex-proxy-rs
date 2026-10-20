@@ -99,6 +99,7 @@ impl Environment {
             .client_keys()
             .create_client_key(
                 NewClientKey {
+                    codex_access: None,
                     request_profile_overrides: BTreeMap::new(),
                     id: ClientApiKeyId::new(id).unwrap(),
                     name: format!("fixture {id}"),

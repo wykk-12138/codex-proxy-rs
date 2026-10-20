@@ -57,6 +57,7 @@ mod admin_adapter;
 mod admin_queries;
 mod authorization;
 mod core_adapter;
+mod identity;
 mod mapping;
 mod quota_forecast;
 mod repository;

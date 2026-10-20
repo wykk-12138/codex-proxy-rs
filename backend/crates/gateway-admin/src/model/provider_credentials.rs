@@ -7,7 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::Stream;
 use gateway_core::{
-    account::{OpaqueProviderData, ProviderAccountId, ProviderAccountIdentity},
+    account::{CredentialIdentityWrite, OpaqueProviderData, ProviderAccountId},
     operation::RawJsonPayload,
     routing::{ProviderKind, UpstreamModelId},
 };
@@ -679,7 +679,7 @@ pub struct PreparedCredentialRotationFacts {
     pub account_id: ProviderAccountId,
     pub provider_kind: ProviderKind,
     pub expected_credential_revision: Revision,
-    pub replacement_identity: Option<ProviderAccountIdentity>,
+    pub identity_write: CredentialIdentityWrite,
     pub name: String,
     pub email: Option<String>,
     pub plan_type: Option<String>,

@@ -29,6 +29,7 @@ type ModelCatalogAccounts = BTreeMap<ProviderKind, BTreeMap<String, BTreeSet<Pro
 /// Store 读取到的一个启用 Client API Key 策略事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotClientPolicyFacts {
+    codex_access: Option<crate::policy::CodexAccessBinding>,
     name_snapshot: Option<String>,
     request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     key_id: ClientApiKeyId,
@@ -38,6 +39,12 @@ pub struct SnapshotClientPolicyFacts {
 }
 
 impl SnapshotClientPolicyFacts {
+    #[must_use]
+    pub fn with_codex_access(mut self, binding: Option<crate::policy::CodexAccessBinding>) -> Self {
+        self.codex_access = binding;
+        self
+    }
+
     #[must_use]
     pub fn with_name_snapshot(mut self, name: Option<String>) -> Self {
         self.name_snapshot = name;
@@ -62,6 +69,7 @@ impl SnapshotClientPolicyFacts {
     ) -> Self {
         Self {
             key_id,
+            codex_access: None,
             name_snapshot: None,
             request_profiles: BTreeMap::new(),
             plaintext_key,
@@ -553,7 +561,8 @@ async fn compile_runtime_snapshot(
                 true,
                 policy.limits,
             )
-            .with_name_snapshot(policy.name_snapshot),
+            .with_name_snapshot(policy.name_snapshot)
+            .with_codex_access(policy.codex_access),
         );
     }
 

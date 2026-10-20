@@ -8,6 +8,8 @@ use crate::identity::ProviderKind;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsValues {
+    #[serde(default)]
+    pub(crate) codex_public_origin: Option<String>,
     pub(crate) pricing: Arc<crate::metering::PricingOverrides>,
     pub(crate) request_profiles: Arc<BTreeMap<ProviderKind, crate::account::OpaqueProviderData>>,
     pub(crate) codex_privacy_policy: super::privacy::CodexPrivacyPolicy,
@@ -30,6 +32,17 @@ pub struct SettingsValues {
 }
 
 impl SettingsValues {
+    #[must_use]
+    pub fn with_codex_public_origin(mut self, origin: Option<String>) -> Self {
+        self.codex_public_origin = origin;
+        self
+    }
+
+    #[must_use]
+    pub fn codex_public_origin(&self) -> Option<&str> {
+        self.codex_public_origin.as_deref()
+    }
+
     #[must_use]
     pub fn with_codex_privacy_policy(mut self, policy: super::privacy::CodexPrivacyPolicy) -> Self {
         self.codex_privacy_policy = policy;
@@ -136,6 +149,7 @@ impl SettingsValues {
         Self {
             request_profiles: Arc::default(),
             pricing: Arc::default(),
+            codex_public_origin: None,
             codex_privacy_policy: Default::default(),
             request_location_enabled: false,
             request_location: crate::account::RequestLocation::default(),
@@ -228,4 +242,20 @@ pub fn client_min_versions(
             .transpose()
             .map_err(|_| "min_codex_cli_version")?,
     ))
+}
+
+/// 与官方 workspace routing 一致，只接受无认证、路径、query 和 fragment 的 HTTPS origin
+pub fn validate_codex_public_origin(origin: &str) -> Result<(), &'static str> {
+    let url = url::Url::parse(origin).map_err(|_| "codex_public_origin")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("codex_public_origin");
+    }
+    Ok(())
 }

@@ -97,6 +97,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "request_location_enabled".to_owned(),
                     "request_location_json".to_owned(),
                     "codex_privacy_policy_json".to_owned(),
+                    "codex_public_origin".to_owned(),
                     "model_mappings_json".to_owned(),
                     "refresh_margin_seconds".to_owned(),
                     "refresh_concurrency".to_owned(),

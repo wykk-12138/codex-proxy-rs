@@ -150,7 +150,7 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
 
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-            "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
+            "select codex_public_origin, provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
                     refresh_concurrency, max_concurrent_per_account,
                     rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
@@ -328,7 +328,7 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-        "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
+        "select codex_public_origin, provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
                 refresh_concurrency, max_concurrent_per_account,
                 rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
@@ -420,6 +420,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      codex_privacy_policy_json = $34,
                      reset_credit_lead_minutes = $35,
                      reset_credit_max_weekly_remaining_percent = $36,
+                     codex_public_origin = $37,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -471,6 +472,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     .bind(sqlx::types::Json(&update.values.codex_privacy_policy))
     .bind(i64::from(update.values.reset_credit_lead_minutes))
     .bind(update.values.reset_credit_max_weekly_remaining_percent.map(i64::from))
+    .bind(update.values.codex_public_origin.as_deref())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|source| postgres_unavailable("update runtime settings in transaction", source))?
@@ -534,6 +536,7 @@ pub(crate) async fn update_admin_api_key_in_transaction(
 
 #[derive(sqlx::FromRow)]
 struct RuntimeSettingsRow {
+    codex_public_origin: Option<String>,
     provider_request_profiles_json: sqlx::types::Json<
         std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     >,
@@ -603,6 +606,7 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
             refresh_concurrency: to_u32(row.refresh_concurrency)?,
             max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
             smart_scheduling: row.smart_scheduling_json.0,
+            codex_public_origin: row.codex_public_origin,
             codex_privacy_policy: row.codex_privacy_policy_json.0,
             request_location_enabled: row.request_location_enabled,
             request_location: row

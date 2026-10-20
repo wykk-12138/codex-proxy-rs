@@ -18,6 +18,7 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             ("grok-latest".to_owned(), "grok-4.5".to_owned()),
         ]),
         values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_public_origin: None,
             codex_privacy_policy: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
@@ -1187,5 +1188,40 @@ async fn reset_credit_weekly_threshold_defaults_unset_and_round_trips() {
         assert!(sqlx::query("update runtime_settings set reset_credit_max_weekly_remaining_percent = $1 where id = 1")
             .bind(threshold).execute(&database.pool).await.is_err());
     }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn codex_public_origin_persists_in_the_request_snapshot() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("codex_origin").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    assert!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .codex_public_origin
+            .is_none()
+    );
+    let mut update = settings_with_margin(300);
+    update.values.codex_public_origin = Some("https://codex.example:8443".into());
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        settings.values.codex_public_origin.as_deref(),
+        Some("https://codex.example:8443")
+    );
+    assert_eq!(
+        snapshot.settings.codex_public_origin(),
+        settings.values.codex_public_origin.as_deref()
+    );
     database.close().await;
 }

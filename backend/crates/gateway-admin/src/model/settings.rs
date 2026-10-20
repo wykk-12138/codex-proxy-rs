@@ -45,6 +45,8 @@ pub use gateway_core::account::RotationStrategy;
 /// 运行设置的共同值；版本、Provider 画像更新和数据库秘密由外层类型拥有
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSettingsValues {
+    #[serde(default)]
+    pub codex_public_origin: Option<String>,
     pub codex_privacy_policy: gateway_core::settings::privacy::CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -191,6 +193,9 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
 impl RuntimeSettingsValues {
     /// 校验共同事实，返回字段名供边界转换错误；SQL 类型转换仍由 Store 处理
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(origin) = &self.codex_public_origin {
+            gateway_core::settings::validate_codex_public_origin(origin)?;
+        }
         if !(1..=1440).contains(&self.reset_credit_lead_minutes) {
             return Err("reset_credit_lead_minutes");
         }

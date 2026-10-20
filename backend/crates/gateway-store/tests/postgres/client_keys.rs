@@ -51,6 +51,7 @@ async fn migrated_keys_persist_exactly_and_keep_short_keys_masked() {
         let (_, record) = store
             .create_client_key(
                 NewClientKey {
+                    codex_access: None,
                     request_profile_overrides: Default::default(),
                     id: id.clone(),
                     name: format!("Migrated {index}"),
@@ -106,6 +107,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
     };
     let key = "legacy-key-case-sensitive!";
     let command = |id: &str| NewClientKey {
+        codex_access: None,
         request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: id.to_owned(),
@@ -142,6 +144,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
 #[test]
 fn generated_client_key_format_remains_valid() {
     let key = NewClientApiKey {
+        codex_access: None,
         request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
@@ -175,6 +178,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
         request_id: "duplicate-name-test".to_owned(),
     };
     let create = |id: &str, name: &str| NewClientKey {
+        codex_access: None,
         request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: name.to_owned(),
@@ -185,6 +189,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
         plaintext: format!("synthetic-credential-{id}"),
     };
     let update = |id: ClientApiKeyId, name: &str| UpdateClientKey {
+        codex_access: None,
         request_profile_override_updates: Default::default(),
         id,
         name: name.to_owned(),
@@ -640,6 +645,7 @@ async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
 fn client_key_debug_redacts_plaintext() {
     let secret = format!("sk_{}", "s".repeat(43));
     let key = NewClientApiKey {
+        codex_access: None,
         request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
@@ -713,6 +719,7 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
     let (_, record) = store
         .create_client_key(
             NewClientKey {
+                codex_access: None,
                 id: id.clone(),
                 name: "profile".to_owned(),
                 label: None,
@@ -735,6 +742,7 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
     );
     assert_eq!(record.request_profile_overrides.get(&xai), Some(&profile));
     let update = |override_value: Option<Option<OpaqueProviderData>>| UpdateClientKey {
+        codex_access: None,
         id: id.clone(),
         name: "profile".to_owned(),
         label: None,
@@ -790,5 +798,204 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
         .await
         .unwrap();
     assert!(snapshot.client_api_keys[0].request_profiles.is_empty());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
+    use gateway_admin::model::{
+        MutationActor, MutationContext,
+        client_keys::{DeleteClientKey, NewClientKey, UpdateClientKey},
+    };
+    use gateway_core::{account::ProviderAccountId, policy::CodexAccessBinding};
+    use gateway_store::postgres::{
+        PgProviderAccountRepository, PgRuntimeSnapshotRepository, ProviderAccountRepository,
+        RuntimeSnapshotRepository,
+    };
+    let Some(database) = TestDatabase::create("codex_key_binding").await else {
+        return;
+    };
+    let accounts = PgProviderAccountRepository::new(database.pool.clone());
+    for id in ["acct_codex_a", "acct_codex_b"] {
+        let mut account = super::provider_accounts::account(id, id);
+        account.upstream_account_id = Some(format!("workspace-{id}"));
+        accounts.insert_provider_account(account).await.unwrap();
+    }
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "codex-key".into(),
+    };
+    let id = ClientApiKeyId::new("key_codex").unwrap();
+    let (_, record) = keys
+        .create_client_key(
+            NewClientKey {
+                codex_access: None,
+                request_profile_overrides: Default::default(),
+                id: id.clone(),
+                name: "Codex".into(),
+                label: None,
+                group_ids: Vec::new(),
+                limits: Default::default(),
+                budget: Default::default(),
+                plaintext: "test-codex-key".into(),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+    assert!(record.codex_access.is_none());
+    let binding = CodexAccessBinding {
+        enabled: true,
+        account_id: ProviderAccountId::new("acct_codex_a").unwrap(),
+    };
+    let update = |codex_access| UpdateClientKey {
+        codex_access,
+        request_profile_override_updates: Default::default(),
+        id: id.clone(),
+        name: "Codex".into(),
+        label: None,
+        group_ids: Vec::new(),
+        limits: Default::default(),
+        daily_limit_usd: None,
+        weekly_limit_usd: None,
+    };
+    keys.update_client_key(update(Some(binding.clone())), &context)
+        .await
+        .unwrap();
+    keys.update_client_key(update(None), &context)
+        .await
+        .unwrap();
+    let record = keys.get_client_key(&id).await.unwrap().unwrap();
+    assert_eq!(record.codex_access, Some(binding.clone()));
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .client_api_keys
+            .iter()
+            .find(|key| key.id == id)
+            .unwrap()
+            .codex_access,
+        Some(binding.clone())
+    );
+    let disabled = CodexAccessBinding {
+        enabled: false,
+        ..binding.clone()
+    };
+    keys.update_client_key(update(Some(disabled.clone())), &context)
+        .await
+        .unwrap();
+    let before: (i64, i64) = sqlx::query_as("select config_revision, (select count(*) from admin_audit_events) from runtime_settings where id=1").fetch_one(&database.pool).await.unwrap();
+    assert!(
+        keys.update_client_key(
+            update(Some(CodexAccessBinding {
+                enabled: true,
+                account_id: ProviderAccountId::new("acct_codex_b").unwrap()
+            })),
+            &context
+        )
+        .await
+        .is_err()
+    );
+    let after: (i64, i64) = sqlx::query_as("select config_revision, (select count(*) from admin_audit_events) from runtime_settings where id=1").fetch_one(&database.pool).await.unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        keys.get_client_key(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .codex_access,
+        Some(disabled)
+    );
+    keys.delete_client_key(DeleteClientKey { id }, &context)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("select count(*) from client_api_key_codex_bindings")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn codex_binding_requires_identified_oauth_and_the_effective_key_scope() {
+    use gateway_admin::model::{MutationActor, MutationContext, client_keys::NewClientKey};
+    use gateway_core::{
+        account::ProviderAccountId, policy::CodexAccessBinding, routing::AccountGroupId,
+    };
+    use gateway_store::postgres::{PgProviderAccountRepository, ProviderAccountRepository};
+    let Some(database) = TestDatabase::create("codex_key_scope").await else {
+        return;
+    };
+    let repository = PgProviderAccountRepository::new(database.pool.clone());
+    for (id, provider, authentication) in [
+        ("acct_codex_oauth", "openai", "oauth"),
+        ("acct_codex_api", "openai", "api_key"),
+        ("acct_codex_xai", "xai", "oauth"),
+    ] {
+        let mut account = super::provider_accounts::account(id, id);
+        account.provider_kind = provider.into();
+        account.authentication_kind = authentication.into();
+        account.upstream_account_id = Some(format!("workspace-{id}"));
+        repository.insert_provider_account(account).await.unwrap();
+    }
+    let group_id = "grp_00000000000000000000000000000004";
+    sqlx::query("insert into account_groups (id,name,enabled,created_at,updated_at,color) values ($1,'Codex scope',false,now(),now(),'#FFFFFFFF')").bind(group_id).execute(&database.pool).await.unwrap();
+    sqlx::query("insert into account_group_accounts (account_group_id,provider_account_id,created_at) values ($1,'acct_codex_oauth',now())").bind(group_id).execute(&database.pool).await.unwrap();
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "codex-scope".into(),
+    };
+    let command = |account: &str, group_ids| NewClientKey {
+        codex_access: Some(CodexAccessBinding {
+            enabled: true,
+            account_id: ProviderAccountId::new(account).unwrap(),
+        }),
+        request_profile_overrides: Default::default(),
+        id: ClientApiKeyId::new("key_scope").unwrap(),
+        name: "Codex scope".into(),
+        label: None,
+        group_ids,
+        limits: Default::default(),
+        budget: Default::default(),
+        plaintext: "test-codex-scope".into(),
+    };
+    for account in ["acct_missing", "acct_codex_api", "acct_codex_xai"] {
+        assert!(
+            keys.create_client_key(command(account, Vec::new()), &context)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        keys.create_client_key(
+            command(
+                "acct_codex_oauth",
+                vec![AccountGroupId::new(group_id).unwrap()]
+            ),
+            &context
+        )
+        .await
+        .is_err()
+    );
+    sqlx::query("update account_groups set enabled=true where id=$1")
+        .bind(group_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    keys.create_client_key(
+        command(
+            "acct_codex_oauth",
+            vec![AccountGroupId::new(group_id).unwrap()],
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
     database.close().await;
 }

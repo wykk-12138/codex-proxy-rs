@@ -172,6 +172,31 @@ impl ProviderAccountIdentity {
     }
 }
 
+/// 凭据写入来源与 Provider 已解析的身份，不能用缺少身份表示正常刷新
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialIdentityWrite {
+    /// 同身份运行时维护：RT 刷新、刷新延期及响应 Cookie 更新，沿用既有版本保护
+    RuntimeMaintenance,
+    /// 管理员替换、导入或重新授权的真实新身份
+    VerifiedReplacement(ProviderAccountIdentity),
+    /// 无上游身份的凭据替换，例如 API Key；不能替换已有原生绑定
+    UnidentifiedReplacement,
+    /// 只更新连接参数，不替换认证材料
+    ConnectionSettings,
+}
+
+impl CredentialIdentityWrite {
+    #[must_use]
+    pub const fn replacement_identity(&self) -> Option<&ProviderAccountIdentity> {
+        match self {
+            Self::VerifiedReplacement(identity) => Some(identity),
+            Self::RuntimeMaintenance | Self::UnidentifiedReplacement | Self::ConnectionSettings => {
+                None
+            }
+        }
+    }
+}
+
 /// `provider_accounts.credential_revision` 的正数 CAS revision
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CredentialRevision(NonZeroU64);
@@ -1213,6 +1238,7 @@ pub struct CredentialStateWrite {
 
 /// [`CredentialCasUpdate`] 跨 store 边界的命名字段
 pub struct CredentialCasUpdateParts {
+    pub identity_write: CredentialIdentityWrite,
     pub account_id: ProviderAccountId,
     pub expected_revision: CredentialRevision,
     pub profile: ProviderAccountUpdate,
@@ -1227,6 +1253,7 @@ pub struct CredentialCasUpdateParts {
 /// 刷新后的完整 CAS 写回
 #[derive(Clone, PartialEq)]
 pub struct CredentialCasUpdate {
+    identity_write: CredentialIdentityWrite,
     account_id: ProviderAccountId,
     expected_revision: CredentialRevision,
     profile: ProviderAccountUpdate,
@@ -1242,6 +1269,7 @@ impl fmt::Debug for CredentialCasUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CredentialCasUpdate")
+            .field("identity_write", &self.identity_write)
             .field("account_id", &self.account_id)
             .field("expected_revision", &self.expected_revision)
             .field("profile", &self.profile)
@@ -1256,7 +1284,15 @@ impl fmt::Debug for CredentialCasUpdate {
 }
 
 impl CredentialCasUpdate {
-    /// 创建同一账号 revision fence 下的完整 credential + 普通投影写回
+    /// 管理员输入新凭据必须显式附上 Provider 的新身份事实
+    #[must_use]
+    pub fn with_identity_write(mut self, identity_write: CredentialIdentityWrite) -> Self {
+        self.identity_write = identity_write;
+        self
+    }
+
+    /// 创建同一账号 revision fence 下的运行时维护写回
+    /// 管理员替换须用 with_identity_write 附新身份，并经 Admin 事务提交
     ///
     /// # Errors
     ///
@@ -1281,6 +1317,7 @@ impl CredentialCasUpdate {
             expected_revision,
             profile,
             preserve_profile: false,
+            identity_write: CredentialIdentityWrite::RuntimeMaintenance,
             credential,
             has_refresh_token,
             access_token_expires_at,
@@ -1358,6 +1395,7 @@ impl CredentialCasUpdate {
     #[must_use]
     pub fn into_parts(self) -> CredentialCasUpdateParts {
         CredentialCasUpdateParts {
+            identity_write: self.identity_write,
             account_id: self.account_id,
             expected_revision: self.expected_revision,
             profile: self.profile,

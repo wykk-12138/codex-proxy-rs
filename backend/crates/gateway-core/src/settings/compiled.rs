@@ -27,6 +27,9 @@ impl CompiledSettings {
         compiler: Option<&dyn super::privacy::PrivacyPolicyCompiler>,
         previous: Option<&Self>,
     ) -> Result<Self, InvalidSettings> {
+        if let Some(origin) = &settings.codex_public_origin {
+            super::validate_codex_public_origin(origin).map_err(|_| InvalidSettings)?;
+        }
         let privacy = if let Some(previous) = previous.filter(|previous| {
             previous.values.codex_privacy_policy == settings.codex_privacy_policy
         }) {

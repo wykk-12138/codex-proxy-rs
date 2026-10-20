@@ -998,7 +998,11 @@ fn verified_rotation(
     let access_token_expires_at = SystemTime::now()
         .checked_add(expires_in)
         .ok_or_else(|| provider_error(ProviderAdminErrorKind::Invalid))?;
-    GrokCredentialAdmin
+    let identity = gateway_core::account::ProviderAccountIdentity::new(
+        tokens.evidence().subject().to_owned(),
+        current.account.upstream_account_id().map(str::to_owned),
+    );
+    let mut prepared = GrokCredentialAdmin
         .prepare_rotation(&RotateManagedGrokCredential {
             secret: GrokOAuthSecret {
                 access_token: tokens.access_token().clone(),
@@ -1016,7 +1020,11 @@ fn verified_rotation(
             },
             current,
         })
-        .map_err(map_repository_error)
+        .map_err(map_repository_error)?;
+    prepared.credential = prepared.credential.with_identity_write(
+        gateway_core::account::CredentialIdentityWrite::VerifiedReplacement(identity),
+    );
+    Ok(prepared)
 }
 
 fn prepared_create(
@@ -1064,6 +1072,7 @@ fn prepared_rotation(
         access_token_expires_at,
         next_refresh_at,
         account_state: _account_state,
+        identity_write,
     } = credential.into_parts();
     if profile != credential_profile || profile.account_id != account_id {
         return Err(provider_error(ProviderAdminErrorKind::Internal));
@@ -1074,7 +1083,7 @@ fn prepared_rotation(
             provider_kind,
             expected_credential_revision: Revision::new(expected_revision.get())
                 .map_err(|_| provider_error(ProviderAdminErrorKind::Internal))?,
-            replacement_identity: None,
+            identity_write,
             name: profile.name,
             email: profile.email,
             plan_type: profile.plan_type,
