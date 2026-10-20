@@ -1737,12 +1737,14 @@ async fn write_codex_binding(
             "Codex account binding cannot be changed; create a new key",
         ));
     }
-    if current.is_some() && !binding.enabled {
-        sqlx::query("update client_api_key_codex_bindings set enabled = false where key_id = $1")
+    // 已有绑定只修改开关；账号范围失效由每次原生请求重新求交集处理
+    if current.is_some() {
+        sqlx::query("update client_api_key_codex_bindings set enabled = $2 where key_id = $1")
             .bind(key_id)
+            .bind(binding.enabled)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| postgres_unavailable("disable Codex binding", source))?;
+            .map_err(|source| postgres_unavailable("update Codex binding state", source))?;
         return Ok(());
     }
     // 与凭据身份写入共用账号行锁，取得锁之后重新读取身份和分组范围
@@ -1779,7 +1781,7 @@ async fn write_codex_binding(
     }
     sqlx::query(
         "insert into client_api_key_codex_bindings (key_id, account_id, enabled)
-         values ($1, $2, $3) on conflict (key_id) do update set enabled = excluded.enabled",
+         values ($1, $2, $3)",
     )
     .bind(key_id)
     .bind(binding.account_id.as_str())

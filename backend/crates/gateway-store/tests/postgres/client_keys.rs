@@ -922,8 +922,11 @@ async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
 }
 
 #[tokio::test]
-async fn codex_binding_requires_identified_oauth_and_the_effective_key_scope() {
-    use gateway_admin::model::{MutationActor, MutationContext, client_keys::NewClientKey};
+async fn codex_binding_checks_scope_on_creation_and_keeps_existing_switch_editable() {
+    use gateway_admin::model::{
+        MutationActor, MutationContext,
+        client_keys::{NewClientKey, UpdateClientKey},
+    };
     use gateway_core::{
         account::ProviderAccountId, policy::CodexAccessBinding, routing::AccountGroupId,
     };
@@ -997,5 +1000,45 @@ async fn codex_binding_requires_identified_oauth_and_the_effective_key_scope() {
     )
     .await
     .unwrap();
+    for scope_change in [
+        "update account_groups set enabled=false where id=$1",
+        "delete from account_group_accounts where account_group_id=$1",
+    ] {
+        sqlx::query(scope_change)
+            .bind(group_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // 同值保存、停用和重新启用都不重新建立关系，失效范围不能阻止管理操作
+        for enabled in [true, false, true] {
+            let expected = CodexAccessBinding {
+                enabled,
+                account_id: ProviderAccountId::new("acct_codex_oauth").unwrap(),
+            };
+            let (_, saved) = keys
+                .update_client_key(
+                    UpdateClientKey {
+                        codex_access: Some(expected.clone()),
+                        request_profile_override_updates: Default::default(),
+                        id: ClientApiKeyId::new("key_scope").unwrap(),
+                        name: "Codex scope".into(),
+                        label: None,
+                        group_ids: vec![AccountGroupId::new(group_id).unwrap()],
+                        limits: Default::default(),
+                        daily_limit_usd: None,
+                        weekly_limit_usd: None,
+                    },
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(saved.codex_access, Some(expected));
+        }
+        sqlx::query("update account_groups set enabled=true where id=$1")
+            .bind(group_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
     database.close().await;
 }
