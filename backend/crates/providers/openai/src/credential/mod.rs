@@ -23,7 +23,7 @@ pub(crate) use affinity::{
     derive_live_session_affinity, derive_previous_response_id_hash, derive_turn_alias,
 };
 pub(crate) use oauth::oauth_owner_ref;
-pub(crate) use types::parse_access_token_expiration;
+pub(crate) use types::oauth_metadata;
 
 pub(crate) use crate::CODEX_AUTHENTICATION_KIND_API_KEY;
 

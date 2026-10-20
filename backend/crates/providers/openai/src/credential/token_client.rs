@@ -48,8 +48,7 @@ struct PersonalAccessTokenResponse {
     chatgpt_user_id: String,
     chatgpt_account_id: String,
     chatgpt_plan_type: String,
-    #[serde(rename = "chatgpt_account_is_fedramp")]
-    _chatgpt_account_is_fedramp: bool,
+    chatgpt_account_is_fedramp: bool,
 }
 
 /// Token 刷新成功后得到的认证材料
@@ -474,6 +473,7 @@ impl OpenAiTokenClient {
             chatgpt_user_id: Some(identity.chatgpt_user_id.trim().to_owned()),
             chatgpt_account_id: Some(identity.chatgpt_account_id.trim().to_owned()),
             chatgpt_plan_type: Some(identity.chatgpt_plan_type.trim().to_owned()),
+            chatgpt_account_is_fedramp: Some(identity.chatgpt_account_is_fedramp),
         })
     }
 }

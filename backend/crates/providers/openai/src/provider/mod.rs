@@ -105,6 +105,7 @@ use crate::transport::{
 mod execution;
 mod failure;
 mod live;
+mod native;
 mod observation;
 mod upstream_adapter;
 mod workers;
@@ -159,6 +160,7 @@ pub struct CodexProvider {
     stream_max_retries: u32,
     live_registry: Arc<CodexLiveRegistry>,
     live_gateway: Option<Arc<CodexLiveGateway>>,
+    native_token_client: Option<Arc<crate::credential::token_client::OpenAiTokenClient>>,
 }
 
 struct PreparedGenerateRequest {
@@ -331,7 +333,16 @@ impl CodexProvider {
             stream_max_retries,
             live_registry: Arc::new(CodexLiveRegistry::default()),
             live_gateway: None,
+            native_token_client: None,
         })
+    }
+
+    pub(crate) fn with_native_token_client(
+        mut self,
+        client: Arc<crate::credential::token_client::OpenAiTokenClient>,
+    ) -> Self {
+        self.native_token_client = Some(client);
+        self
     }
 
     #[must_use]
@@ -416,6 +427,10 @@ impl Provider for CodexProvider {
         self.live_gateway
             .clone()
             .map(|gateway| gateway as Arc<dyn gateway_core::live::LiveGateway>)
+    }
+
+    fn codex_gateway(&self) -> Option<Arc<dyn gateway_core::engine::codex::CodexGateway>> {
+        Some(Arc::new(self.clone()))
     }
 
     fn catalog_generation(&self) -> ProviderCatalogGeneration {

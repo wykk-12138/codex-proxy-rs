@@ -2646,6 +2646,10 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
         assert_eq!(material.get("base_url"), Some(&json!(base_url)));
         assert!(!prepared.facts().has_refresh_token);
+        assert_eq!(
+            prepared.facts().identity_write,
+            gateway_core::account::CredentialIdentityWrite::UnidentifiedReplacement
+        );
         assert_eq!(prepared.facts().account_id, *account.id());
     }
     assert_eq!(
@@ -2732,6 +2736,10 @@ async fn oauth_transport_settings_preserve_tokens_refresh_schedule_and_health() 
         );
         assert_eq!(facts.has_refresh_token, account.has_refresh_token());
         assert!(facts.preserve_profile && facts.preserve_credential_state);
+        assert_eq!(
+            facts.identity_write,
+            gateway_core::account::CredentialIdentityWrite::ConnectionSettings
+        );
     }
     for invalid in [
         json!({"transport":"invalid"}),
@@ -2811,5 +2819,221 @@ async fn usage_quote_reuses_native_override_and_reports_incomplete_input() {
             .evaluate_usage_pricing(&input, Some(&custom))
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn oauth_replacement_delivers_new_identity_and_never_inherits_the_old_id_token() {
+    use gateway_core::account::CredentialIdentityWrite;
+    let store = Arc::new(MemoryAccountStore::default());
+    let jwt = |value: Value| {
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        )
+    };
+    let mut old_secret = secret("old-access");
+    old_secret.id_token = Some(SecretString::from(jwt(json!({
+        "https://api.openai.com/auth": {"chatgpt_user_id":"old-user", "chatgpt_account_id":"old-workspace", "chatgpt_plan_type":"pro"}
+    }))));
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_identity_replace".to_owned(),
+            name: "Identity replacement".to_owned(),
+            secret: old_secret,
+            verified_account: profile("old-workspace"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_identity_replace").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::default()),
+    )
+    .await
+    .unwrap();
+    for (user, workspace) in [
+        ("new-user", "old-workspace"),
+        ("user-old-workspace", "new-workspace"),
+        ("user-old-workspace", "old-workspace"),
+    ] {
+        let token = jwt(json!({"https://api.openai.com/auth": {
+            "chatgpt_user_id":user, "chatgpt_account_id":workspace, "chatgpt_plan_type":"plus"
+        }}));
+        let prepared = bundle
+            .admin_provider()
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"access_token":token}).as_object().unwrap().clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let facts = prepared.facts();
+        let CredentialIdentityWrite::VerifiedReplacement(identity) = &facts.identity_write else {
+            panic!("replacement must carry the new identity")
+        };
+        assert_eq!(identity.upstream_user_id(), user);
+        assert_eq!(identity.upstream_account_id(), Some(workspace));
+        assert_eq!(facts.plan_type.as_deref(), Some("plus"));
+        assert!(!facts.preserve_profile);
+        let material = facts
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert!(!material.contains_key("id_token"));
+        assert!(!material.contains_key("principal"));
+    }
+    let prepared = bundle
+        .admin_provider()
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"access_token":"opaque-new-access"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.facts().identity_write,
+        CredentialIdentityWrite::UnidentifiedReplacement
+    );
+    assert!(prepared.facts().email.is_none() && prepared.facts().plan_type.is_none());
+    assert_eq!(
+        store.account("acct_identity_replace").unwrap(),
+        account,
+        "preparation does not commit credentials or identity"
+    );
+}
+
+#[tokio::test]
+async fn manual_refresh_keeps_runtime_maintenance_source_and_does_not_request_identity() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"opaque-refreshed-access"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_native_refresh".to_owned(),
+            name: "Native refresh".to_owned(),
+            secret: secret("old-access"),
+            verified_account: profile("workspace-native-refresh"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_native_refresh").unwrap();
+    let mut config = valid_config();
+    config.config.auth.oauth_token_endpoint = format!("{}/oauth/token", server.uri());
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::default()),
+    )
+    .await
+    .unwrap();
+    let prepared = bundle
+        .admin_provider()
+        .prepare_refresh(PrepareCredentialRefresh {
+            account: account_record(&account),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.facts().identity_write,
+        gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
+    );
+    assert!(prepared.facts().preserve_profile);
+    assert_eq!(prepared.facts().plan_type.as_deref(), account.plan_type());
+    assert_eq!(
+        prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()["access_token"],
+        "opaque-refreshed-access"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(store.account("acct_native_refresh").unwrap(), account);
+}
+
+#[tokio::test]
+async fn native_pat_identity_and_replacement_use_official_facts_and_current_proxy() {
+    use gateway_core::engine::execution::ExecutionService as _;
+    let auth = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/accounts/v1/user-auth-credential/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chatgpt_user_id":"pat-user", "chatgpt_account_id":"pat-workspace", "chatgpt_plan_type":"plus", "chatgpt_account_is_fedramp":true
+        }))).expect(2).mount(&proxy).await;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_native_bound".to_owned(),
+            name: "Native PAT".to_owned(),
+            secret: secret("at-test-native"),
+            verified_account: profile("pat-workspace"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    store.set_egress(
+        "acct_native_bound",
+        Some(gateway_core::account::OutboundProxy::parse(proxy.uri()).unwrap()),
+        None,
+    );
+    let mut config = valid_config();
+    config.config.auth.oauth_token_endpoint = format!("{}/oauth/token", auth.uri());
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::default()),
+    )
+    .await
+    .unwrap();
+    let (service, _) = crate::provider::native::native_service(bundle.core_provider());
+    let identity = service
+        .codex_identity(crate::provider::native::prepare(&service).await)
+        .await
+        .unwrap();
+    assert_eq!(identity.user_id, "pat-user");
+    assert_eq!(identity.account_id, "pat-workspace");
+    assert_eq!(identity.plan_type.as_deref(), Some("plus"));
+    assert!(identity.is_fedramp);
+    let account = store.account("acct_native_bound").unwrap();
+    let replacement = bundle.admin_provider().prepare_rotation(PrepareCredentialRotation {
+        account: account_record(&account),
+        provider_material: ProviderDocument::new(OpaqueProviderData::new(json!({"access_token":"at-test-native-new", "id_token":"must-not-inherit", "refresh_token":"must-not-refresh"}).as_object().unwrap().clone())),
+    }).await.unwrap();
+    let identity = replacement
+        .facts()
+        .identity_write
+        .replacement_identity()
+        .unwrap();
+    assert_eq!(identity.upstream_user_id(), "pat-user");
+    assert_eq!(identity.upstream_account_id(), Some("pat-workspace"));
+    let material = replacement
+        .facts()
+        .provider_material
+        .expose_to_provider()
+        .expose_to_provider();
+    assert!(!material.contains_key("id_token") && !material.contains_key("refresh_token"));
+    assert!(auth.received_requests().await.unwrap().is_empty());
+    let calls = proxy.received_requests().await.unwrap();
+    assert_eq!(calls[0].headers["authorization"], "Bearer at-test-native");
+    assert_eq!(
+        calls[1].headers["authorization"],
+        "Bearer at-test-native-new"
     );
 }

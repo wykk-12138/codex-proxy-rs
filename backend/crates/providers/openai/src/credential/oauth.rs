@@ -544,12 +544,7 @@ impl CodexOAuthAdminService {
         let credential = if let Some(current) = current {
             CompletedCodexOAuthCredential::Reauthorize(Box::new(
                 self.credentials
-                    .prepare_refreshed_oauth_rotation(
-                        current,
-                        secret,
-                        access_token_expires_at,
-                        None,
-                    )
+                    .prepare_metadata_rotation(current, secret, metadata, access_token_expires_at)
                     .map_err(map_admin_error)?,
             ))
         } else {

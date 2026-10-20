@@ -1435,6 +1435,36 @@ impl CodexCredentialSelector {
         }
     }
 
+    /// 原生辅助请求只核对固定账号的授权与凭据，不消费模型额度或参与换号
+    pub(crate) async fn native_credential(
+        &self,
+        context: &gateway_core::engine::codex::CodexAuthorizedContext,
+    ) -> Result<(ProviderAccount, super::security::CodexRuntimeCredential), CredentialSelectionError>
+    {
+        if !context.account_scope().allows(context.account_id()) {
+            return Err(CredentialSelectionError::NoEligibleCredential);
+        }
+        let loaded = self
+            .repository
+            .store()
+            .load_current_credential(context.account_id())
+            .await
+            .map_err(|source| CredentialSelectionError::Store(ErrorSource::new(source)))?;
+        if loaded.account.provider() != &self.provider_kind
+            || loaded.account.authentication_kind() != CODEX_AUTHENTICATION_KIND_OAUTH
+            || !loaded.account.enabled()
+            || loaded.account.credential_state() != CredentialState::Ready
+            || loaded
+                .account
+                .access_token_expires_at()
+                .is_some_and(|at| at <= SystemTime::now())
+        {
+            return Err(CredentialSelectionError::NoEligibleCredential);
+        }
+        let runtime = self.repository.decode_runtime_credential(&loaded)?;
+        Ok((loaded.account, runtime))
+    }
+
     pub async fn current_account(
         &self,
         account_id: &ProviderAccountId,

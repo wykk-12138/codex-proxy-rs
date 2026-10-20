@@ -174,6 +174,13 @@ pub async fn initialize(
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
     ));
+    let token_client = Arc::new(
+        credential::token_client::openai_token_client(
+            config.token_client_config(),
+            profile.clone(),
+        )
+        .map_err(|_| OpenAiInitializeError::TokenClient)?,
+    );
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,
@@ -189,14 +196,8 @@ pub async fn initialize(
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
         .with_timezone(config.timezone)
-        .with_live_support(repository.clone()),
-    );
-    let token_client = Arc::new(
-        credential::token_client::openai_token_client(
-            config.token_client_config(),
-            profile.clone(),
-        )
-        .map_err(|_| OpenAiInitializeError::TokenClient)?,
+        .with_live_support(repository.clone())
+        .with_native_token_client(Arc::clone(&token_client)),
     );
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client.clone();

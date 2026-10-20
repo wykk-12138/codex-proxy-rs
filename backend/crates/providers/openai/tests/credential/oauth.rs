@@ -528,3 +528,79 @@ async fn first_exchange_permits_missing_identity_claims_but_requires_a_parseable
         .expect_err("official local payload parsing rejects malformed id tokens");
     assert_eq!(error, CodexOAuthAdminError::TokenRejected);
 }
+
+#[tokio::test]
+async fn reauthorization_carries_new_user_and_workspace_instead_of_runtime_refresh_source() {
+    use gateway_core::account::{CredentialIdentityWrite, ProviderAccountStore as _};
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_native_reauthorize".to_owned(),
+            name: "Reauthorize".to_owned(),
+            secret: secret("old-access"),
+            verified_account: account_profile("old-workspace"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_native_reauthorize").unwrap();
+    let pending = Arc::new(PendingStore::default());
+    let service = CodexOAuthAdminService::new(
+        pending.clone(),
+        Arc::new(Exchanger {
+            id_token: id_token(serde_json::json!({
+                "email":"new@example.test", "https://api.openai.com/auth": {
+                    "chatgpt_user_id":"new-user", "chatgpt_account_id":"new-workspace", "chatgpt_plan_type":"plus"
+                }
+            })),
+        }),
+        store.clone(),
+        CodexCredentialAdmin,
+        profile(),
+    );
+    let started = service
+        .start_authorization(StartCodexOAuthAuthorization {
+            mutation: reauthorization_mutation(account.id().clone(), "native-reauthorize"),
+        })
+        .await
+        .unwrap();
+    use secrecy::ExposeSecret as _;
+    let state = pending
+        .pending
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .state
+        .expose_secret()
+        .to_owned();
+    let completed = service
+        .complete_authorization(CompleteCodexOAuthAuthorization {
+            owner_ref: "test-owner".to_owned(),
+            flow_id: started.flow_id,
+            callback_url: SecretString::from(format!(
+                "http://127.0.0.1:1455/auth/callback?code=code-from-browser&state={state}"
+            )),
+        })
+        .await
+        .unwrap();
+    let CompletedCodexOAuthCredential::Reauthorize(prepared) = completed.credential else {
+        panic!("expected reauthorization")
+    };
+    let (_, credential, _guard) = prepared.into_parts();
+    let parts = credential.into_parts();
+    let CredentialIdentityWrite::VerifiedReplacement(identity) = parts.identity_write else {
+        panic!("reauthorization must carry a verified replacement")
+    };
+    assert_eq!(identity.upstream_user_id(), "new-user");
+    assert_eq!(identity.upstream_account_id(), Some("new-workspace"));
+    assert_eq!(parts.profile.plan_type.as_deref(), Some("plus"));
+    assert_eq!(parts.profile.email.as_deref(), Some("new@example.test"));
+    let runtime = CodexCredentialCodec::decode(&parts.credential).unwrap();
+    assert!(runtime.principal.is_none());
+    let stored = store.load_current_credential(account.id()).await.unwrap();
+    assert_eq!(
+        stored.account, account,
+        "Store owns the eventual atomic identity check and commit"
+    );
+}

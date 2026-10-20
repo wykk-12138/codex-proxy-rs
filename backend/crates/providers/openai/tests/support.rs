@@ -364,7 +364,11 @@ impl ProviderAccountStore for MemoryAccountStore {
             access_token_expires_at,
             next_refresh_at,
             account_state,
+            identity_write,
         } = update.into_parts();
+        if identity_write != gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance {
+            return Err(store_error(StoreErrorKind::InvalidData));
+        }
         let mut accounts = self.accounts.lock().expect("account store lock");
         let stored = accounts
             .get_mut(&account_id)

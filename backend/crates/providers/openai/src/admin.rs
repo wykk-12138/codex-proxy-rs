@@ -58,9 +58,7 @@ use crate::credential::{
     CodexResetCreditsError, CompleteCodexOAuthAuthorization, CompletedCodexOAuthCredential,
     ExportManagedCodexCredential, StartCodexOAuthAuthorization, StoredCodexPendingAuthorization,
 };
-use crate::credential::{
-    CodexCredentialCodec, CodexOAuthSecret, oauth_owner_ref, parse_access_token_expiration,
-};
+use crate::credential::{CodexCredentialCodec, CodexOAuthSecret, oauth_owner_ref};
 use crate::transport::CodexWebSocketPool;
 use crate::transport::profile::{
     CodexDesktopReleaseSnapshot, CodexDesktopReleaseStatus, CodexWireProfile, CodexWireProfileState,
@@ -618,19 +616,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return prepared_rotation(prepared, command.account.provider_kind)
                 .map(PreparedCredentialRotation::preserving_credential_state);
         }
-        let mut secret = rotation_secret(command.provider_material)?;
-        if secret.id_token.is_none() {
-            let runtime = CodexCredentialCodec::decode(&current.credential)
-                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
-            secret.id_token = runtime
-                .authentication
-                .oauth()
-                .and_then(|oauth| oauth.id_token.clone());
-        }
-        let access_token_expires_at =
-            parse_access_token_expiration(secret.access_token.expose_secret());
-        let prepared = CodexCredentialAdmin
-            .prepare_refreshed_oauth_rotation(current, secret, access_token_expires_at, None)
+        let secret = rotation_secret(command.provider_material)?;
+        let prepared = self
+            .credentials
+            .prepare_replacement(current, secret)
+            .await
             .map_err(map_credential_admin_error)?;
         prepared_rotation(prepared, command.account.provider_kind)
     }
@@ -1004,7 +994,7 @@ fn prepared_rotation(
     prepared: crate::credential::PreparedCodexCredentialRotation,
     provider_kind: ProviderKind,
 ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
-    let (profile, credential, replacement_identity, guard) = prepared.into_parts();
+    let (profile, credential, guard) = prepared.into_parts();
     let CredentialCasUpdateParts {
         account_id,
         expected_revision,
@@ -1015,6 +1005,7 @@ fn prepared_rotation(
         access_token_expires_at,
         next_refresh_at,
         account_state: _account_state,
+        identity_write,
     } = credential.into_parts();
     if profile != credential_profile || profile.account_id != account_id {
         return Err(provider_admin_error(ProviderAdminErrorKind::Internal));
@@ -1026,7 +1017,7 @@ fn prepared_rotation(
             account_id,
             provider_kind,
             expected_credential_revision,
-            replacement_identity,
+            identity_write,
             name: profile.name,
             email: profile.email,
             plan_type: profile.plan_type,

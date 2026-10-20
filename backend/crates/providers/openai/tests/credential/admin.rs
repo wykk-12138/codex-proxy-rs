@@ -1169,3 +1169,42 @@ async fn sub2api_api_key_import_preserves_versioned_and_explicit_responses_paths
     }
     assert!(service.prepare_import_document_with_proxy(serde_json::json!({"platform":"openai","type":"apikey","credentials":{"api_key":"sk-test"},"extra":{"openai_api_key_responses_websockets_v2_mode":"http_bridge"}}), None).await.is_err());
 }
+
+#[tokio::test]
+async fn verified_rotation_is_not_a_runtime_cas_write() {
+    use crate::support::{MemoryAccountStore, profile, secret};
+    use gateway_core::account::{CredentialIdentityWrite, ProviderAccountStore as _};
+    use provider_openai::credential::{
+        CodexCredentialAdmin, ImportCodexOAuthCredential, RotateManagedCodexCredential,
+    };
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_verified_replace".to_owned(),
+            name: "Verified replace".to_owned(),
+            secret: secret("old-access"),
+            verified_account: profile("old-workspace"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let before = store.account("acct_verified_replace").unwrap();
+    let current = store.load_current_credential(before.id()).await.unwrap();
+    let prepared = CodexCredentialAdmin
+        .prepare_rotation(RotateManagedCodexCredential {
+            current,
+            secret: secret("new-access"),
+            verified_account: profile("new-workspace"),
+            next_refresh_at: None,
+        })
+        .unwrap();
+    let (_, credential, _guard) = prepared.into_parts();
+    let parts = credential.clone().into_parts();
+    let CredentialIdentityWrite::VerifiedReplacement(identity) = parts.identity_write else {
+        panic!("verified replacement identity required")
+    };
+    assert_eq!(identity.upstream_user_id(), "user-new-workspace");
+    assert_eq!(identity.upstream_account_id(), Some("new-workspace"));
+    assert!(store.compare_and_swap_credential(credential).await.is_err());
+    assert_eq!(store.account("acct_verified_replace").unwrap(), before);
+}

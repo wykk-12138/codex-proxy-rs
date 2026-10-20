@@ -4,7 +4,7 @@ use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
@@ -51,6 +51,7 @@ pub(crate) struct CodexOAuthMetadata {
     pub(crate) chatgpt_plan_type: Option<String>,
     pub(crate) chatgpt_user_id: Option<String>,
     pub(crate) chatgpt_account_id: Option<String>,
+    pub(crate) chatgpt_account_is_fedramp: Option<bool>,
 }
 
 impl fmt::Debug for CodexOAuthMetadata {
@@ -93,7 +94,27 @@ pub(crate) fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<CodexOAuthMetadata, 
         chatgpt_plan_type: auth.chatgpt_plan_type.map(ChatgptPlanType::into_raw_value),
         chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
         chatgpt_account_id: auth.chatgpt_account_id,
+        chatgpt_account_is_fedramp: Some(auth.chatgpt_account_is_fedramp),
     })
+}
+
+/// 导入、管理员替换和原生身份共用 ID token 优先、AT 补齐的字段规则
+pub(crate) fn oauth_metadata(secret: &CodexOAuthSecret) -> CodexOAuthMetadata {
+    let id = secret
+        .id_token
+        .as_ref()
+        .and_then(|token| parse_chatgpt_jwt_claims(token.expose_secret()).ok())
+        .unwrap_or_default();
+    let access = parse_chatgpt_jwt_claims(secret.access_token.expose_secret()).unwrap_or_default();
+    CodexOAuthMetadata {
+        email: id.email.or(access.email),
+        chatgpt_plan_type: id.chatgpt_plan_type.or(access.chatgpt_plan_type),
+        chatgpt_user_id: id.chatgpt_user_id.or(access.chatgpt_user_id),
+        chatgpt_account_id: id.chatgpt_account_id.or(access.chatgpt_account_id),
+        chatgpt_account_is_fedramp: id
+            .chatgpt_account_is_fedramp
+            .or(access.chatgpt_account_is_fedramp),
+    }
 }
 
 /// 按官方 Codex 的方式，从 access token JWT payload 读取调度所需的过期时刻
@@ -140,8 +161,8 @@ struct AuthClaims {
     user_id: Option<String>,
     #[serde(default)]
     chatgpt_account_id: Option<String>,
-    #[serde(rename = "chatgpt_account_is_fedramp", default)]
-    _chatgpt_account_is_fedramp: bool,
+    #[serde(default)]
+    chatgpt_account_is_fedramp: bool,
 }
 
 /// 与官方 `codex_protocol::auth::PlanType` 同构的 claims 反序列化类型
