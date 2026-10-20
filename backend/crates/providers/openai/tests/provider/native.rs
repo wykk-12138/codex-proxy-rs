@@ -427,7 +427,7 @@ async fn auxiliary_uses_current_refresh_token_result_and_current_proxy_without_m
         .unwrap();
     store.set_egress(
         ACCOUNT,
-        Some(OutboundProxy::parse(proxy.uri()).unwrap()),
+        Some(OutboundProxy::parse(&proxy.uri()).unwrap()),
         None,
     );
     let second = service

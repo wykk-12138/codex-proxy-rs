@@ -2506,6 +2506,45 @@ mod errors {
         assert!(prepared.facts().preserve_profile);
     }
 
+    #[tokio::test]
+    async fn manual_refresh_keeps_runtime_maintenance_source_and_does_not_request_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"opaque-refreshed-access"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (bundle, store, _config) = refresh_fixture(&server, false, true).await;
+        let account = store.account("acct_refresh_error").unwrap();
+        let prepared = bundle
+            .admin_provider()
+            .prepare_refresh(PrepareCredentialRefresh {
+                account: account_record(&account),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.facts().identity_write,
+            gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
+        );
+        assert!(prepared.facts().preserve_profile);
+        assert_eq!(prepared.facts().plan_type.as_deref(), account.plan_type());
+        assert_eq!(
+            prepared
+                .facts()
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider()["access_token"],
+            "opaque-refreshed-access"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(store.account("acct_refresh_error").unwrap(), account);
+    }
+
     async fn refresh_fixture(
         server: &MockServer,
         busy: bool,
@@ -2913,63 +2952,6 @@ async fn oauth_replacement_delivers_new_identity_and_never_inherits_the_old_id_t
 }
 
 #[tokio::test]
-async fn manual_refresh_keeps_runtime_maintenance_source_and_does_not_request_identity() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"access_token":"opaque-refreshed-access"})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    let store = Arc::new(MemoryAccountStore::default());
-    store
-        .seed_oauth_credential(ImportCodexOAuthCredential {
-            account_id: "acct_native_refresh".to_owned(),
-            name: "Native refresh".to_owned(),
-            secret: secret("old-access"),
-            verified_account: profile("workspace-native-refresh"),
-            next_refresh_at: None,
-            enabled: true,
-        })
-        .await;
-    let account = store.account("acct_native_refresh").unwrap();
-    let mut config = valid_config();
-    config.config.auth.oauth_token_endpoint = format!("{}/oauth/token", server.uri());
-    let bundle = provider_openai::initialize(
-        config.config.clone(),
-        provider_ports_with(store.clone(), Arc::default()),
-    )
-    .await
-    .unwrap();
-    let prepared = bundle
-        .admin_provider()
-        .prepare_refresh(PrepareCredentialRefresh {
-            account: account_record(&account),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        prepared.facts().identity_write,
-        gateway_core::account::CredentialIdentityWrite::RuntimeMaintenance
-    );
-    assert!(prepared.facts().preserve_profile);
-    assert_eq!(prepared.facts().plan_type.as_deref(), account.plan_type());
-    assert_eq!(
-        prepared
-            .facts()
-            .provider_material
-            .expose_to_provider()
-            .expose_to_provider()["access_token"],
-        "opaque-refreshed-access"
-    );
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    assert_eq!(store.account("acct_native_refresh").unwrap(), account);
-}
-
-#[tokio::test]
 async fn native_pat_identity_and_replacement_use_official_facts_and_current_proxy() {
     use gateway_core::engine::execution::ExecutionService as _;
     let auth = MockServer::start().await;
@@ -2991,7 +2973,7 @@ async fn native_pat_identity_and_replacement_use_official_facts_and_current_prox
         .await;
     store.set_egress(
         "acct_native_bound",
-        Some(gateway_core::account::OutboundProxy::parse(proxy.uri()).unwrap()),
+        Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
         None,
     );
     let mut config = valid_config();

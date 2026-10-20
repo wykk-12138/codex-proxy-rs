@@ -57,7 +57,7 @@ fn snapshot(revision: u64, binding: Option<CodexAccessBinding>, allowed: bool) -
         ConfigRevision::new(revision).unwrap(),
         gateway_core::settings::SettingsValues::new(2, "smart", Default::default(), None, None)
             .with_codex_public_origin(Some("https://codex.example.test".into())),
-        vec![openai.clone(), xai.clone()],
+        vec![openai.clone(), xai],
         vec![ProviderModel::new(
             openai,
             UpstreamModelId::new("gpt-start").unwrap(),
@@ -768,7 +768,7 @@ fn auxiliary_during_model_sse_is_capacity_rejected_when_shared_key_queue_is_disa
 }
 
 #[test]
-fn auxiliary_waiting_for_model_sse_can_cancel_without_releasing_the_model_slot() {
+fn auxiliary_queue_tail_can_cancel_without_releasing_the_model_or_head_slot() {
     block_on(async {
         let provider = Arc::new(NativeProvider::default());
         provider.hold_generation.store(true, Ordering::SeqCst);
@@ -779,11 +779,13 @@ fn auxiliary_waiting_for_model_sse_can_cancel_without_releasing_the_model_slot()
                 &snapshot
                     .settings()
                     .clone()
-                    .with_concurrency_queues(1, 0, 10),
+                    .with_concurrency_queues(2, 0, 10),
             )
             .unwrap();
         let (service, _) = service_for(snapshot, provider.clone(), admissions.clone());
         let model = start_in_flight_model(&service).await;
+        let mut head = service.codex_auxiliary(prepare(&service).await, request());
+        assert!(futures::poll!(head.as_mut()).is_pending());
         let prepared = prepare(&service).await;
         let cancellation = prepared.cancellation();
         let mut waiting = service.codex_auxiliary(prepared, request());
@@ -806,18 +808,21 @@ fn auxiliary_waiting_for_model_sse_can_cancel_without_releasing_the_model_slot()
             BTreeSet::from([model.request_id.clone()])
         );
         assert!(!model.session.is_finalized());
-        // 唯一等待位置已回收；下一次辅助请求可入队，丢弃 future 也释放该位置
+        assert!(futures::poll!(head.as_mut()).is_pending());
+        // 队尾位置已回收；模型和队首继续持有各自位置，后续请求可复用队尾位置
         let mut replacement = service.codex_auxiliary(prepare(&service).await, request());
         assert!(futures::poll!(replacement.as_mut()).is_pending());
+        let mut overflow = service.codex_auxiliary(prepare(&service).await, request());
+        assert!(matches!(
+            futures::poll!(overflow.as_mut()),
+            std::task::Poll::Ready(Err(error)) if error.kind() == GatewayErrorKind::ConcurrencyQueueFull
+        ));
         drop(replacement);
         assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 0);
         model.session.cancel();
         model.session.detach_finalize().await;
         assert!(admissions.active.lock().unwrap().is_empty());
-        let auxiliary = service
-            .codex_auxiliary(prepare(&service).await, request())
-            .await
-            .unwrap();
+        let auxiliary = head.await.unwrap();
         auxiliary.into_parts().3.close().await;
         assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 1);
         assert!(admissions.active.lock().unwrap().is_empty());

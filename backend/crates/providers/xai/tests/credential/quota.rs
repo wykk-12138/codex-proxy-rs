@@ -73,7 +73,7 @@ impl GrokBillingTransport for QueueBillingTransport {
 /// 每次读取都返回同一份无法解码的 catalog 文档的存储端口
 enum BillingMutation {
     State(AccountStateChange),
-    Credential(CredentialCasUpdate),
+    Credential(Box<CredentialCasUpdate>),
 }
 
 struct MutatingBillingTransport {
@@ -102,7 +102,7 @@ impl GrokBillingTransport for MutatingBillingTransport {
                     .expect("apply concurrent state"),
                 BillingMutation::Credential(update) => {
                     store
-                        .compare_and_swap_credential(update)
+                        .compare_and_swap_credential(*update)
                         .await
                         .expect("apply concurrent credential rotation");
                 }
@@ -493,7 +493,7 @@ async fn quota_refresh_rejects_a_concurrent_credential_revision() {
     .expect("credential update");
     let transport = Arc::new(MutatingBillingTransport {
         store: Arc::clone(&store),
-        mutation: Mutex::new(Some(BillingMutation::Credential(update))),
+        mutation: Mutex::new(Some(BillingMutation::Credential(Box::new(update)))),
         body: br#"{"config":{"creditUsagePercent":10}}"#.to_vec(),
     });
 

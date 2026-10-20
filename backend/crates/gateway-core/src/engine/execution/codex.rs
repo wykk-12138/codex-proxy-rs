@@ -66,17 +66,26 @@ impl DefaultExecutionService {
             cancellation: context.cancellation().clone(),
             admission: None,
         };
-        lifetime.admission = Some(
-            self.acquire_client_admission(
-                &prepared.client,
-                prepared.request_id(),
-                context.deadline(),
-                context.cancellation().clone(),
-                &ConcurrencyWaitBudget::default(),
-                AdmissionPurpose::Auxiliary,
-            )
-            .await?,
-        );
+        lifetime.admission = Some({
+            let wait_budget = ConcurrencyWaitBudget::default();
+            let admission = self
+                .acquire_client_admission(
+                    &prepared.client,
+                    prepared.request_id(),
+                    context.deadline(),
+                    context.cancellation().clone(),
+                    &wait_budget,
+                    AdmissionPurpose::Auxiliary,
+                )
+                .fuse();
+            let cancelled = context.cancellation().cancelled().fuse();
+            pin_mut!(admission, cancelled);
+            // 非队首等待也须响应取消，丢弃准入 future 沿 RAII 回收等待位置和租约
+            select_biased! {
+                () = cancelled => return Err(cancelled_error()),
+                result = admission => result?,
+            }
+        });
         Ok((gateway, context, lifetime))
     }
 
