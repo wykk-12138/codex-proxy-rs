@@ -139,7 +139,7 @@ watch(() => form.value.groupIds, () => {
               aria-label="原生 Codex 绑定账号"
               placeholder="选择 OpenAI OAuth 账号"
               empty-text="暂无 OpenAI OAuth 账号"
-              @update:model-value="updateForm('codexAccountId', $event)"
+              @update:model-value="updateForm('codexAccountId', $event ?? '')"
             />
           </template>
         </div>

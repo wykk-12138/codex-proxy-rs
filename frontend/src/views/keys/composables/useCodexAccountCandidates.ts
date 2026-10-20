@@ -33,7 +33,9 @@ export function useCodexAccountCandidates(options: { immediate?: boolean } = {})
         .filter(account => account.authenticationKind === 'oauth' && account.userId && account.accountId)
         .map(account => ({
           id: account.id,
-          label: account.email ?? account.name,
+          label: account.email && account.email !== account.name
+            ? `${account.name} (${account.email})`
+            : account.name,
           groups: account.groups,
         }))
       return accounts.value
