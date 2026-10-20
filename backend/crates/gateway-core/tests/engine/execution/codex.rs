@@ -228,6 +228,7 @@ struct NativeProvider {
     gateway: Arc<NativeGateway>,
     attempts: Mutex<Vec<String>>,
     recover_transport: AtomicBool,
+    hold_generation: AtomicBool,
 }
 #[async_trait]
 impl Provider for NativeProvider {
@@ -280,6 +281,24 @@ impl Provider for NativeProvider {
             attempts.push("acct_start".into());
             attempts.len()
         };
+        if self.hold_generation.load(Ordering::SeqCst) {
+            use futures::StreamExt as _;
+            let metadata = ProviderCallMetadata::new(
+                request.candidate().provider().clone(),
+                request.candidate().upstream_model().unwrap().clone(),
+                ProviderAccountId::new("acct_start").unwrap(),
+                UpstreamTransport::new("http").unwrap(),
+            );
+            let started = ProviderEvent::canonical(GatewayEvent::Started(ResponseMeta::new(
+                "resp_in_flight",
+                "gpt-start",
+            )));
+            return Ok(ProviderStream::new(
+                metadata,
+                futures::stream::iter([Ok(started)]).chain(futures::stream::pending()),
+                (),
+            ));
+        }
         if self.recover_transport.load(Ordering::SeqCst) && attempt <= 2 {
             let error =
                 ProviderError::new(ProviderErrorKind::Transport, UpstreamSendState::Ambiguous);
@@ -672,5 +691,135 @@ fn continuation_from_another_account_is_rejected_before_admission() {
             .await;
         assert!(matches!(result, Err(error) if error.kind() == GatewayErrorKind::PolicyDenied));
         assert!(provider.attempts.lock().unwrap().is_empty());
+    });
+}
+
+async fn start_in_flight_model(
+    service: &DefaultExecutionService,
+) -> gateway_core::engine::execution::StartedExecution {
+    let mut started = service
+        .start(StartExecution {
+            client: authenticate(service).await.unwrap(),
+            public_model: PublicModelId::new("gpt-start").unwrap(),
+            operation: start_operation(),
+            metadata: ExecutionRequestMetadata {
+                protocol: "openai".into(),
+                endpoint: "/codex/backend-api/codex/responses".into(),
+                transport: ClientTransport::HttpSse,
+                stream: true,
+                client_ip: None,
+                user_agent: None,
+                previous_response_id: None,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(started.session.next_event().await.unwrap().is_some());
+    started.session.commit_downstream(Some(200)).await.unwrap();
+    assert!(!started.session.is_finalized());
+    started
+}
+
+#[test]
+fn auxiliary_during_model_sse_is_capacity_rejected_when_shared_key_queue_is_disabled() {
+    use futures::FutureExt as _;
+    block_on(async {
+        let provider = Arc::new(NativeProvider::default());
+        provider.hold_generation.store(true, Ordering::SeqCst);
+        let admissions = Arc::new(BoundedAdmissions::default());
+        let snapshot = snapshot(1, Some(binding(true, "acct_start")), true);
+        let snapshot = snapshot
+            .with_settings(
+                &snapshot
+                    .settings()
+                    .clone()
+                    .with_concurrency_queues(0, 0, 10),
+            )
+            .unwrap();
+        let (service, _) = service_for(snapshot, provider.clone(), admissions.clone());
+        let model = start_in_flight_model(&service).await;
+        assert_eq!(
+            *admissions.active.lock().unwrap(),
+            BTreeSet::from([model.request_id.clone()])
+        );
+        // 官方工具可在 SSE 终态前调用 history/notes，不能为此绕过同 Key 并发
+        let result = service
+            .codex_auxiliary(prepare(&service).await, request())
+            .now_or_never()
+            .expect("queue-disabled admission must return without waiting for model completion");
+        assert!(matches!(result, Err(error) if error.kind() == GatewayErrorKind::RateLimited));
+        assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *admissions.active.lock().unwrap(),
+            BTreeSet::from([model.request_id.clone()])
+        );
+        assert!(!model.session.is_finalized());
+        model.session.cancel();
+        model.session.detach_finalize().await;
+        assert!(admissions.active.lock().unwrap().is_empty());
+        let auxiliary = service
+            .codex_auxiliary(prepare(&service).await, request())
+            .await
+            .unwrap();
+        auxiliary.into_parts().3.close().await;
+        assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 1);
+        assert!(admissions.active.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn auxiliary_waiting_for_model_sse_can_cancel_without_releasing_the_model_slot() {
+    block_on(async {
+        let provider = Arc::new(NativeProvider::default());
+        provider.hold_generation.store(true, Ordering::SeqCst);
+        let admissions = Arc::new(BoundedAdmissions::default());
+        let snapshot = snapshot(1, Some(binding(true, "acct_start")), true);
+        let snapshot = snapshot
+            .with_settings(
+                &snapshot
+                    .settings()
+                    .clone()
+                    .with_concurrency_queues(1, 0, 10),
+            )
+            .unwrap();
+        let (service, _) = service_for(snapshot, provider.clone(), admissions.clone());
+        let model = start_in_flight_model(&service).await;
+        let prepared = prepare(&service).await;
+        let cancellation = prepared.cancellation();
+        let mut waiting = service.codex_auxiliary(prepared, request());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 0);
+        cancellation.cancel();
+        let timeout = Box::pin(futures_timer::Delay::new(Duration::from_secs(2)));
+        match futures::future::select(waiting, timeout).await {
+            futures::future::Either::Left((result, _)) => {
+                assert!(
+                    matches!(result, Err(error) if error.kind() == GatewayErrorKind::Cancelled)
+                );
+            }
+            futures::future::Either::Right(_) => {
+                panic!("auxiliary cancellation must not wait for the model to finish")
+            }
+        }
+        assert_eq!(
+            *admissions.active.lock().unwrap(),
+            BTreeSet::from([model.request_id.clone()])
+        );
+        assert!(!model.session.is_finalized());
+        // 唯一等待位置已回收；下一次辅助请求可入队，丢弃 future 也释放该位置
+        let mut replacement = service.codex_auxiliary(prepare(&service).await, request());
+        assert!(futures::poll!(replacement.as_mut()).is_pending());
+        drop(replacement);
+        assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 0);
+        model.session.cancel();
+        model.session.detach_finalize().await;
+        assert!(admissions.active.lock().unwrap().is_empty());
+        let auxiliary = service
+            .codex_auxiliary(prepare(&service).await, request())
+            .await
+            .unwrap();
+        auxiliary.into_parts().3.close().await;
+        assert_eq!(provider.gateway.calls.load(Ordering::SeqCst), 1);
+        assert!(admissions.active.lock().unwrap().is_empty());
     });
 }
