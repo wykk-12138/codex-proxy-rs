@@ -195,32 +195,34 @@ async fn managed_next_can_outlive_the_initial_budget_with_or_without_resource_st
 
 #[tokio::test(start_paused = true)]
 async fn response_processing_uses_only_the_budget_left_before_next() {
-    let plugin = MiddlewarePlugin::new(
-        &middleware_contributions(),
-        |call: RequestCall| async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let response = call.next.run(call.request).await?;
-            tokio::time::sleep(Duration::from_millis(850)).await;
-            Ok(response)
-        },
-    )
-    .unwrap();
-    let (mut host, task) = start_session(plugin).await;
-    send_middleware_call(&mut host, 1, false).await;
-    let next = receive_next(&mut host, 1).await;
-    tokio::time::advance(Duration::from_secs(10)).await;
-    reply_next(&mut host, next).await;
-    assert!(matches!(
-        receive(&mut host).await.message,
-        Message::Error {
-            id: 1,
-            error: PluginFault {
-                code: ErrorCode::Timeout,
-                ..
+    for resource_stream in [false, true] {
+        let plugin = MiddlewarePlugin::new(
+            &middleware_contributions(),
+            |call: RequestCall| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let response = call.next.run(call.request).await?;
+                tokio::time::sleep(Duration::from_millis(850)).await;
+                Ok(response)
+            },
+        )
+        .unwrap();
+        let (mut host, task) = start_session(plugin).await;
+        send_middleware_call(&mut host, 1, resource_stream).await;
+        let next = receive_next(&mut host, 1).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        reply_next(&mut host, next).await;
+        assert!(matches!(
+            receive(&mut host).await.message,
+            Message::Error {
+                id: 1,
+                error: PluginFault {
+                    code: ErrorCode::Timeout,
+                    ..
+                }
             }
-        }
-    ));
-    shutdown(&mut host, task).await;
+        ));
+        shutdown(&mut host, task).await;
+    }
 }
 
 #[tokio::test(start_paused = true)]

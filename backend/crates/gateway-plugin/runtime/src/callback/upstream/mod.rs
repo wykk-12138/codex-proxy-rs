@@ -133,6 +133,7 @@ impl ManagedUpstream {
         &self,
         request: adapter::UpstreamHttpRequest,
         body: Vec<u8>,
+        maximum_body_bytes: usize,
     ) -> Result<(HttpRequest, UpstreamPathPurpose), PluginFault> {
         let (target, purpose) = self.target.resolve(&request.path, &request.query)?;
         if request.headers.len() > 128 {
@@ -158,18 +159,14 @@ impl ManagedUpstream {
                 (name, value.to_vec())
             })
             .collect();
-        headers.extend(
-            request
-                .headers
-                .into_iter()
-                .map(|(name, value)| (name, value.into_bytes())),
-        );
+        headers.extend(request.headers);
         Ok((
             HttpRequest {
                 method: request.method,
                 url: target.into(),
                 headers,
                 body,
+                maximum_body_bytes,
             },
             purpose,
         ))
@@ -188,6 +185,7 @@ pub(super) async fn dispatch(
         scope,
         call,
         maximum_payload,
+        ..
     } = *http;
     let managed = scope.upstream.as_ref().ok_or_else(denied)?;
     let timeout = || {
@@ -197,7 +195,8 @@ pub(super) async fn dispatch(
     match method {
         "host.upstream.http.do" | "host.upstream.http.do_stream" => {
             let request = serde_json::from_value(params).map_err(|_| invalid())?;
-            let (request, purpose) = managed.request(request, payload)?;
+            let maximum_body_bytes = http.body_limit(&payload)?;
+            let (request, purpose) = managed.request(request, payload, maximum_body_bytes)?;
             http.send(request, method.ends_with("do_stream"), Some(purpose))
                 .await
         }
@@ -227,12 +226,13 @@ pub(super) async fn dispatch(
                     headers: request.headers,
                 },
                 vec![],
+                0,
             )?;
             if purpose != UpstreamPathPurpose::Inference {
                 return Err(denied());
             }
             let mut socket = managed.socket.try_lock().map_err(|_| denied())?;
-            if let Some((url, _)) = socket
+            if let Some((url, connection)) = socket
                 .as_ref()
                 .filter(|(_, connection)| !connection.is_closed())
             {
@@ -240,7 +240,13 @@ pub(super) async fn dispatch(
                     return Err(denied());
                 }
                 return Ok(RpcReply {
-                    result: serde_json::json!({"status":101,"headers":[],"stream":null}),
+                    result: serde_json::json!({
+                        "status": 101,
+                        "http_version": format!("{:?}", connection.handshake_version()),
+                        "headers": connection.handshake_headers(),
+                        "stream": null,
+                        "trailers": [],
+                    }),
                     payload: vec![],
                 });
             }
@@ -261,12 +267,8 @@ pub(super) async fn dispatch(
                     .map_or_else(|error| error.send_state, |_| UpstreamSendState::Sent),
             );
             let mut response = response.map_err(super::http::http_error)?;
-            let headers = response
-                .headers
-                .into_iter()
-                .map(|(name, value)| String::from_utf8(value).map(|value| (name, value)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| invalid())?;
+            let headers = response.headers;
+            let mut trailers = Vec::new();
             let mut payload = Vec::new();
             if let Some(body) = response.body.as_mut() {
                 while let Some(chunk) = body
@@ -279,6 +281,7 @@ pub(super) async fn dispatch(
                     }
                     payload.extend_from_slice(&chunk);
                 }
+                trailers = body.take_trailers();
             }
             if let Some(connection) = response.connection {
                 *socket = Some((url, Arc::new(connection)));
@@ -286,8 +289,10 @@ pub(super) async fn dispatch(
             Ok(RpcReply {
                 result: serde_json::to_value(wire::HttpResponse {
                     status: response.status,
+                    http_version: format!("{:?}", response.version),
                     headers,
                     stream: None,
+                    trailers,
                 })
                 .map_err(|_| invalid())?,
                 payload,

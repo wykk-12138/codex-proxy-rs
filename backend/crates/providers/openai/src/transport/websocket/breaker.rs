@@ -2,10 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -41,7 +38,7 @@ pub enum WebSocketOriginBreakerDecision {
     HalfOpenBusy,
 }
 
-/// origin 级 WebSocket 快路径熔断器
+/// origin 级 WebSocket 建连熔断器
 #[derive(Clone)]
 pub struct WebSocketOriginBreaker {
     inner: Arc<Mutex<HashMap<String, CircuitState>>>,
@@ -77,81 +74,90 @@ impl WebSocketOriginBreaker {
             .or_insert_with(CircuitState::closed);
 
         match state {
-            CircuitState::Closed { failures } => {
+            CircuitState::Closed {
+                generation,
+                failures,
+            } => {
                 retain_window(failures, now, self.config.failure_window);
                 WebSocketOriginBreakerDecision::Allowed(WebSocketOriginBreakerPermit::new(
                     self.clone(),
                     origin_key.to_string(),
-                    None,
+                    *generation,
                 ))
             }
             CircuitState::Open { until } if now < *until => WebSocketOriginBreakerDecision::Open,
             CircuitState::Open { .. } => {
-                let probe_id = Uuid::new_v4();
-                *state = CircuitState::HalfOpen { probe_id };
+                let generation = Uuid::new_v4();
+                *state = CircuitState::HalfOpen { generation };
                 WebSocketOriginBreakerDecision::Allowed(WebSocketOriginBreakerPermit::new(
                     self.clone(),
                     origin_key.to_string(),
-                    Some(probe_id),
+                    generation,
                 ))
             }
             CircuitState::HalfOpen { .. } => WebSocketOriginBreakerDecision::HalfOpenBusy,
         }
     }
 
-    fn record_success(&self, origin_key: &str, probe_id: Option<Uuid>) {
+    fn record_success(&self, origin_key: &str, generation: Uuid) {
         let mut circuits = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if permit_still_owns_state(circuits.get(origin_key), probe_id) {
-            circuits.insert(origin_key.to_string(), CircuitState::closed());
+        let Some(state) = circuits.get_mut(origin_key) else {
+            return;
+        };
+        if !permit_still_owns_state(Some(state), generation) {
+            return;
+        }
+        match state {
+            CircuitState::Closed { failures, .. } => {
+                // 保留同轮尚未完成的 opening，让其后续结果继续参与计数
+                failures.clear();
+            }
+            CircuitState::HalfOpen { .. } => *state = CircuitState::closed(),
+            CircuitState::Open { .. } => {}
         }
     }
 
-    fn record_failure(&self, origin_key: &str, probe_id: Option<Uuid>) {
+    fn record_failure(&self, origin_key: &str, generation: Uuid) {
         let now = Instant::now();
         let mut circuits = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !permit_still_owns_state(circuits.get(origin_key), probe_id) {
-            return;
-        }
-        if probe_id.is_some() {
-            circuits.insert(
-                origin_key.to_string(),
-                CircuitState::Open {
-                    until: now + self.config.open_duration,
-                },
-            );
-            return;
-        }
-
-        let state = circuits
-            .entry(origin_key.to_string())
-            .or_insert_with(CircuitState::closed);
-        let CircuitState::Closed { failures } = state else {
+        let Some(state) = circuits.get_mut(origin_key) else {
             return;
         };
-        retain_window(failures, now, self.config.failure_window);
-        failures.push_back(now);
-        if failures.len() >= self.config.failure_threshold {
-            *state = CircuitState::Open {
-                until: now + self.config.open_duration,
-            };
+        if !permit_still_owns_state(Some(state), generation) {
+            return;
+        }
+        match state {
+            CircuitState::HalfOpen { .. } => {
+                *state = CircuitState::Open {
+                    until: now + self.config.open_duration,
+                };
+            }
+            CircuitState::Closed { failures, .. } => {
+                retain_window(failures, now, self.config.failure_window);
+                failures.push_back(now);
+                if failures.len() >= self.config.failure_threshold {
+                    *state = CircuitState::Open {
+                        until: now + self.config.open_duration,
+                    };
+                }
+            }
+            CircuitState::Open { .. } => {}
         }
     }
 
-    fn cancel_probe(&self, origin_key: &str, probe_id: Option<Uuid>) {
-        let Some(probe_id) = probe_id else {
-            return;
-        };
+    fn cancel_probe(&self, origin_key: &str, generation: Uuid) {
         let mut circuits = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if permit_still_owns_state(circuits.get(origin_key), Some(probe_id)) {
+        if matches!(circuits.get(origin_key), Some(CircuitState::HalfOpen { generation: active }) if *active == generation)
+        {
             circuits.insert(
                 origin_key.to_string(),
                 CircuitState::Open {
@@ -166,95 +172,71 @@ impl WebSocketOriginBreaker {
 pub struct WebSocketOriginBreakerPermit {
     breaker: WebSocketOriginBreaker,
     origin_key: String,
-    probe_id: Option<Uuid>,
-    degradation_recorded: Arc<AtomicBool>,
+    generation: Uuid,
     armed: bool,
 }
 
 impl WebSocketOriginBreakerPermit {
-    fn new(breaker: WebSocketOriginBreaker, origin_key: String, probe_id: Option<Uuid>) -> Self {
+    fn new(breaker: WebSocketOriginBreaker, origin_key: String, generation: Uuid) -> Self {
         Self {
             breaker,
             origin_key,
-            probe_id,
-            degradation_recorded: Arc::new(AtomicBool::new(false)),
+            generation,
             armed: true,
         }
     }
 
-    /// 创建可跨前台预算与后台 opening 生命周期共享的快路径观察器
-    pub(crate) fn fast_path_reporter(&self) -> WebSocketOriginFastPathReporter {
-        WebSocketOriginFastPathReporter {
-            breaker: self.breaker.clone(),
-            origin_key: self.origin_key.clone(),
-            probe_id: self.probe_id,
-            degradation_recorded: Arc::clone(&self.degradation_recorded),
-        }
-    }
-
     pub fn succeed(mut self) {
-        if !self.degradation_recorded.load(Ordering::Acquire) {
-            self.breaker.record_success(&self.origin_key, self.probe_id);
-        }
+        self.breaker
+            .record_success(&self.origin_key, self.generation);
         self.armed = false;
     }
 
-    pub fn fast_timeout(mut self) {
-        self.fast_path_reporter().missed();
-        self.armed = false;
+    /// 非池化 opening 已被前台时限终止，按连接失败计数
+    pub fn fast_timeout(self) {
+        self.fail();
     }
 
     pub fn fail(mut self) {
-        self.record_failure_once();
+        self.breaker
+            .record_failure(&self.origin_key, self.generation);
         self.armed = false;
     }
 
     /// opening 因账号驱逐或服务关闭而取消，不污染 origin 可用性
     pub(crate) fn cancel(mut self) {
-        self.breaker.cancel_probe(&self.origin_key, self.probe_id);
+        self.breaker.cancel_probe(&self.origin_key, self.generation);
         self.armed = false;
-    }
-
-    fn record_failure_once(&self) {
-        if !self.degradation_recorded.swap(true, Ordering::AcqRel) {
-            self.breaker.record_failure(&self.origin_key, self.probe_id);
-        }
     }
 }
 
 impl Drop for WebSocketOriginBreakerPermit {
     fn drop(&mut self) {
         if self.armed {
-            self.record_failure_once();
-        }
-    }
-}
-
-/// 前台等待结束后仍可报告同一次后台 opening 错过快路径预算
-pub(crate) struct WebSocketOriginFastPathReporter {
-    breaker: WebSocketOriginBreaker,
-    origin_key: String,
-    probe_id: Option<Uuid>,
-    degradation_recorded: Arc<AtomicBool>,
-}
-
-impl WebSocketOriginFastPathReporter {
-    pub(crate) fn missed(&self) {
-        if !self.degradation_recorded.swap(true, Ordering::AcqRel) {
-            self.breaker.record_failure(&self.origin_key, self.probe_id);
+            self.breaker
+                .record_failure(&self.origin_key, self.generation);
         }
     }
 }
 
 enum CircuitState {
-    Closed { failures: VecDeque<Instant> },
-    Open { until: Instant },
-    HalfOpen { probe_id: Uuid },
+    Closed {
+        generation: Uuid,
+        failures: VecDeque<Instant>,
+    },
+    Open {
+        until: Instant,
+    },
+    HalfOpen {
+        generation: Uuid,
+    },
 }
 
 impl CircuitState {
     fn closed() -> Self {
         Self::Closed {
+            // 初始化或半开恢复时创建新代次，隔离之前熔断周期的迟到结果
+            generation: Uuid::new_v4(),
             failures: VecDeque::new(),
         }
     }
@@ -269,10 +251,14 @@ fn retain_window(timeouts: &mut VecDeque<Instant>, now: Instant, window: Duratio
     }
 }
 
-fn permit_still_owns_state(state: Option<&CircuitState>, probe_id: Option<Uuid>) -> bool {
-    match (state, probe_id) {
-        (Some(CircuitState::Closed { .. }), None) => true,
-        (Some(CircuitState::HalfOpen { probe_id: active }), Some(expected)) => *active == expected,
+fn permit_still_owns_state(state: Option<&CircuitState>, generation: Uuid) -> bool {
+    match state {
+        Some(
+            CircuitState::Closed {
+                generation: active, ..
+            }
+            | CircuitState::HalfOpen { generation: active },
+        ) => *active == generation,
         _ => false,
     }
 }

@@ -11,7 +11,11 @@ const MAX_CORE: u64 = 512 * 1024 * 1024;
 const MAX_ASAR_PREFIX: u64 = 128 * 1024 * 1024;
 
 pub fn read_windows<R: Read + Seek>(source: R, arch: &str) -> io::Result<ClientRelease> {
-    let mut zip = zip::ZipArchive::new(source).map_err(|_| invalid())?;
+    // MSIX 从文件起点开始，固定偏移避免自动探测扫描整包、耗尽 HTTP Range 下载预算
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut zip = zip::ZipArchive::with_config(config, source).map_err(|_| invalid())?;
     if zip.len() > 20_000 {
         return Err(invalid());
     }

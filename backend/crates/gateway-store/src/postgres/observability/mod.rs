@@ -34,6 +34,7 @@ pub use admin_adapter::*;
 pub(crate) use analytics::accounts::{
     account_group_usage, account_usage_sort_values, account_usage_windows,
 };
+pub(crate) use analytics::backup_projection_ready;
 pub(crate) use analytics::{AGGREGATE_COLLECTION, AnalyticsSnapshot};
 pub use analytics::{AnalyticsMaintenance, AnalyticsStatus, PgRequestAnalyticsRepository};
 pub(crate) use mapping::*;

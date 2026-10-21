@@ -69,6 +69,7 @@ pub(super) async fn invoke(
         },
         maximum_timeout,
     );
+    call_context.resource_stream = true;
     call_context.request = crate::adapter::request_context(context.extension_scope().request());
     call_context.request_id = Some(context.request_id().as_str().to_owned());
     call_context.attempt_id = context
@@ -85,6 +86,7 @@ pub(super) async fn invoke(
             context.extension_scope().clone(),
             context.plan(),
             context.cancellation().clone(),
+            context.request_body_limit(),
         )
         .map_err(|_| MiddlewareError::Fault)?;
     let _binding = invocation_ports.callbacks.bind_middleware(

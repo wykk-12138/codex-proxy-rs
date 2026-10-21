@@ -16,11 +16,12 @@ use tokio::process::Command;
 use gateway_admin::model::backup::{BackupError, code};
 use gateway_admin::ports::backup::{DatabaseDumpPort, DumpArtifact, DumpRequest, StagedArtifact};
 
-use super::staging::StagingArea;
+use super::{archive::ArchiveWriter, snapshot::BusinessSnapshot, staging::StagingArea};
 
 /// `pg_dump` 导出适配器
 pub struct PgDumpAdapter {
     staging: Arc<StagingArea>,
+    pool: sqlx::PgPool,
     /// 不含密码的 PostgreSQL URL，用于 `--dbname`
     database_url: String,
     /// 数据库密码，仅通过 `PGPASSWORD` 注入
@@ -34,9 +35,11 @@ impl PgDumpAdapter {
         staging: Arc<StagingArea>,
         database_url: impl Into<String>,
         database_password: impl Into<String>,
+        pool: sqlx::PgPool,
     ) -> Self {
         Self {
             staging,
+            pool,
             database_url: database_url.into(),
             database_password: database_password.into(),
         }
@@ -64,8 +67,14 @@ impl DatabaseDumpPort for PgDumpAdapter {
             .open(&partial)
             .map_err(|_| pg_dump_failed("无法创建暂存文件"))?;
         let _partial_cleanup = PartialArchive(partial.clone());
-        let mut child = Command::new("pg_dump")
-            .arg("--format=custom")
+        let snapshot = tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => return Err(cancelled()),
+            result = BusinessSnapshot::begin(&self.pool, &request.backup_id) => result?,
+        };
+        let mut command = Command::new("pg_dump");
+        command
+            .arg("--format=plain")
             .arg("--no-owner")
             .arg("--no-privileges")
             .arg("--dbname")
@@ -74,17 +83,22 @@ impl DatabaseDumpPort for PgDumpAdapter {
             .env("PGCONNECT_TIMEOUT", "10")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        command.arg("--lock-wait-timeout=5s");
+        snapshot.configure(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|_| pg_dump_failed("无法启动 pg_dump 进程"))?;
-        let mut hasher = Sha256::new();
-        let mut size: u64 = 0;
         let export = async {
             let stdout = child
                 .stdout
                 .take()
                 .ok_or_else(|| pg_dump_failed("无法读取 pg_dump 输出"))?;
-            let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(file));
+            let mut writer = ArchiveWriter::new(file, self.staging.max_archive_bytes());
+            writer
+                .write_all(snapshot.restore_preamble().as_bytes())
+                .await
+                .map_err(write_failed)?;
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut buffer = vec![0_u8; 64 * 1024];
             loop {
@@ -95,20 +109,8 @@ impl DatabaseDumpPort for PgDumpAdapter {
                 if n == 0 {
                     break;
                 }
-                size = size.saturating_add(n as u64);
-                if size > self.staging.max_archive_bytes() {
-                    return Err(staging_space_exhausted());
-                }
-                hasher.update(&buffer[..n]);
-                writer
-                    .write_all(&buffer[..n])
-                    .await
-                    .map_err(|_| pg_dump_failed("写入暂存文件失败"))?;
+                writer.write_all(&buffer[..n]).await.map_err(write_failed)?;
             }
-            writer
-                .flush()
-                .await
-                .map_err(|_| pg_dump_failed("刷新暂存文件失败"))?;
             let status = child
                 .wait()
                 .await
@@ -116,22 +118,26 @@ impl DatabaseDumpPort for PgDumpAdapter {
             if !status.success() {
                 return Err(pg_dump_failed("pg_dump 非零退出"));
             }
-            Ok(())
+            snapshot.append(&mut writer).await?;
+            writer.finish().await.map_err(write_failed)
         };
         let result = tokio::select! {
             biased;
             _ = request.cancellation.cancelled() => Err(cancelled()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15 * 60)) => Err(pg_dump_failed("备份导出超过 15 分钟期限")),
             result = export => result,
         };
-        if let Err(error) = result {
-            // 正常错误和取消必须等到进程退出；任务被强制丢弃时由 kill_on_drop 接管
-            if let Err(source) = child.kill().await {
-                tracing::warn!(backup_id = %request.backup_id, error = %source, "终止 pg_dump 失败");
+        let (size, sha256) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // 正常错误和取消必须等到进程退出；任务被强制丢弃时由 kill_on_drop 接管
+                if let Err(source) = child.kill().await {
+                    tracing::warn!(backup_id = %request.backup_id, error = %source, "终止 pg_dump 失败");
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         std::fs::rename(&partial, &final_path).map_err(|_| pg_dump_failed("暂存归档改名失败"))?;
-        let sha256 = hex::encode(hasher.finalize());
         Ok(DumpArtifact {
             path: final_path,
             size_bytes: size,
@@ -199,7 +205,7 @@ async fn hash_file(path: &std::path::Path) -> Result<String, BackupError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn pg_dump_failed(message: &'static str) -> BackupError {
+pub(super) fn pg_dump_failed(message: &'static str) -> BackupError {
     BackupError::new(code::PG_DUMP_FAILED, message.to_owned())
 }
 
@@ -212,4 +218,15 @@ fn staging_space_exhausted() -> BackupError {
 
 fn cancelled() -> BackupError {
     BackupError::new(code::CANCELLED, "备份导出已取消".to_owned())
+}
+
+pub(super) fn write_failed(error: std::io::Error) -> BackupError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::StorageFull
+    ) {
+        staging_space_exhausted()
+    } else {
+        pg_dump_failed("写入暂存归档失败")
+    }
 }

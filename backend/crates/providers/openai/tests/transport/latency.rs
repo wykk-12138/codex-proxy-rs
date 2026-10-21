@@ -117,7 +117,7 @@ async fn cold_websocket_should_fall_back_without_recording_a_successful_connect(
     pool.shutdown().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_opening() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -190,7 +190,7 @@ async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_
     pool.shutdown().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn external_continuation_should_wait_for_a_cold_websocket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -227,67 +227,102 @@ async fn external_continuation_should_wait_for_a_cold_websocket() {
     pool.shutdown().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn timed_out_websocket_should_finish_in_background_and_serve_the_next_request() {
+#[tokio::test]
+async fn slow_pooled_openings_should_remain_healthy_and_serve_subsequent_requests() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (websocket_ready_tx, websocket_ready_rx) = tokio::sync::oneshot::channel();
+    let openings = WebSocketOriginBreakerConfig::default().failure_threshold + 1;
+    let (websocket_ready_tx, mut websocket_ready_rx) = tokio::sync::mpsc::channel(1);
     let server = tokio::spawn(async move {
-        let (websocket_stream, _) = listener.accept().await.unwrap();
-        let websocket_server = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let mut websocket = accept_codex_test_websocket(websocket_stream).await;
-            websocket_ready_tx.send(()).unwrap();
-            let _payload = websocket.next().await.unwrap().unwrap();
-            websocket
-                .send(Message::Text(
-                    completed_websocket_response("resp_background_ready", 2, 1).into(),
-                ))
-                .await
-                .unwrap();
-        });
+        for _ in 0..openings {
+            let (mut websocket_stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 4];
+            loop {
+                let read = websocket_stream.peek(&mut prefix).await.unwrap();
+                assert!(read > 0, "opening socket closed before the request prefix");
+                if read == prefix.len() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            if prefix == *b"POST" {
+                read_http_request(&mut websocket_stream).await;
+                write_completed_sse_response(&mut websocket_stream).await;
+                continue;
+            }
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let ready = websocket_ready_tx.clone();
+            let websocket_server = tokio::spawn(async move {
+                release_rx.await.unwrap();
+                let mut websocket = accept_codex_test_websocket(websocket_stream).await;
+                ready.send(()).await.unwrap();
+                // 回退的请求只发 HTTP，WS 的首个业务帧必须来自后续请求
+                let payload = websocket.next().await.unwrap().unwrap();
+                let payload: Value = serde_json::from_str(payload.to_text().unwrap()).unwrap();
+                assert_eq!(payload["input"][0]["content"], "subsequent request");
+                websocket
+                    .send(Message::Text(
+                        completed_websocket_response("resp_background_ready", 2, 1).into(),
+                    ))
+                    .await
+                    .unwrap();
+            });
 
-        let (mut http, _) = listener.accept().await.unwrap();
-        let request = read_http_request(&mut http).await;
-        assert!(request.starts_with("POST /codex/responses HTTP/1.1"));
-        write_completed_sse_response(&mut http).await;
-        websocket_server.await.unwrap();
+            let (mut http, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut http).await;
+            assert!(request.starts_with("POST /codex/responses HTTP/1.1"));
+            write_completed_sse_response(&mut http).await;
+            release_tx.send(()).unwrap();
+            websocket_server.await.unwrap();
+        }
     });
-    let pool = Arc::new(CodexWebSocketPool::default());
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
     let backend = CodexBackendClient::new(
         reqwest::Client::builder().no_proxy().build().unwrap(),
         format!("http://{addr}"),
         test_wire_profile(),
     )
     .with_websocket_pool(Arc::clone(&pool));
-    let request = new_chain_request("conversation-background-ready");
+    for index in 0..openings {
+        let request = new_chain_request(&format!("conversation-background-{index}"));
+        let first = backend
+            .create_response(
+                &request,
+                request_context("req_background_http", Some("chatgpt-account")),
+            )
+            .await
+            .expect("foreground request should use HTTP after its fast-path budget");
+        assert_eq!(first.transport, CodexBackendTransport::HttpSse);
+        assert_eq!(first.transport_metrics.ws_connect_ms, None);
+        assert_eq!(
+            first.transport_metrics.decision,
+            Some(CodexTransportDecision::Http2WebSocketBudgetExhausted)
+        );
+        websocket_ready_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut subsequent = codex_request(
+            "gpt-5.5",
+            "be brief",
+            vec![json!({"role":"user","content":"subsequent request"})],
+        );
+        subsequent.use_websocket = true;
+        subsequent.local_conversation_id = request.local_conversation_id.clone();
+        let second = backend
+            .create_response(
+                &subsequent,
+                request_context("req_background_reuse", Some("chatgpt-account")),
+            )
+            .await
+            .expect("next request should reuse the background websocket");
 
-    let first = backend
-        .create_response(
-            &request,
-            request_context("req_background_http", Some("chatgpt-account")),
-        )
-        .await
-        .expect("foreground request should use HTTP after its fast-path budget");
-    websocket_ready_rx.await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let second = backend
-        .create_response(
-            &request,
-            request_context("req_background_reuse", Some("chatgpt-account")),
-        )
-        .await
-        .expect("next request should reuse the background websocket");
+        assert_eq!(second.transport, CodexBackendTransport::WebSocket);
+        assert_eq!(
+            second.transport_metrics.decision,
+            Some(CodexTransportDecision::ReusedWebSocket)
+        );
+        assert!(second.body.contains("resp_background_ready"));
+    }
     server.await.unwrap();
-
-    assert_eq!(first.transport, CodexBackendTransport::HttpSse);
-    assert_eq!(first.transport_metrics.ws_connect_ms, None);
-    assert_eq!(second.transport, CodexBackendTransport::WebSocket);
-    assert_eq!(
-        second.transport_metrics.decision,
-        Some(CodexTransportDecision::ReusedWebSocket)
-    );
-    assert!(second.body.contains("resp_background_ready"));
     pool.shutdown().await;
 }
 
@@ -1266,12 +1301,208 @@ async fn origin_breaker_should_open_then_allow_only_one_half_open_probe() {
 }
 
 #[tokio::test]
+async fn slow_half_open_probe_should_remain_singleflight_and_recover_on_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = WebSocketOriginBreakerConfig::default();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        reject_websocket_openings(&listener, config.failure_threshold).await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let probe = tokio::spawn(async move {
+            release_rx.await.unwrap();
+            let mut websocket = accept_codex_test_websocket(stream).await;
+            ready_tx.send(()).unwrap();
+            let _payload = websocket.next().await.unwrap().unwrap();
+            websocket
+                .send(Message::Text(
+                    completed_websocket_response("resp_probe_reused", 2, 1).into(),
+                ))
+                .await
+                .unwrap();
+        });
+        // 探测未完成前，预算耗尽的原请求和其他新会话都只能发送 HTTP
+        for _ in 0..2 {
+            let (mut http, _) = listener.accept().await.unwrap();
+            assert!(
+                read_http_request(&mut http)
+                    .await
+                    .starts_with("POST /codex/responses")
+            );
+            write_completed_sse_response(&mut http).await;
+        }
+        probe.await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _payload = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_after_recovery", 2, 1).into(),
+            ))
+            .await
+            .unwrap();
+    });
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::clone(&pool));
+    record_websocket_origin_failures(&backend, config.failure_threshold, "slow-half-open").await;
+    tokio::time::pause();
+    tokio::time::advance(config.open_duration).await;
+    tokio::time::resume();
+
+    let probe_request = new_chain_request("slow-half-open-probe");
+    let fallback = backend
+        .create_response(
+            &probe_request,
+            request_context("req_slow_probe", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fallback.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2WebSocketBudgetExhausted)
+    );
+    let suppressed = backend
+        .create_response(
+            &new_chain_request("other-cold-conversation"),
+            request_context("req_probe_busy", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        suppressed.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2BreakerOpen)
+    );
+    release_tx.send(()).unwrap();
+    ready_rx.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let reused = backend
+        .create_response(
+            &probe_request,
+            request_context("req_probe_reuse", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.transport_metrics.decision,
+        Some(CodexTransportDecision::ReusedWebSocket)
+    );
+    let fresh = backend
+        .create_response(
+            &new_chain_request("after-probe-recovery"),
+            request_context("req_after_probe", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.transport, CodexBackendTransport::WebSocket);
+    assert_eq!(
+        fresh.transport_metrics.decision,
+        Some(CodexTransportDecision::ConnectedWebSocket)
+    );
+    server.await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn slow_half_open_probe_should_reopen_after_the_hard_connect_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = WebSocketOriginBreakerConfig::default();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        reject_websocket_openings(&listener, config.failure_threshold).await;
+        let (mut opening, _) = listener.accept().await.unwrap();
+        assert!(
+            read_http_request(&mut opening)
+                .await
+                .starts_with("GET /codex/responses")
+        );
+        let stalled = tokio::spawn(async move {
+            let mut byte = [0];
+            assert_eq!(opening.read(&mut byte).await.unwrap(), 0);
+            closed_tx.send(()).unwrap();
+        });
+        for _ in 0..3 {
+            let (mut http, _) = listener.accept().await.unwrap();
+            assert!(
+                read_http_request(&mut http)
+                    .await
+                    .starts_with("POST /codex/responses")
+            );
+            write_completed_sse_response(&mut http).await;
+        }
+        stalled.await.unwrap();
+    });
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::clone(&pool));
+    record_websocket_origin_failures(&backend, config.failure_threshold, "hard-timeout").await;
+    tokio::time::pause();
+    tokio::time::advance(config.open_duration).await;
+    tokio::time::resume();
+
+    let fallback = backend
+        .create_response(
+            &new_chain_request("hard-timeout-probe"),
+            request_context("req_hard_probe", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fallback.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2WebSocketBudgetExhausted)
+    );
+    let busy = backend
+        .create_response(
+            &new_chain_request("while-hard-probe-pending"),
+            request_context("req_hard_busy", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        busy.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2BreakerOpen)
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    timeout(Duration::from_secs(1), closed_rx)
+        .await
+        .expect("15s hard timeout must close the opening socket")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let suppressed = backend
+        .create_response(
+            &new_chain_request("after-hard-probe-failure"),
+            request_context("req_after_hard_failure", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        suppressed.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2BreakerOpen)
+    );
+    server.await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
 async fn cancelled_half_open_opening_should_allow_another_probe() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let breaker_config = WebSocketOriginBreakerConfig::default();
 
     let (opening_started_tx, opening_started_rx) = tokio::sync::oneshot::channel();
+    let (opening_closed_tx, opening_closed_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         reject_websocket_openings(&listener, breaker_config.failure_threshold).await;
 
@@ -1280,12 +1511,21 @@ async fn cancelled_half_open_opening_should_allow_another_probe() {
         assert!(request.starts_with("GET /codex/responses HTTP/1.1"));
         opening_started_tx.send(()).unwrap();
 
+        let (mut http, _) = listener.accept().await.unwrap();
+        assert!(
+            read_http_request(&mut http)
+                .await
+                .starts_with("POST /codex/responses")
+        );
+        write_completed_sse_response(&mut http).await;
+
         let mut byte = [0_u8; 1];
         let read = timeout(Duration::from_secs(1), opening.read(&mut byte))
             .await
             .expect("account eviction should close the half-open probe")
             .unwrap();
         assert_eq!(read, 0);
+        opening_closed_tx.send(()).unwrap();
 
         let (fresh_stream, _) = listener.accept().await.unwrap();
         let mut websocket = accept_codex_test_websocket(fresh_stream).await;
@@ -1318,23 +1558,27 @@ async fn cancelled_half_open_opening_should_allow_another_probe() {
     let attempt = tokio::spawn(async move {
         probe_backend
             .create_response(
-                &explicit_websocket_warmup_request("conversation-cancelled-half-open"),
+                &new_chain_request("conversation-cancelled-half-open"),
                 request_context("req_cancelled_half_open", Some("chatgpt-account")),
             )
             .await
     });
 
     opening_started_rx.await.unwrap();
-    pool.evict_account("chatgpt-account").await;
-    timeout(Duration::from_secs(1), attempt)
+    let fallback = attempt
         .await
-        .expect("cancelled request should finish")
         .unwrap()
-        .expect_err("cancelled half-open opening should fail the request");
+        .expect("slow probe should fall back to HTTP");
+    assert_eq!(
+        fallback.transport_metrics.decision,
+        Some(CodexTransportDecision::Http2WebSocketBudgetExhausted)
+    );
+    pool.evict_account("chatgpt-account").await;
+    opening_closed_rx.await.unwrap();
 
     let response = backend
         .create_response(
-            &explicit_websocket_warmup_request("conversation-next-half-open-probe"),
+            &new_chain_request("conversation-next-half-open-probe"),
             request_context("req_next_half_open_probe", Some("chatgpt-account")),
         )
         .await
@@ -1531,7 +1775,7 @@ async fn half_open_upstream_response_should_close_origin_breaker() {
     );
     let response = backend
         .create_response(
-            &explicit_websocket_warmup_request("conversation-after-half-open-response"),
+            &new_chain_request("conversation-after-half-open-response"),
             request_context("req_after_half_open_response", Some("chatgpt-account")),
         )
         .await

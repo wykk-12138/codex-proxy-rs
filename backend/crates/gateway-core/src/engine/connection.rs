@@ -18,6 +18,7 @@ struct State {
 pub struct ConnectionBudget {
     state: Arc<Mutex<State>>,
     now: fn() -> Instant,
+    reserve_next_opening: bool,
 }
 
 impl Default for ConnectionBudget {
@@ -37,7 +38,24 @@ impl ConnectionBudget {
         Self {
             state: Arc::default(),
             now,
+            reserve_next_opening: false,
         }
+    }
+
+    /// 仅本次恢复使用一半剩余时间并留下一次 opening；已启动的后台连接不受影响
+    #[must_use]
+    pub fn reserve_next_opening(mut self) -> Self {
+        self.reserve_next_opening = true;
+        self
+    }
+
+    #[must_use]
+    pub fn remaining_openings(&self) -> u32 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MAX_OPENINGS.saturating_sub(state.openings)
     }
 
     /// 在可能建立连接前预约一次 opening；返回本次连接允许使用的剩余时间
@@ -53,11 +71,16 @@ impl ConnectionBudget {
         let started = *state.started.get_or_insert_with(self.now);
         let remaining =
             STARTUP_TIMEOUT.saturating_sub((self.now)().saturating_duration_since(started));
-        if state.openings >= MAX_OPENINGS || remaining.is_zero() {
+        let opening_limit = MAX_OPENINGS - u32::from(self.reserve_next_opening);
+        if state.openings >= opening_limit || remaining.is_zero() {
             return Err(ConnectionBudgetExhausted);
         }
         state.openings += 1;
-        Ok(Some(remaining))
+        Ok(Some(if self.reserve_next_opening {
+            remaining / 2
+        } else {
+            remaining
+        }))
     }
 
     /// 仅连接成功不足以清零；确认业务发送后退出新增的 NotSent 恢复策略

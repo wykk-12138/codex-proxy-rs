@@ -185,6 +185,107 @@ async fn short_retention_keeps_statistics_readable_until_each_deletion_batch_is_
 }
 
 #[tokio::test]
+async fn locked_expired_rows_do_not_block_cleanup_and_are_revisited() {
+    let Some(database) = TestDatabase::create("retention_locked").await else {
+        return;
+    };
+    let now = Utc::now();
+    for id in ["locked", "available"] {
+        seed(&database.pool, id, now - ChronoDuration::days(40), &[]).await;
+    }
+    let mut writing = database.pool.begin().await.unwrap();
+    sqlx::query("select id from model_requests where id='locked' for update")
+        .execute(&mut *writing)
+        .await
+        .unwrap();
+    let repository = PgRetentionRepository::new(database.pool.clone());
+    let policy = RetentionPolicy::try_new(31, 7, 90).unwrap();
+    let deleted = tokio::time::timeout(
+        Duration::from_secs(2),
+        repository.purge_batch(
+            RetentionTarget::ModelRequests,
+            now,
+            policy,
+            NonZeroU32::new(10).unwrap(),
+        ),
+    )
+    .await
+    .expect("cleanup must skip the occupied row")
+    .unwrap();
+    assert_eq!(deleted, 1);
+    writing.commit().await.unwrap();
+    assert_eq!(
+        repository
+            .purge_batch(
+                RetentionTarget::ModelRequests,
+                now,
+                policy,
+                NonZeroU32::new(10).unwrap()
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn blocked_cascade_rolls_back_the_batch_and_respects_lock_deadline() {
+    let Some(database) = TestDatabase::create("retention_cascade_deadline").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(
+        &database.pool,
+        "parent",
+        now - ChronoDuration::days(40),
+        &[],
+    )
+    .await;
+    sqlx::query("insert into ops_events(id,model_request_id,attempt_index,level,component,operation,failure_kind,message,created_at) values('child','parent',1,'warning','routing','responses','rate_limited','synthetic',$1)")
+        .bind(now).execute(&database.pool).await.unwrap();
+    let mut writing = database.pool.begin().await.unwrap();
+    sqlx::query("select id from ops_events where id='child' for update")
+        .execute(&mut *writing)
+        .await
+        .unwrap();
+    let repository = PgRetentionRepository::new(database.pool.clone());
+    let policy = RetentionPolicy::try_new(31, 7, 90).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        repository.purge_batch(
+            RetentionTarget::ModelRequests,
+            now,
+            policy,
+            NonZeroU32::new(10).unwrap(),
+        ),
+    )
+    .await
+    .expect("cascade lock must have a server deadline");
+    assert!(result.is_err());
+    writing.rollback().await.unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("select count(*) from model_requests where id='parent'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 1);
+    assert_eq!(
+        repository
+            .purge_batch(
+                RetentionTarget::ModelRequests,
+                now,
+                policy,
+                NonZeroU32::new(10).unwrap()
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn retention_batch_deletes_only_expired_rows_up_to_limit() {
     let Some(database) = TestDatabase::create("retention_cycle_budget").await else {
         return;

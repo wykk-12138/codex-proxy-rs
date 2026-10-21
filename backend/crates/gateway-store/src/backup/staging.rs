@@ -52,7 +52,7 @@ impl StagingArea {
     /// 完成归档的暂存路径
     #[must_use]
     pub fn final_path(&self, backup_id: &str) -> PathBuf {
-        self.base_dir.join(format!("{backup_id}.dump"))
+        self.base_dir.join(format!("{backup_id}.sql.gz"))
     }
 
     /// 单任务暂存归档上限

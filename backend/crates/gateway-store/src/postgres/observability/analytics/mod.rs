@@ -24,6 +24,15 @@ pub(crate) const AGGREGATE_COLLECTION: &str = "usage_contribution";
 const SCHEMA_VERSION: i32 = 1;
 const HISTOGRAM_VERSION: i32 = histogram::HISTOGRAM_VERSION;
 
+/// 业务备份只消费已发布小时汇总，重建中的前缀不能作为完整历史导出
+pub(crate) async fn backup_projection_ready(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> StoreResult<bool> {
+    sqlx::query_scalar("select exists(select 1 from request_analytics_build_state where singleton and backfill_complete and reset_phase=0 and schema_version=$1 and histogram_version=$2) and not exists(select 1 from request_analytics_pending_buckets)")
+        .bind(SCHEMA_VERSION).bind(HISTOGRAM_VERSION).fetch_one(&mut **tx).await
+        .map_err(|error| postgres_unavailable("check backup analytics readiness", error))
+}
+
 pub(super) async fn begin_snapshot(
     connection: &mut ObservabilityConnection,
 ) -> StoreResult<sqlx::Transaction<'_, Postgres>> {

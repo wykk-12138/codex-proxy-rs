@@ -156,6 +156,20 @@ jobs:
             echo "CPR_TEST_REDIS_URL=redis://:${redis_password}@127.0.0.1:6379"
           } >> "$GITHUB_ENV"
 
+      - name: Expose matching PostgreSQL backup and restore tools
+        shell: bash
+        env:
+          CPR_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          client_dir="$RUNNER_TEMP/pg-client"
+          mkdir -p "$client_dir"
+          for tool in pg_dump psql; do
+            printf '#!/bin/sh\nexec docker exec -i --env PGPASSWORD "%s" %s "$@"\n' "$CPR_TEST_POSTGRES_CONTAINER" "$tool" > "$client_dir/$tool"
+            chmod +x "$client_dir/$tool"
+          done
+          echo "$client_dir" >> "$GITHUB_PATH"
+
       - name: Rust tests
         working-directory: backend
         run: |

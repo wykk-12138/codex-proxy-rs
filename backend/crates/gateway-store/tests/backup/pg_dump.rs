@@ -5,11 +5,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::postgres::{TestDatabase, drain_analytics};
 use gateway_admin::model::backup::code;
 use gateway_admin::ports::backup::{DatabaseDumpPort, DumpRequest};
 use gateway_core::lifecycle::CancellationToken;
 use gateway_store::backup::{pg_dump::PgDumpAdapter, staging::StagingArea};
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncReadExt as _;
 
 #[tokio::test]
 async fn dump_process_lifecycle() {
@@ -41,14 +43,31 @@ async fn dump_process_lifecycle() {
         assert!(status.success());
         return;
     };
+    let Some(database) = TestDatabase::create("dump_lifecycle").await else {
+        return;
+    };
+    drain_analytics(&database.pool).await;
     let directory = Path::new(&directory);
-    let staging = Arc::new(StagingArea::open(directory.join("staging"), 64).unwrap());
-    let dump = |mode: &str| PgDumpAdapter::new(staging.clone(), mode, "test-password");
+    let staging = Arc::new(StagingArea::open(directory.join("staging"), 1024 * 1024).unwrap());
+    let dump = |mode: &str| {
+        PgDumpAdapter::new(
+            staging.clone(),
+            mode,
+            "test-password",
+            database.pool.clone(),
+        )
+    };
 
     let artifact = dump("success").dump(request("success")).await.unwrap();
-    assert_eq!(std::fs::read(&artifact.path).unwrap(), b"archive");
-    assert_eq!(artifact.size_bytes, 7);
-    assert_eq!(artifact.sha256, hex::encode(Sha256::digest(b"archive")));
+    let compressed = std::fs::read(&artifact.path).unwrap();
+    let mut decoded = String::new();
+    async_compression::tokio::bufread::GzipDecoder::new(compressed.as_slice())
+        .read_to_string(&mut decoded)
+        .await
+        .unwrap();
+    assert!(decoded.contains("\narchive\n"));
+    assert_eq!(artifact.size_bytes, compressed.len() as u64);
+    assert_eq!(artifact.sha256, hex::encode(Sha256::digest(&compressed)));
     assert!(!staging.partial_path("success").exists());
     assert_eq!(
         dump("success")
@@ -65,10 +84,15 @@ async fn dump_process_lifecycle() {
     assert!(!staging.partial_path("fail").exists());
 
     let small = Arc::new(StagingArea::open(directory.join("small"), 1).unwrap());
-    let error = PgDumpAdapter::new(small.clone(), "success", "test-password")
-        .dump(request("oversized"))
-        .await
-        .unwrap_err();
+    let error = PgDumpAdapter::new(
+        small.clone(),
+        "success",
+        "test-password",
+        database.pool.clone(),
+    )
+    .dump(request("oversized"))
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), code::STAGING_SPACE_EXHAUSTED);
     assert!(!small.partial_path("oversized").exists());
 
@@ -119,13 +143,21 @@ async fn dump_process_lifecycle() {
         artifact.path.exists(),
         "completed archives remain available for recovery"
     );
+    database.close().await;
 }
 
 #[tokio::test]
 async fn cleanup_reports_failure_and_still_removes_the_other_archive() {
     let directory = tempfile::tempdir().unwrap();
     let staging = Arc::new(StagingArea::open(directory.path().to_path_buf(), 64).unwrap());
-    let adapter = PgDumpAdapter::new(staging.clone(), "unused", "unused");
+    let adapter = PgDumpAdapter::new(
+        staging.clone(),
+        "unused",
+        "unused",
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap(),
+    );
     adapter.cleanup_staging("missing").await.unwrap();
     std::fs::create_dir(staging.partial_path("blocked")).unwrap();
     std::fs::write(staging.final_path("blocked"), b"archive").unwrap();

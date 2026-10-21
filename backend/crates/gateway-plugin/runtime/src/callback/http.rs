@@ -17,9 +17,18 @@ pub(super) struct HttpCallbacks<'a> {
     pub(super) scope: &'a Arc<CallbackScope>,
     pub(super) call: &'a CallResources,
     pub(super) maximum_payload: usize,
+    pub(super) request_limits: &'a super::request_limits::RequestLimits,
 }
 
 impl HttpCallbacks<'_> {
+    pub(super) fn body_limit(&self, body: &[u8]) -> Result<usize, PluginFault> {
+        // 空正文不占请求预算，也允许尚未发布设置的注册阶段执行无正文查询
+        if body.is_empty() {
+            return Ok(0);
+        }
+        self.request_limits.body_bytes(self.call)
+    }
+
     pub(super) async fn send(
         &self,
         request: HttpRequest,
@@ -32,7 +41,11 @@ impl HttpCallbacks<'_> {
             scope,
             call,
             maximum_payload,
+            ..
         } = *self;
+        if request.body.len() > request.maximum_body_bytes {
+            return Err(super::request_limits::too_large());
+        }
         let timeout = call.timeout()?;
         let attempt = call.start_upstream(upstream_purpose)?;
         let response = client
@@ -45,16 +58,12 @@ impl HttpCallbacks<'_> {
         );
         let response = response.map_err(http_error)?;
         let mut body = response.body;
-        let headers = response
-            .headers
-            .into_iter()
-            .map(|(name, value)| String::from_utf8(value).map(|value| (name, value)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| sent_fault(ErrorCode::Fault, "HTTP header cannot be represented"))?;
         let mut result = wire::HttpResponse {
             status: response.status,
-            headers,
+            http_version: format!("{:?}", response.version),
+            headers: response.headers,
             stream: None,
+            trailers: Vec::new(),
         };
         let mut payload = Vec::new();
         if streaming {
@@ -90,6 +99,7 @@ impl HttpCallbacks<'_> {
                 }
                 payload.extend_from_slice(&chunk);
             }
+            result.trailers = body.take_trailers();
         }
         Ok(RpcReply {
             result: serde_json::to_value(result).map_err(|_| invalid())?,
@@ -111,11 +121,8 @@ impl HttpCallbacks<'_> {
                     HttpRequest {
                         method: request.method,
                         url: request.url,
-                        headers: request
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| (name, value.into_bytes()))
-                            .collect(),
+                        headers: request.headers,
+                        maximum_body_bytes: self.body_limit(&payload)?,
                         body: payload,
                     },
                     method == "host.http.do_stream",
@@ -142,12 +149,16 @@ impl HttpCallbacks<'_> {
                 let mut body = stream.body.try_lock().map_err(|_| {
                     PluginFault::new(ErrorCode::Capacity, "HTTP stream already has a reader")
                 })?;
+                let timeout = call.timeout()?;
                 let mut closed = stream.closed.subscribe();
                 let result = tokio::select! {
                     biased;
                     _ = closed.wait_for(|closed| *closed) => Err(denied()),
-                    result = body.as_mut().ok_or_else(denied)?.read(request.maximum_bytes as usize) => result.map_err(http_error),
+                    result = body.as_mut().ok_or_else(denied)?.read_with_timeout(request.maximum_bytes as usize, timeout) => result.map_err(http_error),
                 };
+                let trailers = body
+                    .as_mut()
+                    .map_or_else(Vec::new, |body| body.take_trailers());
                 if !matches!(&result, Ok(Some(_))) {
                     body.take();
                     stream.closed.send_replace(true);
@@ -159,7 +170,7 @@ impl HttpCallbacks<'_> {
                 }
                 let chunk = result?;
                 Ok(RpcReply {
-                    result: serde_json::json!({"eof":chunk.is_none()}),
+                    result: serde_json::json!({"eof":chunk.is_none(), "trailers": trailers}),
                     payload: chunk.map_or_else(Vec::new, |chunk| chunk.to_vec()),
                 })
             }
@@ -216,6 +227,10 @@ pub(super) fn http_error(error: HttpError) -> PluginFault {
         HttpErrorKind::Response => (ErrorCode::Upstream, "目标网站响应读取失败"),
     };
     let mut fault = PluginFault::new(code, message);
+    fault.details = Some(serde_json::json!({
+        "kind": error.kind(),
+        "reason": error.reason(),
+    }));
     fault.send_state = match error.send_state {
         UpstreamSendState::NotSent => SendState::NotSent,
         UpstreamSendState::Sent => SendState::Sent,

@@ -61,7 +61,9 @@ impl RetentionStore for PgRetentionRepository {
                    select ctid from model_requests
                     where outcome <> 'running'
                       and completed_at < $1 - ($2 * interval '1 day')
+                    order by completed_at
                     limit $3
+                    for update skip locked
                  )"
             }
             RetentionTarget::OpsEvents => {
@@ -70,7 +72,9 @@ impl RetentionStore for PgRetentionRepository {
                    select ctid from ops_events
                     where model_request_id is null
                       and created_at < $1 - ($2 * interval '1 day')
+                    order by created_at
                     limit $3
+                    for update skip locked
                  )"
             }
             RetentionTarget::AdminAuditEvents => {
@@ -78,18 +82,39 @@ impl RetentionStore for PgRetentionRepository {
                  where ctid in (
                    select ctid from admin_audit_events
                     where created_at < $1 - ($2 * interval '1 day')
+                    order by created_at
                     limit $3
+                    for update skip locked
                  )"
             }
         };
-        sqlx::query(sql)
+        // 跳过正在写入的父行；级联与投影触发器仍可能等锁，单批需有服务端截止时间
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| unavailable("begin retention batch", source))?;
+        sqlx::query("set local statement_timeout = '5s'")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| unavailable("set retention statement timeout", source))?;
+        sqlx::query("set local lock_timeout = '500ms'")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| unavailable("set retention lock timeout", source))?;
+        let deleted = sqlx::query(sql)
             .bind(now)
             .bind(i64::from(policy.days(target)))
             .bind(i64::from(limit.get()))
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| unavailable("delete expired records", source))
+            .map_err(|source| unavailable("delete expired records", source))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| unavailable("commit retention batch", source))?;
+        Ok(deleted)
     }
 }
 

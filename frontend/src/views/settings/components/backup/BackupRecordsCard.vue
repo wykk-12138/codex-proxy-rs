@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { BackupRecord } from '@/api'
 
-import { defineTableColumns, ZButton, ZCard, ZConfirmDialog, ZIconButton, ZPagination, ZTable } from '@codex-proxy/ui'
-import { Download, Play, RefreshCw, Trash2 } from '@lucide/vue'
+import { defineTableColumns, ZButton, ZCard, ZConfirmDialog, ZIconButton, ZPagination, ZPopover, ZTable } from '@codex-proxy/ui'
+import { CircleHelp, Download, Play, RefreshCw, Trash2 } from '@lucide/vue'
 
 import BackupStatusBadge from './BackupStatusBadge.vue'
 
@@ -84,10 +84,23 @@ function canDelete(record: BackupRecord): boolean {
 </script>
 
 <template>
-  <ZCard
-    title="备份记录"
-    description="创建手动备份和管理已有备份记录"
-  >
+  <ZCard description="不包含请求明细与日志">
+    <template #title>
+      <span class="inline-flex items-center gap-1.5">
+        <span>备份记录</span>
+        <ZPopover trigger="hover-click" placement="bottom-start">
+          <template #reference="{ open }">
+            <ZIconButton aria-label="备份范围说明" :title="undefined" :aria-expanded="open" class="size-6! hover:bg-transparent! active:bg-transparent!">
+              <CircleHelp class="size-3.5" aria-hidden="true" />
+            </ZIconButton>
+          </template>
+          <div class="max-w-72 space-y-2 px-3 py-2 text-cp-sm leading-relaxed text-cp-text-secondary">
+            <p>保留账号、Key、设置、插件及已用额度</p>
+            <p>用量保留小时汇总</p>
+          </div>
+        </ZPopover>
+      </span>
+    </template>
     <template #actions>
       <div class="flex flex-wrap items-center gap-2">
         <ZButton

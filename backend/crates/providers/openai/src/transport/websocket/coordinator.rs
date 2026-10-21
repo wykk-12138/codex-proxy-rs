@@ -13,7 +13,6 @@ use tokio::{
 use super::{
     breaker::{
         WebSocketOriginBreaker, WebSocketOriginBreakerDecision, WebSocketOriginBreakerPermit,
-        WebSocketOriginFastPathReporter,
     },
     error::CodexWebSocketExchangeError,
     exchange::{
@@ -306,7 +305,6 @@ async fn prepare_pooled_websocket(
 struct PooledWebSocketConnectWaiter {
     started_at: tokio::time::Instant,
     receiver: oneshot::Receiver<Result<PooledWebSocketHandoff, CodexWebSocketExchangeError>>,
-    fast_path_reporter: Option<WebSocketOriginFastPathReporter>,
 }
 
 struct PooledWebSocketHandoff {
@@ -324,9 +322,7 @@ impl PooledWebSocketConnectWaiter {
             match wait_for_fast_path(self.started_at, fast_path_budget, &mut self.receiver).await {
                 WebSocketFastPath::Ready(received) => received,
                 WebSocketFastPath::Missed => {
-                    if let Some(reporter) = &self.fast_path_reporter {
-                        reporter.missed();
-                    }
+                    // 熔断许可仍归后台 opening 持有，前台停止等待不等于建连失败
                     return Ok(WebSocketFastPath::Missed);
                 }
             };
@@ -347,9 +343,6 @@ fn start_pooled_websocket_connect(
     let task_key = connect_lease.key().clone();
     let started_at = connect_lease.started_at();
     let cancellation = connect_lease.cancellation_token();
-    let fast_path_reporter = permit
-        .as_ref()
-        .map(WebSocketOriginBreakerPermit::fast_path_reporter);
     let keepalive = pool.keepalive();
     let context = PumpLogContext::new(
         Some(task_key.account_id().to_owned()),
@@ -437,7 +430,6 @@ fn start_pooled_websocket_connect(
     PooledWebSocketConnectWaiter {
         started_at,
         receiver,
-        fast_path_reporter,
     }
 }
 

@@ -341,11 +341,12 @@ pub(crate) fn backup_ports(
         config.backup_staging_dir().to_path_buf(),
         backup::staging::DEFAULT_MAX_ARCHIVE_BYTES,
     )?);
-    let repository = Arc::new(postgres::PgBackupRepository::new(pool));
+    let repository = Arc::new(postgres::PgBackupRepository::new(pool.clone()));
     let dump = Arc::new(backup::pg_dump::PgDumpAdapter::new(
         staging,
         config.database.url.clone(),
         config.database.password.clone(),
+        pool,
     ));
     let object_store = Arc::new(backup::s3::S3ObjectStoreAdapter::new());
     Ok(BackupStorePorts::new(repository, dump, object_store))

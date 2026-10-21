@@ -106,6 +106,7 @@ impl Execution {
                 self.adapter.declaration.transport.as_str(),
                 self.invocation.account.as_ref(),
                 active.managed.send_state.get(),
+                self.invocation.context.timing_started_at(),
             )
             .map_err(|error| match error {
                 EventDecodeError::Invalid(error) => {
@@ -131,7 +132,7 @@ impl Execution {
             }.await;
             if let Err(error) = terminal {
                 // 尾部故障不得交付成功 wire，但已经解析的计量事实仍归 Core 结算
-                let metering = decoded
+                let mut metering: Vec<_> = decoded
                     .event
                     .canonical_facts()
                     .iter()
@@ -145,6 +146,11 @@ impl Execution {
                     .cloned()
                     .map(gateway_core::event::ProviderEvent::canonical)
                     .collect();
+                if let Some(observation) = decoded.event.response_observation() {
+                    metering.push(gateway_core::event::ProviderEvent::observation(
+                        observation.clone(),
+                    ));
+                }
                 return Err(error.with_atomic_client_events(metering));
             }
             self.ended = true;
@@ -177,6 +183,8 @@ impl Execution {
             ));
         }
         let mut context = self.adapter.session.context(Stage::Upstream, timeout);
+        // 初始回复后由模型执行持有流的期限与取消，RPC 预算只约束建立阶段
+        context.resource_stream = true;
         context.request =
             crate::adapter::request_context(invocation.context.extension_scope().request());
         context.request_id = Some(invocation.context.request_id().as_str().to_owned());
@@ -210,10 +218,21 @@ impl Execution {
             .extension_scope()
             .extending(self.adapter.instance_id.clone())
             .ok_or_else(invalid)?;
+        let request_body_limit = invocation
+            .context
+            .request_body_limit()
+            .map(Ok)
+            .unwrap_or_else(|| self.adapter.callbacks.request_body_limit())
+            .map_err(|error| fault_error(error, UpstreamSendState::NotSent))?;
         let scope = self
             .adapter
             .callbacks
-            .prepare_upstream(&context, Arc::clone(&managed), extension_scope)
+            .prepare_upstream(
+                &context,
+                Arc::clone(&managed),
+                extension_scope,
+                request_body_limit,
+            )
             .map_err(|error| fault_error(error, UpstreamSendState::NotSent))?;
         let request = UpstreamAdapterRequest {
             adapter_id: declaration.id.clone(),
@@ -230,6 +249,10 @@ impl Execution {
             protocol: invocation.operation.protocol().to_owned(),
             client_transport: invocation.context.client_transport().as_str().to_owned(),
             fast_mode: invocation.context.fast_mode().as_str().to_owned(),
+            request_elapsed_ms: u64::try_from(
+                invocation.context.timing_started_at().elapsed().as_millis(),
+            )
+            .unwrap_or(u64::MAX),
             headers: invocation
                 .headers
                 .iter()
@@ -237,14 +260,18 @@ impl Execution {
                 .collect(),
             continuation: previous.map(|state| state.continuation),
         };
+        let body = invocation
+            .operation
+            .middleware_body()
+            .map_err(|source| invalid().with_source(source))?;
+        if body.len() > gateway_plugin_sdk::call::model::request_payload_limit(request_body_limit) {
+            return Err(fault_error(
+                crate::callback::request_limits::too_large(),
+                UpstreamSendState::NotSent,
+            ));
+        }
         let payload = request
-            .encode(
-                invocation
-                    .operation
-                    .middleware_body()
-                    .map_err(|source| invalid().with_source(source))?
-                    .to_vec(),
-            )
+            .encode(body.to_vec())
             .map_err(|source| invalid().with_source(source))?;
         invocation.context.trace().record("plugin.upstream", serde_json::json!({ "instanceId": self.adapter.instance_id, "adapterId": declaration.id, "generation": context.generation, "transport": declaration.transport.as_str() }));
         let mut stream = tokio::select! {

@@ -12,6 +12,7 @@ fn request(url: String) -> HttpRequest {
         url,
         headers: vec![],
         body: vec![],
+        maximum_body_bytes: 0,
     }
 }
 
@@ -222,6 +223,63 @@ async fn buffered_body_cannot_extend_the_request_deadline() {
 }
 
 #[tokio::test]
+async fn resource_body_reads_outlive_opening_but_keep_a_per_read_timeout() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (send_next, next) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.ends_with(b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && head.len() < 16 * 1024);
+            head.extend_from_slice(&buffer[..count]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na")
+            .await
+            .unwrap();
+        next.await.unwrap();
+        socket.write_all(b"b").await.unwrap();
+        assert_eq!(socket.read(&mut buffer).await.unwrap(), 0);
+    });
+    let mut response = HttpClient::new()
+        .unwrap()
+        .open(request(url), None, &local_network(), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(response.body.read(1).await.unwrap().unwrap(), "a");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    send_next.send(()).unwrap();
+    assert_eq!(
+        response
+            .body
+            .read_with_timeout(1, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap(),
+        "b"
+    );
+    let error = response
+        .body
+        .read_with_timeout(1, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), HttpErrorKind::Timeout);
+    assert_eq!(error.send_state, UpstreamSendState::Sent);
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn cancelling_dns_releases_the_request_slot_without_starting_http() {
     use std::sync::Arc;
 
@@ -258,4 +316,41 @@ async fn cancelling_dns_releases_the_request_slot_without_starting_http() {
             .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn managed_http_enforces_the_callers_body_limit_before_sending() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = HttpClient::new().unwrap();
+    // 覆盖旧固定上限之外的正文，并验证同一个客户端逐次使用调用方的预算
+    let maximum = 17 * 1024 * 1024;
+    for (size, limit, accepted) in [
+        (maximum, maximum, true),
+        (maximum + 1, maximum, false),
+        (maximum + 1, maximum + 1, true),
+    ] {
+        let mut request = request(server.uri());
+        request.method = "POST".into();
+        request.body = vec![b'x'; size];
+        request.maximum_body_bytes = limit;
+        let result = client
+            .open(request, None, &local_network(), Duration::from_secs(10))
+            .await;
+        if accepted {
+            assert_eq!(result.unwrap().status, 200);
+        } else {
+            let error = result.err().unwrap();
+            assert_eq!(error.kind(), HttpErrorKind::InvalidRequest);
+            assert_eq!(error.send_state, UpstreamSendState::NotSent);
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body.len(), maximum);
+    assert_eq!(requests[1].body.len(), maximum + 1);
 }

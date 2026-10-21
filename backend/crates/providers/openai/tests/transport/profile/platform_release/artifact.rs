@@ -6,7 +6,22 @@ use provider_openai::transport::profile::platform_release::{
     xz::IndexedXz,
 };
 use serde_json::json;
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+
+// seek 不重置累计读取预算，用小体积夹具捕获整包扫描
+struct ReadBudget<R>(io::Take<R>);
+
+impl<R: Read> Read for ReadBudget<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for ReadBudget<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.0.get_mut().seek(position)
+    }
+}
 
 fn core(windows: bool, arm: bool) -> Vec<u8> {
     let mut bytes = vec![0; 8192];
@@ -115,6 +130,26 @@ fn windows_and_linux_read_versions_from_the_same_package_and_check_architecture(
         assert!(read_linux(Cursor::new(deb(arm)), other).is_err());
     }
 }
+#[test]
+fn windows_reads_versions_within_budget_despite_large_unrelated_entries() {
+    for (arch, arm) in [("x86_64", false), ("arm64", true)] {
+        let bytes = zip(arm, &core(true, arm));
+        let expected = read_windows(Cursor::new(&bytes), arch).unwrap();
+        let mut archive = zip::ZipWriter::new_append(Cursor::new(bytes)).unwrap();
+        archive
+            .start_file(
+                "app/unrelated.bin",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        io::copy(&mut io::repeat(0).take(2 * 1024 * 1024), &mut archive).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let source = ReadBudget(Cursor::new(bytes).take(64 * 1024));
+        assert_eq!(read_windows(source, arch).unwrap(), expected);
+    }
+}
+
 #[test]
 fn truncated_or_corrupt_archives_do_not_publish_versions() {
     let zip = zip(false, &core(true, false));

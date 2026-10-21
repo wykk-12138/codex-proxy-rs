@@ -33,7 +33,8 @@ pub fn worker(store: Arc<dyn RetentionStore>) -> Result<WorkerContribution, Work
     // 保持稳定的租约身份，滚动升级期间仍与已有进程互斥
     let id = WorkerId::try_new(WorkerKind::Retention, "postgres")?;
     let schedule = WorkerSchedule::try_new(
-        Duration::from_secs(60 * 60),
+        // 有界单轮结束后一分钟继续检查，避免日级写入量超过清理容量
+        Duration::from_secs(60),
         Duration::from_secs(1),
         Duration::from_secs(60),
         Duration::from_secs(15 * 60),

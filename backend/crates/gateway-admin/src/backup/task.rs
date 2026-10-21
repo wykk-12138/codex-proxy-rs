@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use gateway_core::{
     lifecycle::CancellationToken,
-    task::{DaemonTask, WorkerTaskError},
+    task::{DaemonTask, WorkerDaemonContext, WorkerTaskError},
 };
 use tracing::{info, warn};
 
@@ -75,18 +75,20 @@ impl BackupTask {
 }
 
 impl DaemonTask for BackupTask {
-    fn run(&self, cancellation: CancellationToken) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
-        Box::pin(async move { self.run_daemon(cancellation).await })
+    fn run(&self, context: WorkerDaemonContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move { self.run_daemon(context).await })
     }
 }
 
 impl BackupTask {
-    async fn run_daemon(&self, cancellation: CancellationToken) -> Result<(), WorkerTaskError> {
+    async fn run_daemon(&self, context: WorkerDaemonContext) -> Result<(), WorkerTaskError> {
+        let cancellation = context.cancellation();
         loop {
             if cancellation.is_cancelled() {
                 return Ok(());
             }
-            self.run_cycle(&cancellation).await?;
+            self.run_cycle(cancellation).await?;
+            context.succeeded();
 
             tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
@@ -706,6 +708,10 @@ impl BackupTask {
 fn classify_dump_error(error: BackupError) -> (&'static str, &'static str) {
     match error.code() {
         code::CANCELLED => (code::CANCELLED, "备份已取消"),
+        code::ANALYTICS_NOT_READY => (
+            code::ANALYTICS_NOT_READY,
+            "用量统计正在重建，请在统计就绪后重试备份",
+        ),
         code::STAGING_SPACE_EXHAUSTED => (code::STAGING_SPACE_EXHAUSTED, "暂存磁盘空间不足"),
         _ => (code::PG_DUMP_FAILED, "数据库导出失败"),
     }

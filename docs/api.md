@@ -265,7 +265,8 @@ Codex 的 review 等子代理请求仍使用 `/v1/responses`，并通过 `x-open
 多帧连续解码，整体展开结果受运行设置 `responsesMaxDecompressedBodyBytes` 约束（默认 64 MiB），
 超限在继续展开前返回 `400 request_too_large`，错误信息包含当前请求的上限字节数。zstd
 回溯窗口独立固定为最多 64 MiB，不能满足该限制的帧按解码失败处理。这个限制保护入站解压资源，不是
-模型上下文或 Token 上限；未压缩正文不受此长度限制。
+模型上下文或 Token 上限；未压缩正文不经过此解压检查。插件受管出站仍受同一设置约束，
+见[请求解压上限](#请求解压上限)。
 不支持的编码、逗号分隔的叠加编码和重复 `Content-Encoding` 头返回
 `400 unsupported_content_encoding`；压缩正文损坏、截断或解压后不是合法 JSON 返回
 `400 invalid_json`。本地错误不包含原始正文或解压库细节。WebSocket 文本帧不经过这条解压路径
@@ -809,8 +810,9 @@ OpenAI 主动额度刷新和正常响应携带的明确套餐会同步到账号�
 
 `outboundProxyId` 绑定已保存的代理，不要求出口测试成功；省略或 `null` 保留当前绑定，空字符串清除绑定。
 `outboundProxyUrl` 兼容 HTTP、HTTPS、SOCKS5、SOCKS5H 代理 URL，可带用户名和密码；不能与 ID 同时设置。
-编辑时省略或 `null` 表示保持原配置，空字符串表示清除代理并直连。列表和详情只返回
-不含认证信息的 `outboundProxyEndpoint`（直连时为 `null`）；只有显式敏感导出包含完整 URL。
+编辑时省略或 `null` 表示保持原配置，空字符串表示清除代理并直连。列表和详情返回绑定的
+`outboundProxyId`（未绑定时为 `null`，禁用代理仍保留 ID）和不含认证信息的 `outboundProxyEndpoint`
+（未配置时为 `null`）；只有显式敏感导出包含完整 URL。
 指定代理后，推理、OAuth 服务端交换/刷新及账号辅助请求使用同一出口；代理失败不会退回直连。
 浏览器打开的第三方 OAuth 授权页仍使用浏览器自身网络。
 账号出口与连接隔离见 [架构说明](architecture.md#账号出站代理)
@@ -1672,10 +1674,15 @@ Guardian 以 `subagent_kind` 或 `client_metadata.x-openai-subagent` 值 `guardi
 
 ### 请求解压上限
 
-`responsesMaxDecompressedBodyBytes` 是压缩 Responses HTTP 请求的解压输出上限，单位字节，默认
-67108864（64 MiB）。必须为正整数，且可表示为进程平台的 `isize`；管理端以整数 MiB 编辑。
-保存并发布成功后，新请求使用新值；已鉴权请求沿用原快照，无需重启。调高上限会增加大请求的内存占用，
-它不代表整个进程的内存预算
+`responsesMaxDecompressedBodyBytes` 限制压缩 Responses HTTP 请求的解压输出，以及插件受管 HTTP
+的实际出站正文（包括账号上游请求，无论是否压缩），单位字节，默认 67108864（64 MiB）。
+必须为正整数，且可表示为进程平台的 `isize`；管理端以整数 MiB 编辑。
+插件模型调用从同一设置派生内部请求编码预算，具体边界见 [SDK 模型请求](../backend/crates/gateway-plugin/sdk/docs/capabilities.md#key模型与模型调用)
+
+保存并发布成功后，新请求使用新值；在途模型请求及其路由、调度、attempt 和重试回调沿用冻结预算。
+显式 Key 的模型调用沿用当前父调用内绑定的快照，父调用结束后重新绑定时使用新值；无模型请求上下文的
+受管 HTTP 调用读取当前发布值，无需重启插件。调小该值可能使插件上传或转发返回 413，且不发送出站请求。
+调高上限会增加大请求的内存占用，不代表扩大模型 Token 上限、响应缓冲或整个进程的内存预算
 
 ### 原生 Codex 公共地址
 
@@ -1916,6 +1923,11 @@ Desktop 三段 SemVer 门禁，也不会自动回写最低版本设置。门禁�
 ## 9. 备份
 
 全部备份端点位于 `/api/admin/settings/backups/*`，使用管理接口响应信封，字段为 camelCase，响应带 `Cache-Control: no-store`
+
+归档为 `.sql.gz` 业务备份，包含账号、Key、设置、插件、已用额度和已发布用量汇总，不包含请求明细与诊断/审计日志。
+汇总范围和离线恢复限制见 [备份内容与限制](../deploy/README.md#备份内容与限制)；没有在线恢复端点
+
+统计重建或时间桶尚未发布完成时，任务以 `backup.analytics_not_ready` 失败；统计就绪后重新创建备份
 
 | 方法 | 路由 | 请求 | 说明 |
 | --- | --- | --- | --- |

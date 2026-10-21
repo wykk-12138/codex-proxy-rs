@@ -28,6 +28,40 @@ fn elapsed_recovery_window_is_shared_without_waiting_for_real_time() {
 }
 
 #[test]
+fn same_account_retry_preserves_time_and_an_opening_for_rotation() {
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+    thread_local! {
+        static NOW: Cell<Instant> = Cell::new(Instant::now());
+    }
+    fn now() -> Instant {
+        NOW.get()
+    }
+    let request = ConnectionBudget::with_clock(now);
+    // 后台 WS 先占一次，HTTP 首次建连再占一次，模拟代理持续不响应
+    let background = request.clone();
+    assert_eq!(background.begin().unwrap(), Some(Duration::from_secs(30)));
+    NOW.set(now() + Duration::from_secs(1));
+    assert_eq!(request.begin().unwrap(), Some(Duration::from_secs(29)));
+    NOW.set(now() + Duration::from_secs(15));
+    assert_eq!(request.remaining_openings(), 2);
+    let retry = request.clone().reserve_next_opening();
+    assert_eq!(retry.begin().unwrap(), Some(Duration::from_secs(7)));
+    assert_eq!(request.remaining_openings(), 1);
+    assert!(retry.begin().is_err());
+    assert!(!request.exhausted());
+    NOW.set(now() + Duration::from_secs(7));
+    // 重选使用原预算，既不继承 A 的局部时间限制，也不能重置总次数
+    assert_eq!(request.begin().unwrap(), Some(Duration::from_secs(7)));
+    assert!(request.exhausted());
+    assert!(background.begin().is_err());
+    request.complete();
+    assert_eq!(retry.begin().unwrap(), None);
+}
+
+#[test]
 fn all_transports_share_one_opening_budget_but_other_requests_do_not() {
     let request = ConnectionBudget::default();
     let http = request.clone();

@@ -58,7 +58,7 @@ fn object_key_shape() {
     let key = build_object_key("production/backups", "backup_abc", at).unwrap();
     assert_eq!(
         key,
-        "production/backups/2026/08/01/codex-proxy-rs_20260801_123000_abc.dump"
+        "production/backups/2026/08/01/codex-proxy-rs_20260801_123000_abc.sql.gz"
     );
 }
 

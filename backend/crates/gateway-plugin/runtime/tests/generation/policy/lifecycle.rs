@@ -214,6 +214,8 @@ async fn nested_sdk_middleware_waits_beyond_budget_and_can_read_response_callbac
         .expect("host next must not consume either plugin's processing budget");
         let (_, status, _, mut body, _) = response.into_parts();
         assert_eq!(status, 200);
+        // 正文消费可晚于初始处理预算，惰性 body_read 仍须归属原资源流
+        tokio::time::sleep(Duration::from_millis(900)).await;
         // 正文改写还会发起新的 body_read，证明 callback 有效期也随暂停恢复
         let frame = body.next_frame().await.unwrap().unwrap();
         assert_eq!(

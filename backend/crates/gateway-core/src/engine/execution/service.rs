@@ -474,6 +474,12 @@ impl DefaultExecutionService {
                     account_group_ids.clone(),
                 )
                 .with_extension_scope(authorization.extension_scope.clone())
+                .with_request_body_limit(
+                    request
+                        .client
+                        .snapshot
+                        .responses_max_decompressed_body_bytes(),
+                )
                 .with_execution_effects(Arc::clone(&authorization.graph.as_ref()?.effects)),
             )
         });
@@ -1022,8 +1028,7 @@ impl DefaultExecutionService {
         let execution_effects_baseline = parent.graph.effects.epoch();
         metadata.endpoint = "host.model".to_owned();
         metadata.transport = ClientTransport::InternalPlugin;
-        metadata.client_ip = None;
-        metadata.user_agent = None;
+        metadata.inherit_request_origin(&extension_scope);
         let authorization = AuthorizedExecution {
             account_scope,
             response_control: None,
@@ -1176,8 +1181,7 @@ impl DefaultExecutionService {
         let execution_effects_baseline = graph.effects.epoch();
         metadata.endpoint = "host.model".to_owned();
         metadata.transport = ClientTransport::InternalPlugin;
-        metadata.client_ip = None;
-        metadata.user_agent = None;
+        metadata.inherit_request_origin(&authority.extension_scope);
         self.client_api_key_usage
             .record_used(authority.client.policy.key_id());
         self.start_authorized(

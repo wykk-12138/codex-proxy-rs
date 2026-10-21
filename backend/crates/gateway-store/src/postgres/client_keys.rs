@@ -31,11 +31,10 @@ use gateway_core::{
     account::OpaqueProviderData,
     engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
     engine::execution::ClientApiKeyUsageSink,
-    lifecycle::CancellationToken,
     metering::Decimal,
     policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits},
     routing::{AccountGroupId, ProviderKind},
-    task::{DaemonTask, WorkerTaskError},
+    task::{DaemonTask, WorkerDaemonContext, WorkerTaskError},
 };
 use serde::Deserialize;
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
@@ -635,8 +634,9 @@ impl ClientApiKeyUsageSink for PgClientApiKeyUsageSink {
 }
 
 impl DaemonTask for PgClientApiKeyUsageWriter {
-    fn run(&self, cancellation: CancellationToken) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+    fn run(&self, context: WorkerDaemonContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
         Box::pin(async move {
+            let cancellation = context.cancellation();
             loop {
                 tokio::select! {
                     () = cancellation.cancelled() => {
@@ -658,6 +658,7 @@ impl DaemonTask for PgClientApiKeyUsageWriter {
                         "client API key last-used flush failed",
                     ));
                 }
+                context.succeeded();
             }
         })
     }

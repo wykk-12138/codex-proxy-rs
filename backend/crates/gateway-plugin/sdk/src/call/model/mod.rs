@@ -6,6 +6,15 @@ pub(in crate::call) mod codec;
 pub mod facts;
 pub use codec::{ExecutionEncodingError, MAX_EXECUTION_PAYLOAD_BYTES};
 
+/// 内部请求允许 JSON 字符串转义与元数据开销，出站正文仍按原始配置上限检查
+#[must_use]
+pub fn request_payload_limit(body_bytes: usize) -> usize {
+    body_bytes
+        .saturating_mul(2)
+        .saturating_add(64 * 1024)
+        .min(u32::MAX as usize)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
@@ -148,6 +157,12 @@ pub enum WirePayload {
         /// 一个完整 SSE 帧的原字节；存在时必须与解析后的 data 和元数据一致
         #[serde(default, skip_serializing_if = "Option::is_none")]
         raw_sse: Option<Vec<u8>>,
+    },
+    /// 完整 WebSocket 文本消息及可用的解析视图，原文独立放入二进制段
+    WebSocket {
+        event: Option<String>,
+        data: Option<serde_json::Value>,
+        message: Vec<u8>,
     },
     /// 注释、非 JSON data 等原生 SSE 表达，不能夹带第二个帧
     RawSse { frame: Vec<u8> },

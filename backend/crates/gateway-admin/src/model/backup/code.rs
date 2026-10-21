@@ -15,6 +15,8 @@ pub const STATE_CONFLICT: &str = "backup.state_conflict";
 pub const STORAGE_IDENTITY_LOCKED: &str = "backup.storage_identity_locked";
 /// `pg_dump` 非零退出或失败
 pub const PG_DUMP_FAILED: &str = "backup.pg_dump_failed";
+/// 用量汇总尚未完整发布
+pub const ANALYTICS_NOT_READY: &str = "backup.analytics_not_ready";
 /// 暂存磁盘空间不足
 pub const STAGING_SPACE_EXHAUSTED: &str = "backup.staging_space_exhausted";
 /// S3 认证失败
