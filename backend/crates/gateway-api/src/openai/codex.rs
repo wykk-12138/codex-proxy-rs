@@ -6,7 +6,7 @@ use axum::{
     extract::{OriginalUri, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse as _, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use gateway_core::{
     engine::{
@@ -30,9 +30,9 @@ use super::{
 };
 use crate::ApiState;
 
-pub(super) const RESPONSES_PATH: &str = "/codex/backend-api/codex/responses";
-pub(super) const MODELS_PATH: &str = "/codex/backend-api/codex/models";
-pub(super) const SEARCH_PATH: &str = "/codex/backend-api/codex/alpha/search";
+pub(super) const RESPONSES_PATH: &str = "/backend-api/codex/responses";
+pub(super) const MODELS_PATH: &str = "/backend-api/codex/models";
+pub(super) const SEARCH_PATH: &str = "/backend-api/codex/alpha/search";
 
 pub(super) fn responses_path(client: &AuthenticatedClient) -> &'static str {
     match client.authentication_purpose() {
@@ -50,7 +50,7 @@ enum IdentityProjection {
 pub(super) fn router() -> Router<ApiState> {
     let mut router = Router::new()
         .route(
-            "/auth/v1/user-auth-credential/whoami",
+            "/v1/user-auth-credential/whoami",
             get(identity).layer(Extension(IdentityProjection::Whoami)),
         )
         .route(
@@ -134,8 +134,21 @@ pub(super) fn router() -> Router<ApiState> {
     router
         .route_layer(axum::middleware::from_fn(reject_head))
         .layer(Extension(ClientAuthenticationPurpose::Codex))
-        // 原生子树明确拒绝未知 API，不能落入根路由的管理端 SPA
-        .fallback(|| async { StatusCode::NOT_FOUND })
+        // whoami 在根级 /v1 下，其余原生路径在 /backend-api 下；这些命名空间里的未知 API 必须
+        // 明确 404，不能落入根路由的管理端 SPA。旧基址 /auth 与已迁移的 /codex 前缀同样返回 404，
+        // 使配置错误的客户端得到明确失败，而不是 200 的 HTML 页面
+        .route("/v1/user-auth-credential", any(not_found))
+        .route("/v1/user-auth-credential/{*path}", any(not_found))
+        .route("/auth", any(not_found))
+        .route("/auth/{*path}", any(not_found))
+        .route("/backend-api", any(not_found))
+        .route("/backend-api/{*path}", any(not_found))
+        .route("/codex", any(not_found))
+        .route("/codex/{*path}", any(not_found))
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 // axum 的 GET 默认同时接受 HEAD；原生路由只开放合同列出的准确方法

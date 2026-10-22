@@ -450,7 +450,7 @@ fn native_model_attempts_keep_required_account_and_never_use_diagnostics() {
                 operation: start_operation(),
                 metadata: ExecutionRequestMetadata {
                     protocol: "openai".into(),
-                    endpoint: "/codex/backend-api/codex/responses".into(),
+                    endpoint: "/backend-api/codex/responses".into(),
                     transport: ClientTransport::WebSocket,
                     stream: true,
                     client_ip: None,
@@ -681,7 +681,7 @@ fn continuation_from_another_account_is_rejected_before_admission() {
                 operation: start_operation(),
                 metadata: ExecutionRequestMetadata {
                     protocol: "openai".into(),
-                    endpoint: "/codex/backend-api/codex/responses".into(),
+                    endpoint: "/backend-api/codex/responses".into(),
                     transport: ClientTransport::WebSocket,
                     stream: true,
                     client_ip: None,
@@ -705,7 +705,7 @@ async fn start_in_flight_model(
             operation: start_operation(),
             metadata: ExecutionRequestMetadata {
                 protocol: "openai".into(),
-                endpoint: "/codex/backend-api/codex/responses".into(),
+                endpoint: "/backend-api/codex/responses".into(),
                 transport: ClientTransport::HttpSse,
                 stream: true,
                 client_ip: None,

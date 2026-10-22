@@ -38,7 +38,8 @@ pub(crate) fn router() -> Router<ApiState> {
         .route(MODEL_DETAIL_PATH, get(model_detail))
         .merge(usage::router())
         .merge(live::router())
-        .nest("/codex", super::codex::router())
+        // 原生入口直接挂在根级 /auth 与 /backend-api，与官方 Codex 客户端的基址一致
+        .merge(super::codex::router())
         // OpenAI 数据面正文属于客户端/上游协议；代理不能用私有大小上限提前拒绝
         // 上游本可接受的未来 payload
         .layer(DefaultBodyLimit::disable())

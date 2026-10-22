@@ -36,7 +36,10 @@ use gateway_core::{
     },
     error::ProviderError,
     operation::OperationKind,
-    policy::{ClientApiKeyId, ClientPolicy, CodexAccessBinding, PlaintextClientApiKey, RateLimits},
+    policy::{
+        ClientApiKeyId, ClientPolicy, CodexAccessBinding, CodexAccessMode, PlaintextClientApiKey,
+        RateLimits,
+    },
     routing::{
         ClientRoutingScope, ConfigRevision, FrozenAccountScope, ModelCapabilities,
         ProviderCatalogGeneration, ProviderKind, ProviderModel, ProviderModelCapabilities,
@@ -96,7 +99,7 @@ impl CodexGateway for Gateway {
         context: &'a CodexAuthorizedContext,
     ) -> BoxFuture<'a, Result<CodexIdentity, ProviderError>> {
         Box::pin(async move {
-            assert_eq!(context.account_id().as_str(), "acct_native");
+            assert_eq!(context.entry_account_id().as_str(), "acct_native");
             self.identity_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CodexIdentity {
                 user_id: "user-real".into(),
@@ -113,7 +116,7 @@ impl CodexGateway for Gateway {
         request: CodexAuxiliaryRequest,
     ) -> BoxFuture<'a, Result<MiddlewareResponse, ProviderError>> {
         Box::pin(async move {
-            assert_eq!(context.account_id().as_str(), "acct_native");
+            assert_eq!(context.entry_account_id().as_str(), "acct_native");
             assert!(
                 !context
                     .account_scope()
@@ -314,6 +317,7 @@ fn snapshot(enabled: bool) -> RuntimeSnapshot {
             )
             .with_codex_access(Some(CodexAccessBinding {
                 enabled,
+                mode: CodexAccessMode::Fixed,
                 account_id: ProviderAccountId::new("acct_native").unwrap(),
             })),
         ],
@@ -362,7 +366,7 @@ async fn identity_exposes_only_real_bound_account_and_configured_origin() {
         .app
         .clone()
         .oneshot(
-            request(Method::GET, "/codex/auth/v1/user-auth-credential/whoami")
+            request(Method::GET, "/v1/user-auth-credential/whoami")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -379,7 +383,7 @@ async fn identity_exposes_only_real_bound_account_and_configured_origin() {
         .app
         .clone()
         .oneshot(
-            request(Method::GET, "/codex/backend-api/wham/accounts/check")
+            request(Method::GET, "/backend-api/wham/accounts/check")
                 .header("host", "attacker.test")
                 .header("x-forwarded-host", "attacker.test")
                 .body(Body::empty())
@@ -403,12 +407,12 @@ async fn auxiliary_preserves_bytes_query_multivalue_headers_and_upstream_errors(
     for (method, path, status) in [
         (
             Method::POST,
-            "/codex/backend-api/codex/alpha/notes/v2/append_to_file?cursor=%2f&cursor=+",
+            "/backend-api/codex/alpha/notes/v2/append_to_file?cursor=%2f&cursor=+",
             StatusCode::CREATED,
         ),
         (
             Method::GET,
-            "/codex/backend-api/wham/config/bundle?cursor=%2f&cursor=+",
+            "/backend-api/wham/config/bundle?cursor=%2f&cursor=+",
             StatusCode::NOT_FOUND,
         ),
     ] {
@@ -538,7 +542,7 @@ async fn all_auxiliary_routes_select_only_the_declared_operation_and_method() {
             CodexAuxiliaryOperation::NotesWriteFile,
         ),
     ] {
-        let path = format!("/codex/backend-api/codex/alpha/{path}");
+        let path = format!("/backend-api/codex/alpha/{path}");
         let response = fixture
             .app
             .clone()
@@ -577,7 +581,7 @@ async fn all_auxiliary_routes_select_only_the_declared_operation_and_method() {
         ),
         ("config/bundle", CodexAuxiliaryOperation::ConfigBundle),
     ] {
-        let path = format!("/codex/backend-api/wham/{path}");
+        let path = format!("/backend-api/wham/{path}");
         let response = fixture
             .app
             .clone()
@@ -616,12 +620,17 @@ async fn all_auxiliary_routes_select_only_the_declared_operation_and_method() {
         }
     }
     for path in [
+        "/auth",
+        "/auth/unknown",
+        "/v1/user-auth-credential",
+        "/v1/user-auth-credential/unknown",
+        "/backend-api",
+        "/backend-api/connectors",
+        "/backend-api/codex/alpha/history/v2/delete",
+        // 迁移前的原生前缀不能落到管理端 SPA
         "/codex",
-        "/codex/",
-        "/codex/unknown",
-        "/codex/backend-api/connectors",
-        "/codex/backend-api/codex/alpha/history/v2/delete",
-        "/codex/v1/usage",
+        "/codex/backend-api/codex/models",
+        "/codex/v1/user-auth-credential/whoami",
     ] {
         let response = fixture
             .app
@@ -643,7 +652,7 @@ async fn model_catalog_uses_native_scope_and_client_version_and_disabled_binding
         .oneshot(
             request(
                 Method::GET,
-                "/codex/backend-api/codex/models?client_version=0.163.0-alpha.10.2",
+                "/backend-api/codex/models?client_version=0.163.0-alpha.10.2",
             )
             .body(Body::empty())
             .unwrap(),
@@ -663,13 +672,13 @@ async fn model_catalog_uses_native_scope_and_client_version_and_disabled_binding
     );
     fixture.snapshots.publish(snapshot(false));
     for (method, path) in [
-        (Method::GET, "/codex/backend-api/codex/models"),
-        (Method::GET, "/codex/auth/v1/user-auth-credential/whoami"),
-        (Method::POST, "/codex/backend-api/codex/responses"),
-        (Method::POST, "/codex/backend-api/codex/alpha/search"),
+        (Method::GET, "/backend-api/codex/models"),
+        (Method::GET, "/v1/user-auth-credential/whoami"),
+        (Method::POST, "/backend-api/codex/responses"),
+        (Method::POST, "/backend-api/codex/alpha/search"),
         (
             Method::POST,
-            "/codex/backend-api/codex/alpha/history/v2/read_item",
+            "/backend-api/codex/alpha/history/v2/read_item",
         ),
     ] {
         let response = fixture
@@ -758,7 +767,7 @@ async fn native_http_sse_and_search_reuse_model_execution_and_wire_adapters() {
             .app
             .clone()
             .oneshot(
-                request(Method::POST, "/codex/backend-api/codex/responses")
+                request(Method::POST, "/backend-api/codex/responses")
                     .header("content-type", "application/json")
                     .header("thread-id", "native-thread")
                     .body(Body::from(
@@ -788,7 +797,7 @@ async fn native_http_sse_and_search_reuse_model_execution_and_wire_adapters() {
         .app
         .clone()
         .oneshot(
-            request(Method::POST, "/codex/backend-api/codex/alpha/search")
+            request(Method::POST, "/backend-api/codex/alpha/search")
                 .header("content-type", "application/json")
                 .body(Body::from(raw.clone()))
                 .unwrap(),
@@ -829,7 +838,7 @@ async fn native_websocket_reauthenticates_binding_on_next_response_create() {
     let address = listener.local_addr().unwrap();
     let app = fixture.app;
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut opening = format!("ws://{address}/codex/backend-api/codex/responses")
+    let mut opening = format!("ws://{address}/backend-api/codex/responses")
         .into_client_request()
         .unwrap();
     opening
@@ -887,7 +896,7 @@ async fn dropping_auxiliary_http_response_releases_the_primed_body_lease() {
         .oneshot(
             request(
                 Method::POST,
-                "/codex/backend-api/codex/alpha/history/v2/read_item",
+                "/backend-api/codex/alpha/history/v2/read_item",
             )
             .body(Body::empty())
             .unwrap(),
@@ -904,7 +913,7 @@ async fn dropping_auxiliary_http_response_releases_the_primed_body_lease() {
 async fn native_missing_and_invalid_keys_never_reach_provider() {
     let fixture = fixture().await;
     for authorization in [None, Some("Bearer sk_invalid")] {
-        let mut request = Request::get("/codex/auth/v1/user-auth-credential/whoami");
+        let mut request = Request::get("/v1/user-auth-credential/whoami");
         if let Some(authorization) = authorization {
             request = request.header("authorization", authorization);
         }
