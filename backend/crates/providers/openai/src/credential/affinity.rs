@@ -137,6 +137,22 @@ pub(crate) fn derive_codex_session_affinity(
     .map(|affinity| affinity.with_follow_only(request.client_account_follow_only))
 }
 
+/// session_pool 的会话键与软亲和共用同一不可逆派生
+///
+/// 模型请求与辅助请求必须命中同一键；follow_only 由持久归属单独表达，不叠加软亲和语义
+pub(crate) fn derive_pool_session_affinity(
+    session_id: &str,
+    client_api_key_id: &ClientApiKeyId,
+) -> Option<CodexSessionAffinity> {
+    let session_id = non_empty(Some(session_id))?;
+    session_affinity(
+        "root-session",
+        session_id.to_owned(),
+        Some(session_id.to_owned()),
+        client_api_key_id,
+    )
+}
+
 /// 原生 JSON 端点与 Responses 共用绑定命名空间，Search id 是逻辑会话身份
 pub(crate) fn derive_codex_endpoint_session_affinity(
     payload: &RawJsonPayload,

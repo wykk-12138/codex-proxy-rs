@@ -1,8 +1,8 @@
 //! 按能力提供 Provider 所需的存储端口
 
 use super::{
-    OAuthPendingFlowPort, ProviderArtifactProfileCachePort, ProviderCatalogCachePort,
-    ProviderCooldownPort, ProviderCredentialStatePort, ProviderLeasePort,
+    CodexSessionOwnershipPort, OAuthPendingFlowPort, ProviderArtifactProfileCachePort,
+    ProviderCatalogCachePort, ProviderCooldownPort, ProviderCredentialStatePort, ProviderLeasePort,
     ProviderRuntimePolicyPort, ProviderSessionAffinityPort, ProviderSessionExclusionPort,
 };
 use crate::account::{AccountFeedbackStats, ProviderAccountStore};
@@ -22,6 +22,8 @@ pub struct ProviderStorePorts {
     cooldowns: Arc<dyn ProviderCooldownPort>,
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
     oauth_pending: Arc<dyn OAuthPendingFlowPort>,
+    /// session_pool 的会话归属；未装配时该模式如实失败，fixed 不受影响
+    codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
     diagnostics: Arc<dyn crate::diagnostics::OperationalDiagnostics>,
 }
 
@@ -54,8 +56,21 @@ impl ProviderStorePorts {
             cooldowns,
             runtime_policy,
             oauth_pending,
+            codex_sessions: None,
             diagnostics,
         }
+    }
+
+    /// 装配会话归属端口；由组装根在持久存储就绪后注入
+    #[must_use]
+    pub fn with_codex_sessions(mut self, sessions: Arc<dyn CodexSessionOwnershipPort>) -> Self {
+        self.codex_sessions = Some(sessions);
+        self
+    }
+
+    #[must_use]
+    pub fn codex_sessions(&self) -> Option<Arc<dyn CodexSessionOwnershipPort>> {
+        self.codex_sessions.clone()
     }
 
     #[must_use]

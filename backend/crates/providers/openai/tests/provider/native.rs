@@ -29,7 +29,10 @@ use gateway_core::{
         provider::{Provider, ProviderRegistry},
     },
     error::StoreError,
-    policy::{ClientApiKeyId, ClientPolicy, CodexAccessBinding, PlaintextClientApiKey, RateLimits},
+    policy::{
+        ClientApiKeyId, ClientPolicy, CodexAccessBinding, CodexAccessMode, PlaintextClientApiKey,
+        RateLimits,
+    },
     routing::{
         ClientRoutingScope, ConfigRevision, FrozenAccountScope, ProviderKind, RuntimeAccount,
         RuntimeAccountDirectory, RuntimeSnapshot,
@@ -53,12 +56,19 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use crate::support::{MemoryAccountStore, profile, secret};
+use crate::support::{MemoryAccountStore, MemoryCodexSessions, profile, secret};
 
 const ACCOUNT: &str = "acct_native_bound";
 
 pub(crate) fn native_service(
     provider: Arc<dyn Provider>,
+) -> (DefaultExecutionService, Arc<NativeAdmissions>) {
+    native_service_with_mode(provider, CodexAccessMode::Fixed)
+}
+
+pub(crate) fn native_service_with_mode(
+    provider: Arc<dyn Provider>,
+    mode: CodexAccessMode,
 ) -> (DefaultExecutionService, Arc<NativeAdmissions>) {
     let provider_kind = ProviderKind::new("openai").unwrap();
     let account_id = ProviderAccountId::new(ACCOUNT).unwrap();
@@ -87,6 +97,7 @@ pub(crate) fn native_service(
     )
     .with_codex_access(Some(CodexAccessBinding {
         enabled: true,
+        mode,
         account_id,
     }));
     let snapshot = RuntimeSnapshot::new(
@@ -127,6 +138,16 @@ pub(crate) async fn prepare(service: &DefaultExecutionService) -> PreparedRootEx
 }
 
 async fn seed(store: &Arc<MemoryAccountStore>, id: &str, enabled: bool, fedramp: bool) {
+    seed_workspace(store, id, enabled, fedramp, "workspace_native").await;
+}
+
+async fn seed_workspace(
+    store: &Arc<MemoryAccountStore>,
+    id: &str,
+    enabled: bool,
+    fedramp: bool,
+    workspace: &str,
+) {
     let jwt = format!(
         "header.{}.signature",
         URL_SAFE_NO_PAD.encode(
@@ -136,7 +157,7 @@ async fn seed(store: &Arc<MemoryAccountStore>, id: &str, enabled: bool, fedramp:
             .unwrap()
         )
     );
-    let mut account = profile("workspace_native");
+    let mut account = profile(workspace);
     account.chatgpt_user_id = "user_native".to_owned();
     account.plan_type = Some("plus".to_owned());
     store
@@ -736,4 +757,168 @@ async fn cancelling_before_headers_closes_the_pending_auxiliary_request() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// 辅助请求与模型请求共用同一派生：用观测哈希取得池会话键
+fn auxiliary_session_key(
+    provider: &provider_openai::CodexProvider,
+    session: &str,
+) -> gateway_core::provider_ports::ProviderSessionAffinityKey {
+    use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload};
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"hello","session_id":session})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap(),
+    ));
+    let observation =
+        provider.request_observation(&operation, &ClientApiKeyId::new("key_native_test").unwrap());
+    gateway_core::provider_ports::ProviderSessionAffinityKey::try_new(
+        observation
+            .continuation
+            .affinity_hash
+            .expect("session affinity hash"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pool_session_auxiliary_claims_then_reuses_owner() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/read_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"notes".to_vec()))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions(
+        &store,
+        sessions.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    for _ in 0..2 {
+        let response = service
+            .codex_auxiliary(
+                prepare(&service).await,
+                request(CodexAuxiliaryOperation::NotesReadFile),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = read_response(response).await;
+        assert_eq!((status, body.as_slice()), (200, b"notes".as_slice()));
+    }
+    let claims = sessions.claims();
+    assert_eq!(claims.len(), 1, "同会话第二次辅助请求只复用归属");
+    assert_eq!(claims[0].account_id.as_str(), ACCOUNT);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.headers["chatgpt-account-id"], "workspace_native");
+    }
+}
+
+#[tokio::test]
+async fn pool_account_level_auxiliary_keeps_entry_account_without_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/bundle"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bundle".to_vec()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/read_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"notes".to_vec()))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    seed_workspace(
+        &store,
+        "acct_native_other",
+        true,
+        false,
+        "workspace_native_other",
+    )
+    .await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions(
+        &store,
+        sessions.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    // 该会话已归属另一个账号；账号级辅助仍描述入口账号，也不改写归属
+    sessions.seed_owner(
+        &ClientApiKeyId::new("key_native_test").unwrap(),
+        &auxiliary_session_key(&provider, "session-native"),
+        ProviderAccountId::new("acct_native_other").unwrap(),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::ConfigBundle),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = read_response(response).await;
+    assert_eq!((status, body.as_slice()), (200, b"bundle".as_slice()));
+    assert!(sessions.claims().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"],
+        "workspace_native"
+    );
+
+    // 同一 Key、同一会话的 history/notes 走归属账号，与上面的账号级辅助形成对照
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::NotesReadFile),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = read_response(response).await;
+    assert_eq!((status, body.as_slice()), (200, b"notes".as_slice()));
+    assert!(
+        sessions.claims().is_empty(),
+        "既有归属不需要为辅助请求重新认领"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].headers["chatgpt-account-id"],
+        "workspace_native_other"
+    );
+}
+
+#[tokio::test]
+async fn pool_auxiliary_without_session_identity_fails_before_send() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions(
+        &store,
+        sessions.clone(),
+        server.uri(),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let mut request = request(CodexAuxiliaryOperation::NotesReadFile);
+    request.body = Bytes::from_static(br#"{"opaque":"encrypted"}"#);
+    assert!(
+        service
+            .codex_auxiliary(prepare(&service).await, request)
+            .await
+            .is_err()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(sessions.claims().is_empty());
 }

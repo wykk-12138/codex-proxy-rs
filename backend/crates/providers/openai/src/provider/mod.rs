@@ -46,6 +46,8 @@ use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use gateway_protocol::openai::events::{
     ParsedRateLimits, parse_rate_limit_headers, rate_limits_to_header_pairs,
 };
+// 池会话身份在协议层判定，与 transport 的同名 CodexSessionIdentity 必须别名区分
+use gateway_protocol::openai::CodexSessionIdentity as PoolSessionIdentity;
 use reqwest::{Client, header::HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -62,9 +64,11 @@ use crate::credential::{
     derive_codex_cyber_policy_session_key, derive_codex_endpoint_session_affinity,
     derive_codex_session_affinity, derive_codex_transport_key,
     derive_endpoint_affinity_with_headers, derive_live_session_affinity,
-    derive_previous_response_id_hash, derive_turn_alias,
+    derive_pool_session_affinity, derive_previous_response_id_hash, derive_turn_alias,
 };
-use crate::request_identity::{account_session_with_headers, turn_id_with_headers};
+use crate::request_identity::{
+    account_session_with_headers, pool_session_identity, turn_id_with_headers,
+};
 use crate::session_transport::CodexSessionTransportRecovery;
 use crate::transport::canonical::{
     CodexCanonicalDecoder, CodexCanonicalError, CodexCanonicalOutcome,
@@ -266,6 +270,25 @@ impl CodexProvider {
             continuation_requested,
             session_affinity,
             cyber_policy_session_key,
+        }
+    }
+
+    /// session_pool 必须得到唯一逻辑会话；缺失或来源冲突在选号前明确拒绝
+    fn pool_session_affinity(
+        &self,
+        context: &AttemptContext,
+        body: &Map<String, Value>,
+        request_context: &Map<String, Value>,
+        headers: &[MiddlewareHeader],
+        endpoint_session: Option<&str>,
+    ) -> Result<CodexSessionAffinity, ProviderError> {
+        match pool_session_identity(body, request_context, headers, endpoint_session) {
+            PoolSessionIdentity::Resolved(session_id) => {
+                derive_pool_session_affinity(&session_id, context.client_api_key_ref())
+                    .ok_or_else(|| pool_session_error("session_key_invalid"))
+            }
+            PoolSessionIdentity::Missing => Err(pool_session_error("session_key_missing")),
+            PoolSessionIdentity::Conflict => Err(pool_session_error("session_key_conflict")),
         }
     }
 
@@ -641,11 +664,25 @@ impl Provider for CodexProvider {
         let guardian = upstream
             .as_ref()
             .is_some_and(CodexResponsesRequest::is_guardian);
-        let preselection = upstream
+        let mut preselection = upstream
             .filter(|_| adapter.is_none())
             .map(|upstream| self.prepare_generate_request(generate, upstream, &context));
         if let Some(prepared) = preselection.as_ref() {
             prepared.checked_native_continuation_scope(&context)?;
+        }
+        if context.codex_session_pool() {
+            // session_pool：模型与 history/notes 必须得到同一逻辑会话；
+            // 缺失或来源冲突不进入选号，也不退回入口账号
+            let Some(prepared) = preselection.as_mut() else {
+                return Err(pool_session_error("unsupported_protocol"));
+            };
+            prepared.session_affinity = Some(self.pool_session_affinity(
+                &context,
+                generate.protocol_payload().body(),
+                generate.protocol_payload().context(),
+                &[],
+                None,
+            )?);
         }
         let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
             preselection.map_or((None, None, false), |prepared| {
@@ -789,8 +826,25 @@ impl CodexProvider {
             derive_codex_transport_key(&upstream_request, context.client_api_key_ref());
         let previous_session = processed.previous_session;
         let continuation_requested = processed.continuation_requested;
-        let session_affinity = processed.session_affinity;
+        let mut session_affinity = processed.session_affinity;
         let cyber_policy_session_key = processed.cyber_policy_session_key;
+        // session_pool：中间件改写正文或头部后必须仍是同一会话，
+        // 已认领账号不能被扩到别的会话，也不能在此重新认领
+        if context.codex_session_pool() {
+            let affinity = self.pool_session_affinity(
+                &context,
+                generate.protocol_payload().body(),
+                generate.protocol_payload().context(),
+                &middleware_headers,
+                None,
+            )?;
+            if lease.admitted_session() != Some(affinity.key()) {
+                return Err(pool_session_error("session_changed"));
+            }
+            // 认领与后续复验必须同键：validate_translated_selection 与 remember_turn
+            // 只能用池亲和，不能回退到 codex_account_session_id 派生的 transport 亲和
+            session_affinity = Some(affinity);
+        }
         if !context.is_diagnostic_required_account() {
             self.selector
                 .validate_translated_selection(

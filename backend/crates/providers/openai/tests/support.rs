@@ -19,6 +19,7 @@ use gateway_core::account::{
 use gateway_core::error::{StoreError, StoreErrorKind};
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
+    CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort,
     ProviderCatalogCacheKey, ProviderCatalogCachePort, ProviderCooldown, ProviderCooldownPort,
     ProviderCooldownScope, ProviderFreezePolicy, ProviderLeaseAcquisition, ProviderLeasePort,
     ProviderLeaseRequest, ProviderRefreshPolicy, ProviderRuntimePolicyPort,
@@ -948,6 +949,114 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
                 self.alias_ttls.lock().unwrap().push(ttl);
             }
             Ok(applied)
+        })
+    }
+}
+
+/// 池会话归属的内存替身：表内归属按 (Key, 会话键) 保存，并记录每次认领
+///
+/// 只用于验证 Provider 的认领时机与归属复用；并发赢家与凭据版本变化用一次性故障注入模拟
+#[derive(Default)]
+pub(crate) struct MemoryCodexSessions {
+    owners: Mutex<BTreeMap<(String, String), ProviderAccountId>>,
+    claims: Mutex<Vec<CodexSessionClaim>>,
+    conflict_with: Mutex<Option<ProviderAccountId>>,
+    identity_changed: AtomicBool,
+}
+
+impl MemoryCodexSessions {
+    pub(crate) fn seed_owner(
+        &self,
+        key_id: &ClientApiKeyId,
+        session_key: &ProviderSessionAffinityKey,
+        account: ProviderAccountId,
+    ) {
+        self.owners.lock().expect("session owner lock").insert(
+            (
+                key_id.as_str().to_owned(),
+                session_key.expose_to_store().to_owned(),
+            ),
+            account,
+        );
+    }
+
+    pub(crate) fn owner_of(
+        &self,
+        key_id: &ClientApiKeyId,
+        session_key: &ProviderSessionAffinityKey,
+    ) -> Option<ProviderAccountId> {
+        self.owners
+            .lock()
+            .expect("session owner lock")
+            .get(&(
+                key_id.as_str().to_owned(),
+                session_key.expose_to_store().to_owned(),
+            ))
+            .cloned()
+    }
+
+    pub(crate) fn claims(&self) -> Vec<CodexSessionClaim> {
+        self.claims.lock().expect("session claim lock").clone()
+    }
+
+    /// 下一次认领报告已有并发赢家，并补写赢家的归属行
+    pub(crate) fn conflict_with(&self, owner: ProviderAccountId) {
+        *self.conflict_with.lock().expect("session claim lock") = Some(owner);
+    }
+
+    /// 后续认领都报告凭据版本已变化，模拟账号行锁内发现身份替换
+    pub(crate) fn identity_changed(&self) {
+        self.identity_changed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl CodexSessionOwnershipPort for MemoryCodexSessions {
+    fn load<'a>(
+        &'a self,
+        key_id: &'a ClientApiKeyId,
+        session_key: &'a ProviderSessionAffinityKey,
+    ) -> BoxFuture<'a, Result<Option<ProviderAccountId>, ProviderStoreError>> {
+        Box::pin(async move { Ok(self.owner_of(key_id, session_key)) })
+    }
+
+    fn claim<'a>(
+        &'a self,
+        claim: &'a CodexSessionClaim,
+    ) -> BoxFuture<'a, Result<CodexSessionClaimOutcome, ProviderStoreError>> {
+        Box::pin(async move {
+            self.claims
+                .lock()
+                .expect("session claim lock")
+                .push(claim.clone());
+            if self.identity_changed.load(Ordering::SeqCst) {
+                return Ok(CodexSessionClaimOutcome::IdentityChanged);
+            }
+            let key = (
+                claim.key_id.as_str().to_owned(),
+                claim.session_key.expose_to_store().to_owned(),
+            );
+            if let Some(owner) = self
+                .conflict_with
+                .lock()
+                .expect("session claim lock")
+                .take()
+            {
+                // 并发赢家已在同一事务写入归属行，本次认领只读取真实 owner
+                self.owners
+                    .lock()
+                    .expect("session owner lock")
+                    .insert(key, owner.clone());
+                return Ok(CodexSessionClaimOutcome::ConflictingOwner(owner));
+            }
+            let mut owners = self.owners.lock().expect("session owner lock");
+            match owners.get(&key) {
+                Some(owner) if owner == &claim.account_id => Ok(CodexSessionClaimOutcome::Owned),
+                Some(owner) => Ok(CodexSessionClaimOutcome::ConflictingOwner(owner.clone())),
+                None => {
+                    owners.insert(key, claim.account_id.clone());
+                    Ok(CodexSessionClaimOutcome::Owned)
+                }
+            }
         })
     }
 }

@@ -317,7 +317,8 @@ impl NewClientApiKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientApiKeyDetails {
-    pub codex_access: Option<gateway_core::policy::CodexAccessBinding>,
+    /// 省略 mode 表示保留既有模式，旧客户端更新不会被误解为切回 fixed
+    pub codex_access: Option<gateway_core::policy::CodexAccessUpdate>,
     pub request_profile_override_updates: BTreeMap<ProviderKind, Option<OpaqueProviderData>>,
     pub id: String,
     pub name: String,
@@ -385,7 +386,9 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         let mut statement = QueryBuilder::<Postgres>::new(
             "select k.id, k.name, k.label,
                     (select account_id from client_api_key_codex_bindings where key_id = k.id) as codex_account_id,
-                    (select enabled from client_api_key_codex_bindings where key_id = k.id) as codex_enabled, k.provider_request_profiles_json as request_profile_overrides,
+                    (select enabled from client_api_key_codex_bindings where key_id = k.id) as codex_enabled,
+                    (select mode from client_api_key_codex_bindings where key_id = k.id) as codex_mode,
+                    k.provider_request_profiles_json as request_profile_overrides,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, '[]'::jsonb as groups, '{}'::text[] as provider_kinds
@@ -447,7 +450,9 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         let record = sqlx::query(
             "select k.id, k.name, k.label,
                     (select account_id from client_api_key_codex_bindings where key_id = k.id) as codex_account_id,
-                    (select enabled from client_api_key_codex_bindings where key_id = k.id) as codex_enabled, k.provider_request_profiles_json as request_profile_overrides,
+                    (select enabled from client_api_key_codex_bindings where key_id = k.id) as codex_enabled,
+                    (select mode from client_api_key_codex_bindings where key_id = k.id) as codex_mode,
+                    k.provider_request_profiles_json as request_profile_overrides,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
                     k.updated_at, coalesce(groups.groups, '[]'::jsonb) as groups,
@@ -1192,7 +1197,14 @@ pub(crate) async fn insert_client_api_key_in_transaction(
         }
     })?;
     replace_client_api_key_groups_in_transaction(transaction, &key.id, &key.group_ids).await?;
-    write_codex_binding(transaction, &key.id, key.codex_access.as_ref()).await?;
+    write_codex_binding(
+        transaction,
+        &key.id,
+        key.codex_access
+            .as_ref()
+            .map(|binding| (&binding.account_id, binding.enabled, Some(binding.mode))),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1243,7 +1255,14 @@ pub(crate) async fn update_client_api_key_in_transaction(
     .map_err(|source| postgres_unavailable("update client API key in transaction", source))?;
     require_changed(result.rows_affected(), &key.id)?;
     replace_client_api_key_groups_in_transaction(transaction, &key.id, &key.group_ids).await?;
-    write_codex_binding(transaction, &key.id, key.codex_access.as_ref()).await
+    write_codex_binding(
+        transaction,
+        &key.id,
+        key.codex_access
+            .as_ref()
+            .map(|binding| (&binding.account_id, binding.enabled, binding.mode)),
+    )
+    .await
 }
 
 async fn ensure_client_key_name_available(
@@ -1441,6 +1460,8 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
                     .map_err(|source| invalid("invalid Codex account").with_source(source))?,
                 row.try_get("codex_enabled")
                     .map_err(|source| invalid("invalid Codex access").with_source(source))?,
+                row.try_get("codex_mode")
+                    .map_err(|source| invalid("invalid Codex mode").with_source(source))?,
             )?,
             request_profile_overrides:
                 decode_request_profiles(
@@ -1703,57 +1724,72 @@ fn invalid(message: &str) -> StoreError {
 pub(super) fn decode_codex_binding(
     account_id: Option<String>,
     enabled: Option<bool>,
+    mode: Option<String>,
 ) -> StoreResult<Option<gateway_core::policy::CodexAccessBinding>> {
-    account_id
-        .map(|account_id| {
-            Ok(gateway_core::policy::CodexAccessBinding {
-                account_id: gateway_core::account::ProviderAccountId::new(account_id)
-                    .map_err(|source| invalid("invalid Codex account ID").with_source(source))?,
-                enabled: enabled.ok_or_else(|| invalid("missing Codex binding state"))?,
-            })
-        })
-        .transpose()
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    // 只有缺少 mode 列值的旧 shape 才按 fixed 解释；未知值不静默回退
+    let mode = match mode {
+        Some(mode) => gateway_core::policy::CodexAccessMode::parse(&mode)
+            .ok_or_else(|| invalid("invalid Codex access mode"))?,
+        None => gateway_core::policy::CodexAccessMode::Fixed,
+    };
+    Ok(Some(gateway_core::policy::CodexAccessBinding {
+        account_id: gateway_core::account::ProviderAccountId::new(account_id)
+            .map_err(|source| invalid("invalid Codex account ID").with_source(source))?,
+        enabled: enabled.ok_or_else(|| invalid("missing Codex binding state"))?,
+        mode,
+    }))
 }
 
 async fn write_codex_binding(
     transaction: &mut Transaction<'_, Postgres>,
     key_id: &str,
-    binding: Option<&gateway_core::policy::CodexAccessBinding>,
+    binding: Option<(
+        &gateway_core::account::ProviderAccountId,
+        bool,
+        Option<gateway_core::policy::CodexAccessMode>,
+    )>,
 ) -> StoreResult<()> {
-    let Some(binding) = binding else {
+    let Some((account_id, enabled, requested_mode)) = binding else {
         return Ok(());
     };
-    let current: Option<String> = sqlx::query_scalar(
-        "select account_id from client_api_key_codex_bindings where key_id = $1",
+    let current: Option<(String, String)> = sqlx::query_as(
+        "select account_id, mode from client_api_key_codex_bindings where key_id = $1",
     )
     .bind(key_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|source| postgres_unavailable("read Codex binding", source))?;
-    if current
-        .as_deref()
-        .is_some_and(|id| id != binding.account_id.as_str())
-    {
-        return Err(invalid(
-            "Codex account binding cannot be changed; create a new key",
-        ));
-    }
-    // 已有绑定只修改开关；账号范围失效由每次原生请求重新求交集处理
-    if current.is_some() {
+    if let Some((current_account, current_mode)) = current {
+        if current_account != account_id.as_str() {
+            return Err(invalid(
+                "Codex account binding cannot be changed; create a new key",
+            ));
+        }
+        // 模式与入口账号同样在建立后不可原地切换；省略 mode 保留既有模式
+        if requested_mode.is_some_and(|mode| mode.as_str() != current_mode) {
+            return Err(invalid(
+                "Codex access mode cannot be changed; create a new key",
+            ));
+        }
+        // 已有绑定只修改开关；账号范围失效由每次原生请求重新求交集处理
         sqlx::query("update client_api_key_codex_bindings set enabled = $2 where key_id = $1")
             .bind(key_id)
-            .bind(binding.enabled)
+            .bind(enabled)
             .execute(&mut **transaction)
             .await
             .map_err(|source| postgres_unavailable("update Codex binding state", source))?;
         return Ok(());
     }
+    let mode = requested_mode.unwrap_or_default();
     // 与凭据身份写入共用账号行锁，取得锁之后重新读取身份和分组范围
     let account: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
         "select provider_kind, authentication_kind, upstream_user_id, upstream_account_id
          from provider_accounts where id = $1 for update",
     )
-    .bind(binding.account_id.as_str())
+    .bind(account_id.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|source| postgres_unavailable("lock Codex binding account", source))?;
@@ -1773,7 +1809,7 @@ async fn write_codex_binding(
             where kg.client_api_key_id = $1 and ga.provider_account_id = $2)",
     )
     .bind(key_id)
-    .bind(binding.account_id.as_str())
+    .bind(account_id.as_str())
     .fetch_one(&mut **transaction)
     .await
     .map_err(|source| postgres_unavailable("validate Codex binding scope", source))?;
@@ -1781,12 +1817,13 @@ async fn write_codex_binding(
         return Err(invalid("Codex account is outside the key scope"));
     }
     sqlx::query(
-        "insert into client_api_key_codex_bindings (key_id, account_id, enabled)
-         values ($1, $2, $3)",
+        "insert into client_api_key_codex_bindings (key_id, account_id, enabled, mode)
+         values ($1, $2, $3, $4)",
     )
     .bind(key_id)
-    .bind(binding.account_id.as_str())
-    .bind(binding.enabled)
+    .bind(account_id.as_str())
+    .bind(enabled)
+    .bind(mode.as_str())
     .execute(&mut **transaction)
     .await
     .map_err(|source| postgres_unavailable("save Codex binding", source))?;

@@ -1,7 +1,8 @@
 //! 验证 Codex 会话身份优先级、轮次元数据与多代理模式解析
 
 use gateway_protocol::openai::{
-    codex_responses_request_semantics, codex_session_id, codex_thread_id,
+    CodexSessionIdentity, CodexSessionSources, codex_responses_request_semantics, codex_session_id,
+    codex_session_identity, codex_thread_id,
 };
 use serde_json::{Map, Value, json};
 
@@ -205,4 +206,214 @@ fn account_identity_does_not_infer_a_session_from_turn_or_cache_keys() {
     ] {
         assert_eq!(codex_account_session_id(&object(body), &Map::new()), None);
     }
+}
+
+fn session_sources<'a>(
+    body: &'a Map<String, Value>,
+    context: &'a Map<String, Value>,
+) -> CodexSessionSources<'a> {
+    CodexSessionSources {
+        body,
+        context,
+        turn_metadata: None,
+        session_id: None,
+        endpoint_session: None,
+    }
+}
+
+#[test]
+fn pool_session_identity_resolves_each_single_source() {
+    for (body, context, turn_metadata, session_id, endpoint, expected) in [
+        // 官方 history/notes 把会话放在正文 context
+        (
+            json!({"context":{"session_id":"body-context"}}),
+            json!({}),
+            None,
+            None,
+            None,
+            "body-context",
+        ),
+        // 官方 client_metadata.session_id
+        (
+            json!({"client_metadata":{"session_id":"metadata"}}),
+            json!({}),
+            None,
+            None,
+            None,
+            "metadata",
+        ),
+        // Search 的正文 id 属端点级逻辑会话
+        (
+            json!({"id":"endpoint"}),
+            json!({}),
+            None,
+            None,
+            Some("endpoint"),
+            "endpoint",
+        ),
+        // 请求头的 turn metadata 是逻辑来源
+        (
+            json!({}),
+            json!({}),
+            Some("{\"session_id\":\"header-turn\"}"),
+            None,
+            None,
+            "header-turn",
+        ),
+        // 没有逻辑声明时兜底到 session-id 请求头
+        (
+            json!({}),
+            json!({}),
+            None,
+            Some("header-session"),
+            None,
+            "header-session",
+        ),
+        // 再兜底到正文顶层 session_id
+        (
+            json!({"session_id":"body-session"}),
+            json!({}),
+            None,
+            None,
+            None,
+            "body-session",
+        ),
+    ] {
+        let body = object(body);
+        let context = object(context);
+        let sources = CodexSessionSources {
+            turn_metadata,
+            session_id,
+            endpoint_session: endpoint,
+            ..session_sources(&body, &context)
+        };
+        assert_eq!(
+            codex_session_identity(sources),
+            CodexSessionIdentity::Resolved(expected.to_owned()),
+            "会话来源应解析出 {expected}"
+        );
+    }
+}
+
+#[test]
+fn pool_session_identity_deduplicates_same_logical_declaration() {
+    // 模型请求常同时带 turn metadata 与 client_metadata，同值不算冲突
+    let body = object(json!({"client_metadata":{"session_id":"shared"}}));
+    let context = Map::new();
+    let sources = CodexSessionSources {
+        turn_metadata: Some("{\"session_id\":\"shared\"}"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("shared".to_owned())
+    );
+}
+
+#[test]
+fn pool_session_identity_prefers_logical_declaration_over_transport_fallback() {
+    let body = object(json!({"turnMetadata":"{\"session_id\":\"logical\"}","session_id":"body"}));
+    let context = Map::new();
+    let sources = CodexSessionSources {
+        session_id: Some("header"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("logical".to_owned()),
+        "逻辑声明与不同兜底值并存不算冲突"
+    );
+    // 没有逻辑声明时，兜底头先于正文顶层 session_id
+    let body = object(json!({"session_id":"body"}));
+    let sources = CodexSessionSources {
+        session_id: Some("header"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("header".to_owned())
+    );
+}
+
+#[test]
+fn pool_session_identity_reports_conflict_between_logical_declarations() {
+    for (body, context, turn_metadata, endpoint) in [
+        // client_metadata 与请求上下文 turn metadata 不同
+        (
+            json!({"client_metadata":{"session_id":"session-a"}}),
+            json!({"turn_metadata":"{\"session_id\":\"session-b\"}"}),
+            None,
+            None,
+        ),
+        // Search 的 id 与 turn metadata 不同
+        (
+            json!({"id":"session-a"}),
+            json!({}),
+            Some("{\"session_id\":\"session-b\"}"),
+            Some("session-a"),
+        ),
+    ] {
+        let body = object(body);
+        let context = object(context);
+        let sources = CodexSessionSources {
+            turn_metadata,
+            endpoint_session: endpoint,
+            ..session_sources(&body, &context)
+        };
+        assert_eq!(
+            codex_session_identity(sources),
+            CodexSessionIdentity::Conflict
+        );
+    }
+}
+
+#[test]
+fn pool_session_identity_reports_missing_without_any_declaration() {
+    let body = object(json!({"session_id":" ","client_metadata":{"thread_id":"child"}}));
+    let context = object(json!({"turn_metadata":"invalid JSON"}));
+    assert_eq!(
+        codex_session_identity(session_sources(&body, &context)),
+        CodexSessionIdentity::Missing
+    );
+    let sources = CodexSessionSources {
+        turn_metadata: Some("{\"session_id\":\" \"}"),
+        session_id: Some(" "),
+        endpoint_session: Some(" "),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Missing
+    );
+}
+
+#[test]
+fn pool_session_identity_reads_official_history_and_notes_body() {
+    // 官方 history/notes 请求体只把会话放在 context，带 current_agent_name 也不影响
+    for body in [
+        json!({"context":{"session_id":"thread-notes","current_agent_name":"child"},"opaque":"encrypted"}),
+        json!({"context":{"session_id":"thread-notes","current_agent_name":"child"},"commands":{"open":[]}}),
+    ] {
+        let body = object(body);
+        assert_eq!(
+            codex_session_identity(session_sources(&body, &Map::new())),
+            CodexSessionIdentity::Resolved("thread-notes".to_owned())
+        );
+        // 同样的正文与模型请求解析出同一会话标识
+        assert_eq!(
+            codex_session_id(&body, &Map::new()).as_deref(),
+            Some("thread-notes")
+        );
+    }
+    // 附带不同 session-id 头时按计划以传输兜底头为准，不当成第二个逻辑来源
+    let body = object(json!({"context":{"session_id":"thread-notes"}}));
+    let context = Map::new();
+    let sources = CodexSessionSources {
+        session_id: Some("cache-routing"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("cache-routing".to_owned())
+    );
 }

@@ -116,10 +116,48 @@ pub struct ClientSettings {
     pub limits: RateLimits,
 }
 
+/// Key 的原生访问范围；fixed 固定入口账号，session_pool 按逻辑会话从授权池认领
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexAccessMode {
+    /// 全部原生请求使用入口账号，保持既有合同
+    #[default]
+    Fixed,
+    /// 每个逻辑会话首次认领一个授权池账号并固定使用
+    SessionPool,
+}
+
+impl CodexAccessMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::SessionPool => "session_pool",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fixed" => Some(Self::Fixed),
+            "session_pool" => Some(Self::SessionPool),
+            _ => None,
+        }
+    }
+}
+
 /// Key 的持久 Codex 账号绑定；关闭入口不解除身份关系
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexAccessBinding {
     pub enabled: bool,
+    pub mode: CodexAccessMode,
+    pub account_id: crate::account::ProviderAccountId,
+}
+
+/// 更新请求的绑定输入；省略 `mode` 表示保留既有模式，不改写旧客户端的语义
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAccessUpdate {
+    pub enabled: bool,
+    pub mode: Option<CodexAccessMode>,
     pub account_id: crate::account::ProviderAccountId,
 }
 

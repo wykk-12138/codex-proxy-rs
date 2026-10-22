@@ -311,6 +311,7 @@ async fn load_client_keys(
             String,
             Option<String>,
             Option<bool>,
+            Option<String>,
         ),
     >(
         "select k.id, k.key,
@@ -318,7 +319,8 @@ async fn load_client_keys(
                   filter (where kg.account_group_id is not null), '{}') as group_ids,
                 k.max_concurrency, k.requests_per_minute, k.provider_request_profiles_json, k.name,
                 (select account_id from client_api_key_codex_bindings where key_id = k.id),
-                (select enabled from client_api_key_codex_bindings where key_id = k.id)
+                (select enabled from client_api_key_codex_bindings where key_id = k.id),
+                (select mode from client_api_key_codex_bindings where key_id = k.id)
          from client_api_keys k
          left join client_api_key_groups kg on kg.client_api_key_id = k.id
          where k.enabled
@@ -333,7 +335,7 @@ async fn load_client_keys(
             let mut key = ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4)?;
             key.request_profiles = decode_request_profiles(row.5.0)?;
             key.name_snapshot = Some(row.6);
-            key.codex_access = super::client_keys::decode_codex_binding(row.7, row.8)?;
+            key.codex_access = super::client_keys::decode_codex_binding(row.7, row.8, row.9)?;
             Ok(key)
         })
         .collect()

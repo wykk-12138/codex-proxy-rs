@@ -248,6 +248,7 @@ fn selector_with_runtime(
         quota,
         account_feedback,
         CodexCookiePolicy::official().expect("official cookie policy"),
+        None,
     )
 }
 

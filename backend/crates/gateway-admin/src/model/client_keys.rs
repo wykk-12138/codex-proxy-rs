@@ -207,7 +207,8 @@ impl fmt::Debug for NewClientKey {
 /// 修改 Client Key 的公开策略字段
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientKey {
-    pub codex_access: Option<gateway_core::policy::CodexAccessBinding>,
+    /// 省略 mode 表示保留既有模式；null/省略整个对象沿现有更新合同
+    pub codex_access: Option<gateway_core::policy::CodexAccessUpdate>,
     pub request_profile_override_updates: ProviderRequestProfileOverrideUpdates,
     pub id: ClientApiKeyId,
     pub name: String,

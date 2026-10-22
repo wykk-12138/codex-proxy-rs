@@ -34,12 +34,40 @@ pub enum CodexAuxiliaryOperation {
     ConfigBundle,
 }
 
+impl CodexAuxiliaryOperation {
+    /// 会话级辅助操作跟随逻辑会话 owner；账号级请求仍描述入口账号
+    #[must_use]
+    pub const fn follows_codex_session(self) -> bool {
+        match self {
+            Self::HistoryListWindows
+            | Self::HistoryListItems
+            | Self::HistoryReadItem
+            | Self::HistorySearchContents
+            | Self::NotesThreadHint
+            | Self::NotesListFilesByPrefix
+            | Self::NotesReadFile
+            | Self::NotesSearchContents
+            | Self::NotesAppendToFile
+            | Self::NotesWriteFile => true,
+            Self::Usage
+            | Self::Profile
+            | Self::UserSettings
+            | Self::WorkspaceMessages
+            | Self::ConfigBundle => false,
+        }
+    }
+}
+
 /// 每次执行重新认证后由 Core 创建，API 不能自行构造账号授权
 #[derive(Debug, Clone)]
 pub struct CodexAuthorizedContext {
     pub(crate) client_api_key_id: ClientApiKeyId,
-    pub(crate) account_id: ProviderAccountId,
+    /// fixed 模式的入口账号；session_pool 由 Provider 按会话归属解析执行账号
+    pub(crate) entry_account_id: ProviderAccountId,
+    pub(crate) session_pool: bool,
     pub(crate) account_scope: Arc<FrozenAccountScope>,
+    /// session_pool 首次辅助请求可能需要认领账号；此处冻结与模型请求同形的选号事实
+    pub(crate) selection: Option<Arc<super::AttemptContext>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) deadline: Deadline,
 }
@@ -51,8 +79,20 @@ impl CodexAuthorizedContext {
     }
 
     #[must_use]
-    pub const fn account_id(&self) -> &ProviderAccountId {
-        &self.account_id
+    pub const fn entry_account_id(&self) -> &ProviderAccountId {
+        &self.entry_account_id
+    }
+
+    /// session_pool 下执行账号来自持久会话归属，不能退回入口账号
+    #[must_use]
+    pub const fn session_pool(&self) -> bool {
+        self.session_pool
+    }
+
+    /// 辅助请求首次认领时复用的账号选择上下文
+    #[must_use]
+    pub fn selection(&self) -> Option<&super::AttemptContext> {
+        self.selection.as_deref()
     }
 
     #[must_use]

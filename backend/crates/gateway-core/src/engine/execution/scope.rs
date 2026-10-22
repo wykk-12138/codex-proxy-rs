@@ -68,6 +68,8 @@ pub(super) struct AuthorizedExecution {
     pub(super) extension_scope: ExtensionCallScope,
     pub(super) required_provider: Option<ProviderKind>,
     pub(super) required_account: Option<ProviderAccountId>,
+    /// session_pool 模式：执行账号由 Provider 按会话归属选定，Core 不固定入口账号
+    pub(super) codex_session_pool: bool,
     pub(super) nested: Option<NestedExecutionFacts>,
     pub(super) bound: Option<BoundExecutionFacts>,
     pub(super) graph: Option<Arc<NestedExecutionGraph>>,

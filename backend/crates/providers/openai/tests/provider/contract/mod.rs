@@ -58,7 +58,7 @@ use gateway_core::operation::{
     OperationKind, ProtocolPayload, ProviderSessionState, RawJsonPayload, StandaloneSearchRequest,
 };
 use gateway_core::policy::ClientApiKeyId;
-use gateway_core::provider_ports::ProviderLeasePort;
+use gateway_core::provider_ports::{CodexSessionOwnershipPort, ProviderLeasePort};
 use gateway_core::routing::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::routing::{
     ClientRoutingScope, ConfigRevision, FrozenAccountScope, ModelCapabilities, ModelServiceTier,
@@ -89,8 +89,8 @@ use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::support::{
-    MemoryAccountStore, MemoryCooldownPort, MemorySessionAffinity, MemorySessionExclusions,
-    TestLeaseCoordinator, account_policy, catalog_cache, profile, secret,
+    MemoryAccountStore, MemoryCodexSessions, MemoryCooldownPort, MemorySessionAffinity,
+    MemorySessionExclusions, TestLeaseCoordinator, account_policy, catalog_cache, profile, secret,
 };
 use crate::transport::accept_codex_test_websocket;
 
@@ -1150,6 +1150,45 @@ pub(super) fn provider_with_base_url(
     )
 }
 
+/// 池模式需要装配会话归属端口；其余构造与固定账号入口一致
+pub(super) fn provider_with_base_url_and_codex_sessions(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+) -> Arc<CodexProvider> {
+    provider_and_quota_with_codex_sessions(
+        store,
+        Arc::new(MemorySessionAffinity::default()),
+        base_url,
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+    )
+    .0
+}
+
+/// 池模式同时需要软亲和与持久归属两个端口
+pub(super) fn provider_with_affinity_and_codex_sessions(
+    store: &Arc<MemoryAccountStore>,
+    session_affinity: Arc<MemorySessionAffinity>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+) -> Arc<CodexProvider> {
+    provider_and_quota_with_codex_sessions(
+        store,
+        session_affinity,
+        base_url,
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+    )
+    .0
+}
+
 fn provider_with_base_url_and_retry_budget(
     store: &Arc<MemoryAccountStore>,
     base_url: String,
@@ -1238,6 +1277,36 @@ fn provider_and_quota_with_runtime_ports(
     Arc<CodexCredentialQuotaService>,
     Arc<CodexWebSocketPool>,
 ) {
+    provider_and_quota_with_codex_sessions(
+        store,
+        session_affinity,
+        base_url,
+        leases,
+        stream_max_retries,
+        cooldowns,
+        policy,
+        None,
+    )
+}
+
+/// 额外装配池会话归属端口；现有固定账号调用方保持不传
+///
+/// 参数与 `provider_and_quota_with_runtime_ports` 同形再加一个端口，按构造事实直传而不另建包装类型
+#[expect(clippy::too_many_arguments)]
+fn provider_and_quota_with_codex_sessions(
+    store: &Arc<MemoryAccountStore>,
+    session_affinity: Arc<MemorySessionAffinity>,
+    base_url: String,
+    leases: Arc<TestLeaseCoordinator>,
+    stream_max_retries: u32,
+    cooldowns: Arc<MemoryCooldownPort>,
+    policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
+    codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
+) -> (
+    Arc<CodexProvider>,
+    Arc<CodexCredentialQuotaService>,
+    Arc<CodexWebSocketPool>,
+) {
     let profile = wire_profile();
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -1270,6 +1339,7 @@ fn provider_and_quota_with_runtime_ports(
         Arc::clone(&quota),
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().expect("cookie policy"),
+        codex_sessions,
     ));
 
     let provider = CodexProvider::new(
@@ -1617,6 +1687,23 @@ pub(super) fn context_with_middleware(
     plan: Arc<dyn MiddlewarePlan>,
     fast_mode: FastMode,
 ) -> AttemptContext {
+    middleware_context(request_id, plan, fast_mode, false)
+}
+
+/// 池模式的中间件用例入口；其余 attempt 事实与 context_with_middleware 一致
+pub(super) fn pool_context_with_middleware(
+    request_id: &str,
+    plan: Arc<dyn MiddlewarePlan>,
+) -> AttemptContext {
+    middleware_context(request_id, plan, FastMode::Default, true)
+}
+
+fn middleware_context(
+    request_id: &str,
+    plan: Arc<dyn MiddlewarePlan>,
+    fast_mode: FastMode,
+    session_pool: bool,
+) -> AttemptContext {
     let plan = FrozenMiddlewarePlan::new(
         plan,
         ExtensionSetReference::new(
@@ -1636,7 +1723,8 @@ pub(super) fn context_with_middleware(
             "/v1/responses".to_owned(),
             ClientTransport::HttpSse,
         )
-        .with_request_location(Some(global_request_location())),
+        .with_request_location(Some(global_request_location()))
+        .with_codex_session_pool(session_pool),
         NonZeroU32::MIN,
         SystemTime::now() + Duration::from_secs(30),
         account_policy(),
@@ -1649,6 +1737,17 @@ pub(super) fn context_with_middleware(
 
 pub(super) fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
     context_with_fast_policy(request_id, cancellation, FastMode::Default)
+}
+
+/// 池模式只改动会话归属判定，其余 attempt 事实与 context() 一致
+pub(super) fn pool_context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
+    attempt_context(
+        request_id,
+        cancellation,
+        FastMode::Default,
+        Default::default(),
+        true,
+    )
 }
 
 fn context_with_fast_policy(
@@ -1665,6 +1764,16 @@ fn context_with_pricing(
     fast_mode: FastMode,
     pricing: gateway_core::metering::PricingOverrides,
 ) -> AttemptContext {
+    attempt_context(request_id, cancellation, fast_mode, pricing, false)
+}
+
+fn attempt_context(
+    request_id: &str,
+    cancellation: CancellationToken,
+    fast_mode: FastMode,
+    pricing: gateway_core::metering::PricingOverrides,
+    session_pool: bool,
+) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new(request_id).expect("request id"),
@@ -1672,7 +1781,8 @@ fn context_with_pricing(
         )
         .with_fast_mode(fast_mode)
         .with_pricing(Arc::new(pricing))
-        .with_request_location(Some(global_request_location())),
+        .with_request_location(Some(global_request_location()))
+        .with_codex_session_pool(session_pool),
         NonZeroU32::new(1).expect("attempt"),
         SystemTime::now() + Duration::from_secs(30),
         account_policy(),

@@ -695,6 +695,10 @@ fn generic_profile_override_clear_rejects_conflicting_legacy_update() {
 
 #[test]
 fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
+    use gateway_core::{
+        account::ProviderAccountId,
+        policy::{CodexAccessBinding, CodexAccessMode},
+    };
     let baseline = json!({"id":"key_codex", "name":"Codex", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0});
     let omitted = serde_json::from_value::<UpdateClientKeyRequest>(baseline.clone())
         .unwrap()
@@ -711,7 +715,37 @@ fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
         let binding = command.codex_access.unwrap();
         assert_eq!(binding.enabled, enabled);
         assert_eq!(binding.account_id.as_str(), "acct_codex");
+        // 更新省略 mode 表示保留既有模式，不能被当成切回 fixed
+        assert!(binding.mode.is_none());
     }
+    for (mode, expected) in [
+        ("fixed", CodexAccessMode::Fixed),
+        ("session_pool", CodexAccessMode::SessionPool),
+    ] {
+        let mut payload = baseline.clone();
+        payload["codexAccess"] = json!({"enabled":true,"accountId":"acct_codex","mode":mode});
+        let mode = serde_json::from_value::<UpdateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .unwrap()
+            .codex_access
+            .unwrap()
+            .mode;
+        assert_eq!(mode, Some(expected), "显式模式应被解析");
+    }
+    // null 与省略同义：Option<String> 解析为 None，仍是保留既有模式
+    let mut payload = baseline.clone();
+    payload["codexAccess"] = json!({"enabled":true,"accountId":"acct_codex","mode":null});
+    assert!(
+        serde_json::from_value::<UpdateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .unwrap()
+            .codex_access
+            .unwrap()
+            .mode
+            .is_none()
+    );
     for invalid in [
         serde_json::Value::Null,
         json!({"enabled":false}),
@@ -721,6 +755,18 @@ fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
         payload["codexAccess"] = invalid;
         assert!(serde_json::from_value::<UpdateClientKeyRequest>(payload).is_err());
     }
+    let mut payload = baseline.clone();
+    payload["codexAccess"] = json!({"enabled":true,"accountId":"acct_codex","mode":"unknown"});
+    assert!(
+        serde_json::from_value::<UpdateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .is_err(),
+        "未知模式不能被静默回退"
+    );
+    let mut payload = baseline.clone();
+    payload["codexAccess"] = json!({"enabled":true,"accountId":"acct_codex","mode":123});
+    assert!(serde_json::from_value::<UpdateClientKeyRequest>(payload).is_err());
     let mut payload = baseline;
     payload["codexAccess"] = json!({"enabled":true,"accountId":"wrong"});
     assert!(
@@ -729,4 +775,33 @@ fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
             .into_command()
             .is_err()
     );
+    // 读响应始终带模式，客户端能区分会话池与固定账号
+    let time = Utc.with_ymd_and_hms(2026, 7, 18, 8, 0, 0).single().unwrap();
+    let view = ClientKeyView::from((
+        gateway_admin::model::client_keys::ClientKeyRecord {
+            codex_access: Some(CodexAccessBinding {
+                enabled: true,
+                mode: CodexAccessMode::SessionPool,
+                account_id: ProviderAccountId::new("acct_codex").unwrap(),
+            }),
+            request_profile_overrides: Default::default(),
+            budget: Default::default(),
+            id: gateway_core::policy::ClientApiKeyId::new("key_codex").unwrap(),
+            name: "Codex".to_owned(),
+            label: None,
+            groups: Vec::new(),
+            provider_kinds: vec![gateway_core::routing::ProviderKind::new("openai").unwrap()],
+            prefix: "sk_codex12".to_owned(),
+            enabled: true,
+            limits: Default::default(),
+            created_at: time,
+            updated_at: time,
+            last_used_at: None,
+        },
+        gateway_api::TimePresenter::new(Default::default()),
+    ));
+    let view = serde_json::to_value(view).unwrap();
+    assert_eq!(view["codexAccess"]["mode"], "session_pool");
+    assert_eq!(view["codexAccess"]["accountId"], "acct_codex");
+    assert_eq!(view["codexAccess"]["enabled"], true);
 }

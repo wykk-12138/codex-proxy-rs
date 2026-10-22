@@ -9,7 +9,7 @@ use gateway_admin::{
 };
 use gateway_core::{
     account::CredentialIdentityWrite,
-    policy::{ClientApiKeyId, CodexAccessBinding},
+    policy::{ClientApiKeyId, CodexAccessBinding, CodexAccessMode},
 };
 use gateway_store::postgres::PgAdminClientKeyStore;
 
@@ -30,6 +30,7 @@ fn key() -> NewClientKey {
     NewClientKey {
         codex_access: Some(CodexAccessBinding {
             enabled: true,
+            mode: CodexAccessMode::Fixed,
             account_id: ProviderAccountId::new(ACCOUNT).unwrap(),
         }),
         request_profile_overrides: Default::default(),
@@ -340,5 +341,94 @@ async fn unidentified_replacement_cannot_lend_old_identity_to_a_new_binding() {
             .await
             .is_err()
     );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn session_owned_account_rejects_replacement_and_deletion_until_released() {
+    use gateway_core::provider_ports::{
+        CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort as _,
+        ProviderSessionAffinityKey,
+    };
+    use gateway_store::postgres::PgCodexSessionOwnership;
+    let Some(database) = TestDatabase::create("codex_session_identity").await else {
+        return;
+    };
+    seed(&database.pool).await;
+    let key_id = ClientApiKeyId::new("key_codex_session_identity").unwrap();
+    // 不建立入口绑定，确保拒绝只来自会话归属
+    PgAdminClientKeyStore::new(database.pool.clone())
+        .create_client_key(
+            NewClientKey {
+                codex_access: None,
+                request_profile_overrides: Default::default(),
+                id: key_id.clone(),
+                name: "Codex session identity".into(),
+                label: None,
+                group_ids: Vec::new(),
+                limits: Default::default(),
+                budget: Default::default(),
+                plaintext: "test-codex-session-identity".into(),
+            },
+            &context(),
+        )
+        .await
+        .unwrap();
+    let loaded = PgProviderAccountRepository::new(database.pool.clone())
+        .load_current_credential(&ProviderAccountId::new(ACCOUNT).unwrap())
+        .await
+        .unwrap();
+    let session = ProviderSessionAffinityKey::try_new("session-identity").unwrap();
+    assert_eq!(
+        PgCodexSessionOwnership::new(database.pool.clone())
+            .claim(&CodexSessionClaim {
+                key_id: key_id.clone(),
+                session_key: session,
+                account_id: ProviderAccountId::new(ACCOUNT).unwrap(),
+                credential_revision: loaded.account.revision().get(),
+            })
+            .await
+            .unwrap(),
+        CodexSessionClaimOutcome::Owned
+    );
+    let store = admin_account_store(&database.pool);
+    let before = persisted(&database.pool).await;
+    for (user, workspace) in [("other-user", WORKSPACE), (USER, "other-workspace")] {
+        assert!(
+            store
+                .commit_credential_rotation(replacement(user, workspace, 1), &context())
+                .await
+                .is_err(),
+            "被会话引用的账号不能替换上游身份"
+        );
+        assert_eq!(persisted(&database.pool).await, before);
+    }
+    assert!(
+        PgProviderAccountRepository::new(database.pool.clone())
+            .delete_provider_accounts_admin(DeleteProviderAccounts {
+                scope: ProviderAccountAdminScope {
+                    provider_kind: "openai".into()
+                },
+                account_ids: vec![ACCOUNT.into()],
+                audit: audit("session-account-delete", "delete", ACCOUNT),
+            })
+            .await
+            .is_err(),
+        "被会话引用的账号不能删除"
+    );
+    // 删除 Key 会级联清空归属，账号随即恢复可替换
+    PgAdminClientKeyStore::new(database.pool.clone())
+        .delete_client_key(DeleteClientKey { id: key_id }, &context())
+        .await
+        .unwrap();
+    let sessions: i64 = sqlx::query_scalar("select count(*) from client_api_key_codex_sessions")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    store
+        .commit_credential_rotation(replacement("other-user", WORKSPACE, 1), &context())
+        .await
+        .unwrap();
     database.close().await;
 }

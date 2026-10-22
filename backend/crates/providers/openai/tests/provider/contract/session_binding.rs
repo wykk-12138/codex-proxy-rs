@@ -2,6 +2,8 @@
 
 use super::*;
 
+use gateway_core::provider_ports::ProviderSessionAffinityKey;
+
 #[tokio::test]
 async fn cyber_policy_session_exclusion_has_actionable_non_retryable_error() {
     let store = Arc::new(MemoryAccountStore::default());
@@ -126,6 +128,437 @@ async fn cyber_policy_session_exclusion_has_actionable_non_retryable_error() {
             .await
             .unwrap(),
     );
+}
+
+/// 模拟客户端 session-id 头经中间件透传到上游
+#[derive(Debug)]
+struct AddSessionHeader(&'static [u8]);
+
+impl MiddlewarePlan for AddSessionHeader {
+    fn handle(
+        &self,
+        _context: MiddlewareContext,
+        request: MiddlewareRequest,
+        next: MiddlewareNext,
+    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+        let value = self.0;
+        Box::pin(async move {
+            let (protocol, mut headers, body) = request.into_parts();
+            headers.push(MiddlewareHeader::new(
+                "session-id",
+                Bytes::from_static(value),
+            ));
+            next.run(MiddlewareRequest::new(protocol, headers, body))
+                .await
+        })
+    }
+}
+
+/// 池模式的 HTTP 模型请求；与既有合同用例一致地显式关闭 WebSocket 快路径
+fn pool_generate(session: &str) -> Operation {
+    Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"hello","session_id":session})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ))
+}
+
+#[tokio::test]
+async fn pool_session_claims_once_and_pins_following_requests() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_affinity_switch_a", "acct_affinity_switch_b"] {
+        create_account(&store, id).await;
+    }
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CAPTURE_COMPLETED_SSE))
+        .mount(&server)
+        .await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    let mut served = Vec::new();
+    for request_id in ["req_pool_first", "req_pool_second"] {
+        let mut stream = provider
+            .clone()
+            .execute(
+                planned_request("openai", pool_generate("pool-session")),
+                pool_context(request_id, CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+        served.push(stream.metadata().provider_account_id().as_str().to_owned());
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(served[0], served[1], "同一会话的两次请求必须同一账号");
+    let claims = sessions.claims();
+    assert_eq!(claims.len(), 1, "已建立归属的会话不再重新认领");
+    assert_eq!(claims[0].account_id.as_str(), served[0]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            request.headers["chatgpt-account-id"].to_str().unwrap(),
+            format!("chatgpt-{}", served[0])
+        );
+    }
+}
+
+#[tokio::test]
+async fn pool_session_prefers_existing_owner_over_entry_account() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_affinity_switch_a", "acct_affinity_switch_b"] {
+        create_account(&store, id).await;
+    }
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CAPTURE_COMPLETED_SSE))
+        .mount(&server)
+        .await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    sessions.seed_owner(
+        &ClientApiKeyId::new("key_openai_contract").unwrap(),
+        &pool_session_key(&provider, "pool-owned-session"),
+        ProviderAccountId::new("acct_affinity_switch_b").unwrap(),
+    );
+    let mut stream = provider
+        .execute(
+            planned_request("openai", pool_generate("pool-owned-session")),
+            pool_context("req_pool_owned", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.metadata().provider_account_id().as_str(),
+        "acct_affinity_switch_b"
+    );
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert!(sessions.claims().is_empty(), "既有归属不需要重新认领");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"].to_str().unwrap(),
+        "chatgpt-acct_affinity_switch_b"
+    );
+}
+
+#[tokio::test]
+async fn pool_session_conflict_fails_before_send_without_claim() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_affinity_switch_a").await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    let request = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({
+                "model":"gpt-5.4", "input":"hello",
+                "client_metadata":{"session_id":"session-b"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([
+            (
+                "turn_metadata".to_owned(),
+                json!("{\"session_id\":\"session-a\"}"),
+            ),
+            ("use_websocket".to_owned(), json!(false)),
+        ])),
+    ));
+    let error = provider
+        .execute(
+            planned_request("openai", request),
+            pool_context("req_pool_conflict", CancellationToken::new()),
+        )
+        .await
+        .err()
+        .expect("两个逻辑来源不同值必须在发送前拒绝");
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert!(error.retry_is_prohibited());
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let diagnostic = error.diagnostic().expect("session_pool diagnostic");
+    assert_eq!(diagnostic.stage(), Some("session_pool"));
+    assert_eq!(diagnostic.code(), Some("session_key_conflict"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(sessions.claims().is_empty());
+}
+
+#[tokio::test]
+async fn pool_session_missing_identity_fails_before_send_without_claim() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_affinity_switch_a").await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    let error = provider
+        .execute(
+            planned_request("openai", generate_operation()),
+            pool_context("req_pool_missing", CancellationToken::new()),
+        )
+        .await
+        .err()
+        .expect("无任何会话声明的池请求必须在发送前拒绝");
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert!(error.retry_is_prohibited());
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let diagnostic = error.diagnostic().expect("session_pool diagnostic");
+    assert_eq!(diagnostic.stage(), Some("session_pool"));
+    assert_eq!(diagnostic.code(), Some("session_key_missing"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(sessions.claims().is_empty());
+}
+
+#[tokio::test]
+async fn pool_session_fallback_divergence_sends_to_owner_without_rewriting_other_session() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_affinity_switch_a", "acct_affinity_switch_b"] {
+        create_account(&store, id).await;
+    }
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let affinity = Arc::new(MemorySessionAffinity::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CAPTURE_COMPLETED_SSE))
+        .mount(&server)
+        .await;
+    let provider = provider_with_affinity_and_codex_sessions(
+        &store,
+        affinity.clone(),
+        sessions.clone(),
+        server.uri(),
+    );
+    let client = ClientApiKeyId::new("key_openai_contract").unwrap();
+    let provider_kind = ProviderKind::new("openai").unwrap();
+    let key_a = pool_session_key(&provider, "session-a");
+    let key_b = pool_session_key(&provider, "session-b");
+    let owner_a = ProviderAccountId::new("acct_affinity_switch_a").unwrap();
+    let owner_b = ProviderAccountId::new("acct_affinity_switch_b").unwrap();
+    // 两个会话各有独立的软亲和：正文顶层 session_id 指向 B，兜底指向 A
+    affinity.seed_binding(&provider_kind, key_a.expose_to_store(), owner_a.clone());
+    affinity.seed_binding(&provider_kind, key_b.expose_to_store(), owner_b.clone());
+    sessions.seed_owner(&client, &key_a, owner_a.clone());
+    let request = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"hello","session_id":"session-b"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([
+            ("session_id".to_owned(), json!("session-a")),
+            ("use_websocket".to_owned(), json!(false)),
+        ])),
+    ));
+    let mut stream = provider
+        .execute(
+            planned_request("openai", request),
+            pool_context_with_middleware(
+                "req_pool_fallback_divergence",
+                Arc::new(AddSessionHeader(b"session-a")),
+            ),
+        )
+        .await
+        .expect("兜底归属必须优先于错配的传输亲和");
+    assert_eq!(
+        stream.metadata().provider_account_id().as_str(),
+        "acct_affinity_switch_a"
+    );
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert!(sessions.claims().is_empty(), "既有归属不需要重新认领");
+    assert_eq!(affinity.binding_count(), 2, "不能因分歧新增会话绑定");
+    assert_eq!(
+        affinity.load(&provider_kind, &key_b).await.unwrap(),
+        Some(owner_b)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"].to_str().unwrap(),
+        "chatgpt-acct_affinity_switch_a"
+    );
+}
+
+#[tokio::test]
+async fn pool_search_claims_from_body_id_and_reuses_owner() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_affinity_switch_a", "acct_affinity_switch_b"] {
+        create_account(&store, id).await;
+    }
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/alpha/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_raw(
+                    br#"{"encrypted_output":"ciphertext","output":"ok","results":[]}"#.to_vec(),
+                    "application/json",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    let operation = || {
+        Operation::Search(StandaloneSearchRequest::from_raw_json(
+            RawJsonPayload::new(
+                "openai",
+                Bytes::from_static(
+                    br#"{"id":"pool-search-session","commands":{"search_query":[{"q":"private"}]}}"#,
+                ),
+            )
+            .unwrap(),
+        ))
+    };
+    let mut served = Vec::new();
+    for request_id in ["req_pool_search_first", "req_pool_search_second"] {
+        let mut stream = provider
+            .clone()
+            .execute(
+                planned_provider_endpoint_request("openai", operation()),
+                pool_context(request_id, CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+        served.push(stream.metadata().provider_account_id().as_str().to_owned());
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(served[0], served[1], "仅正文 id 的搜索也必须命中同一归属");
+    let claims = sessions.claims();
+    assert_eq!(claims.len(), 1, "搜索会话只在首次请求认领");
+    assert_eq!(claims[0].account_id.as_str(), served[0]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            request.headers["chatgpt-account-id"].to_str().unwrap(),
+            format!("chatgpt-{}", served[0])
+        );
+    }
+}
+
+#[tokio::test]
+async fn pool_session_conflict_follows_real_owner() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_affinity_switch_a", "acct_affinity_switch_b"] {
+        create_account(&store, id).await;
+    }
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CAPTURE_COMPLETED_SSE))
+        .mount(&server)
+        .await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    let owner = ProviderAccountId::new("acct_affinity_switch_b").unwrap();
+    let client = ClientApiKeyId::new("key_openai_contract").unwrap();
+    let key = pool_session_key(&provider, "pool-contended");
+    // 模拟并发首请求已经被另一账号认领：本次认领报告冲突，选号必须改投真实 owner
+    sessions.conflict_with(owner.clone());
+    let mut stream = provider
+        .clone()
+        .execute(
+            planned_request("openai", pool_generate("pool-contended")),
+            pool_context("req_pool_contended", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.metadata().provider_account_id(), &owner);
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert_eq!(sessions.owner_of(&client, &key), Some(owner.clone()));
+    // 冲突后只保留真实 winner，不再覆盖归属
+    assert_eq!(sessions.claims().len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"].to_str().unwrap(),
+        "chatgpt-acct_affinity_switch_b"
+    );
+}
+
+#[tokio::test]
+async fn pool_session_identity_change_retries_without_upstream_send() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_affinity_switch_a").await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let server = MockServer::start().await;
+    let provider =
+        provider_with_base_url_and_codex_sessions(&store, sessions.clone(), server.uri());
+    sessions.identity_changed();
+    let error = provider
+        .clone()
+        .execute(
+            planned_request("openai", pool_generate("pool-stale-identity")),
+            pool_context("req_pool_stale_identity", CancellationToken::new()),
+        )
+        .await
+        .err()
+        .expect("凭据版本在行锁内变化时不能用旧身份发送");
+    assert_eq!(
+        error.kind(),
+        ProviderErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let diagnostic = error.diagnostic().expect("account selection diagnostic");
+    assert_eq!(diagnostic.stage(), Some("account_selection"));
+    assert_eq!(diagnostic.code(), Some("account_snapshot_conflict"));
+    assert!(!sessions.claims().is_empty());
+    assert!(
+        sessions
+            .owner_of(
+                &ClientApiKeyId::new("key_openai_contract").unwrap(),
+                &pool_session_key(&provider, "pool-stale-identity")
+            )
+            .is_none()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// 从与池模式同一派生的观测哈希取得会话键，避免在测试内重复实现哈希
+fn pool_session_key(provider: &CodexProvider, session: &str) -> ProviderSessionAffinityKey {
+    let observation = provider.request_observation(
+        &Operation::Generate(generate_with_session_context(session, None, None)),
+        &ClientApiKeyId::new("key_openai_contract").unwrap(),
+    );
+    ProviderSessionAffinityKey::try_new(
+        observation
+            .continuation
+            .affinity_hash
+            .expect("session affinity hash"),
+    )
+    .unwrap()
 }
 
 #[derive(Debug)]

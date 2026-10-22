@@ -173,6 +173,8 @@ pub async fn initialize(
         Arc::clone(&quota),
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
+        // session_pool 的会话归属端口；未装配时该模式在选号前如实失败
+        ports.codex_sessions(),
     ));
     let token_client = Arc::new(
         credential::token_client::openai_token_client(

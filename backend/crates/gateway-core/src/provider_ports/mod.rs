@@ -13,6 +13,8 @@ pub use affinity::{
     ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionAlias,
     ProviderSessionBinding, ProviderSessionExclusionPort, ProviderSessionExclusions,
 };
+mod session_owner;
+pub use session_owner::{CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort};
 mod catalog;
 pub use catalog::{
     ProviderArtifactProfile, ProviderArtifactProfileCachePort, ProviderCatalogCacheKey,

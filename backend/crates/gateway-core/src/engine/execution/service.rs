@@ -357,24 +357,26 @@ impl DefaultExecutionService {
             .client
             .restrict_codex_access()
             .map_err(authentication_gateway_error)?;
-        let codex_account = (prepared.client.authentication_purpose()
+        let codex_binding = (prepared.client.authentication_purpose()
             == crate::engine::authentication::ClientAuthenticationPurpose::Codex)
-            .then(|| {
-                prepared
-                    .client
-                    .policy
-                    .codex_access()
-                    .map(|binding| binding.account_id.clone())
-            })
+            .then(|| prepared.client.policy.codex_access().cloned())
             .flatten();
-        let required_provider = codex_account
+        // fixed 只放行入口账号；session_pool 保留授权池，实际执行账号由 Provider 按会话归属选定
+        let codex_session_pool = codex_binding
             .as_ref()
-            .and_then(|account| {
+            .is_some_and(|binding| binding.mode == crate::policy::CodexAccessMode::SessionPool);
+        let codex_account = codex_binding
+            .as_ref()
+            .filter(|binding| binding.mode == crate::policy::CodexAccessMode::Fixed)
+            .map(|binding| binding.account_id.clone());
+        let required_provider = codex_binding
+            .as_ref()
+            .and_then(|binding| {
                 prepared
                     .client
                     .policy
                     .account_scope()
-                    .account_provider(account)
+                    .account_provider(&binding.account_id)
             })
             .cloned();
         let PreparedRootExecution {
@@ -396,6 +398,7 @@ impl DefaultExecutionService {
             extension_scope,
             required_provider,
             required_account: codex_account,
+            codex_session_pool,
             nested: None,
             bound: None,
             graph: client
@@ -672,7 +675,8 @@ impl DefaultExecutionService {
                         request.metadata.endpoint.clone(),
                         request.metadata.transport,
                     )
-                    .with_extension_scope(authorization.extension_scope.clone());
+                    .with_extension_scope(authorization.extension_scope.clone())
+                    .with_codex_session_pool(authorization.codex_session_pool);
             entered_execution = true;
             self.start_without_continuation(
                 request,
@@ -1037,6 +1041,7 @@ impl DefaultExecutionService {
             extension_scope,
             required_provider,
             required_account: account,
+            codex_session_pool: false,
             nested: Some(NestedExecutionFacts {
                 parent_request_id,
                 initiating_plugin_instance_id,
@@ -1199,6 +1204,7 @@ impl DefaultExecutionService {
                 extension_scope: authority.extension_scope.clone(),
                 required_provider,
                 required_account: account,
+                codex_session_pool: false,
                 nested: None,
                 bound: Some(BoundExecutionFacts {
                     initiating_plugin_instance_id: authority.initiating_plugin_instance_id.clone(),

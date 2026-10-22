@@ -16,7 +16,7 @@ use crate::{
     identity::ProviderKind,
     lifecycle::{CancellationToken, Deadline},
     operation::Operation,
-    policy::{ClientApiKeyId, ClientPolicy},
+    policy::{ClientApiKeyId, ClientPolicy, CodexAccessMode},
     routing::{
         ProviderCatalogUnavailable, PublicModelDescriptor, PublicModelId, RuntimeSnapshot,
         UpstreamModelId, request_settings::RequestSettings,
@@ -110,10 +110,19 @@ impl AuthenticatedClient {
             .ok_or(ClientAuthenticationError::InvalidKey)?;
         let provider = ProviderKind::new("openai")
             .map_err(|_| ClientAuthenticationError::ProviderUnavailable)?;
-        let scope = self.policy.account_scope().restricted_to(
-            &std::collections::BTreeSet::from([provider]),
-            &std::collections::BTreeSet::from([binding.account_id.clone()]),
-        );
+        // fixed 继续把执行范围收窄到入口账号；session_pool 保留 Key 有效授权池，
+        // 具体会话 owner 由 Provider 按持久归属决定
+        let accounts = match binding.mode {
+            CodexAccessMode::Fixed => {
+                std::collections::BTreeSet::from([binding.account_id.clone()])
+            }
+            CodexAccessMode::SessionPool => std::collections::BTreeSet::new(),
+        };
+        let scope = self
+            .policy
+            .account_scope()
+            .restricted_to(&std::collections::BTreeSet::from([provider]), &accounts);
+        // 入口账号仍须在范围内：身份与账号级辅助沿用它，撤权后不能绕过授权
         if !scope.allows(&binding.account_id) {
             return Err(ClientAuthenticationError::InvalidKey);
         }

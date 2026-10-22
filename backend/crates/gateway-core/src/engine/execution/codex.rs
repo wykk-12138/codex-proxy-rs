@@ -1,6 +1,6 @@
 //! 原生 Codex 辅助调用的授权、Key 准入与惰性正文租约生命周期
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, num::NonZeroU32, sync::Arc};
 
 use futures::{FutureExt as _, future::BoxFuture, pin_mut, select_biased};
 
@@ -12,12 +12,15 @@ use super::{
 use crate::{
     concurrency::ConcurrencyWaitBudget,
     engine::{
+        AccountAttemptContext, AttemptContext, RequestAttemptContext,
         authentication::ClientAuthenticationPurpose,
         codex::{CodexAuthorizedContext, CodexAuxiliaryRequest, CodexGateway, CodexIdentity},
+        execution::ClientTransport,
         middleware::{MiddlewareBody, MiddlewareError, MiddlewareFrame, MiddlewareResponse},
     },
     error::{GatewayError, GatewayErrorKind},
     lifecycle::{CancellationToken, Deadline},
+    policy::CodexAccessMode,
 };
 
 impl DefaultExecutionService {
@@ -45,7 +48,7 @@ impl DefaultExecutionService {
         let binding = prepared.client.policy.codex_access().ok_or_else(|| {
             GatewayError::new(GatewayErrorKind::PolicyDenied, "Codex access is disabled")
         })?;
-        let scope = prepared.client.policy.account_scope();
+        let scope = Arc::clone(prepared.client.policy.account_scope());
         let gateway = scope
             .account_provider(&binding.account_id)
             .and_then(|kind| self.providers.get(kind))
@@ -53,12 +56,27 @@ impl DefaultExecutionService {
             .ok_or_else(|| {
                 GatewayError::new(GatewayErrorKind::Unsupported, "Codex access is unavailable")
             })?;
+        // 辅助调用完成只取消自身资源，外层中间件仍可加工身份或响应
+        let cancellation = prepared.cancellation().child_token();
+        let session_pool = binding.mode == CodexAccessMode::SessionPool;
+        // session_pool 的辅助请求可能先于模型请求到达；首次认领复用同一份冻结选号事实
+        let selection = if session_pool {
+            Some(Arc::new(auxiliary_selection(
+                &prepared,
+                Arc::clone(&scope),
+                cancellation.clone(),
+            )?))
+        } else {
+            None
+        };
         let context = CodexAuthorizedContext {
             client_api_key_id: prepared.client.policy.key_id().clone(),
-            account_id: binding.account_id.clone(),
-            account_scope: Arc::clone(scope),
-            // 辅助调用完成只取消自身资源，外层中间件仍可加工身份或响应
-            cancellation: prepared.cancellation().child_token(),
+            // 入口账号始终存在：身份投影与账号级辅助沿用它，只有会话级执行改由 owner 决定
+            entry_account_id: binding.account_id.clone(),
+            session_pool,
+            account_scope: scope,
+            selection,
+            cancellation,
             deadline: prepared.deadline_at(),
         };
         // 在准入等待前持有取消责任，覆盖取得响应头前请求 future 被丢弃的出口
@@ -248,4 +266,40 @@ fn cancelled_error() -> GatewayError {
 
 fn timeout_error() -> GatewayError {
     GatewayError::new(GatewayErrorKind::Timeout, "Codex request deadline elapsed")
+}
+
+/// 构造与模型 attempt 同形的辅助选号事实
+///
+/// 辅助请求不产生模型费用，但首次认领仍须复用现有可用性、调度策略与账号租约，
+/// 因此只冻结选择所需的上下文，不伪造模型请求或 usage
+fn auxiliary_selection(
+    prepared: &PreparedRootExecution,
+    scope: Arc<crate::account::scope::FrozenAccountScope>,
+    cancellation: CancellationToken,
+) -> Result<AttemptContext, GatewayError> {
+    let account_group_ids = scope
+        .routing_snapshot()
+        .groups_snapshot()
+        .iter()
+        .map(|group| group.id().clone())
+        .collect::<Vec<_>>();
+    let request = RequestAttemptContext::new(
+        prepared.request_id().clone(),
+        prepared.client.policy.key_id().clone(),
+    )
+    .with_middleware(
+        None,
+        Arc::from(account_group_ids),
+        "codex_auxiliary".to_owned(),
+        ClientTransport::HttpJson,
+    );
+    Ok(AttemptContext::new(
+        request,
+        NonZeroU32::new(1).expect("constant auxiliary attempt index is non-zero"),
+        prepared.deadline_at(),
+        prepared.client.snapshot.account_selection_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope),
+        None,
+        cancellation,
+    ))
 }

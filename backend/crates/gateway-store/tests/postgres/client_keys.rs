@@ -809,7 +809,10 @@ async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
         MutationActor, MutationContext,
         client_keys::{DeleteClientKey, NewClientKey, UpdateClientKey},
     };
-    use gateway_core::{account::ProviderAccountId, policy::CodexAccessBinding};
+    use gateway_core::{
+        account::ProviderAccountId,
+        policy::{CodexAccessBinding, CodexAccessMode, CodexAccessUpdate},
+    };
     use gateway_store::postgres::{
         PgProviderAccountRepository, PgRuntimeSnapshotRepository, ProviderAccountRepository,
         RuntimeSnapshotRepository,
@@ -849,7 +852,14 @@ async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
     assert!(record.codex_access.is_none());
     let binding = CodexAccessBinding {
         enabled: true,
+        mode: CodexAccessMode::Fixed,
         account_id: ProviderAccountId::new("acct_codex_a").unwrap(),
+    };
+    // 更新输入省略 mode 时保留既有模式，旧客户端不会被误解为切回 fixed
+    let update_binding = |binding: &CodexAccessBinding| CodexAccessUpdate {
+        enabled: binding.enabled,
+        mode: Some(binding.mode),
+        account_id: binding.account_id.clone(),
     };
     let update = |codex_access| UpdateClientKey {
         codex_access,
@@ -862,7 +872,7 @@ async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
         daily_limit_usd: None,
         weekly_limit_usd: None,
     };
-    keys.update_client_key(update(Some(binding.clone())), &context)
+    keys.update_client_key(update(Some(update_binding(&binding))), &context)
         .await
         .unwrap();
     keys.update_client_key(update(None), &context)
@@ -887,14 +897,15 @@ async fn codex_binding_is_persistent_immutable_and_included_in_snapshots() {
         enabled: false,
         ..binding.clone()
     };
-    keys.update_client_key(update(Some(disabled.clone())), &context)
+    keys.update_client_key(update(Some(update_binding(&disabled))), &context)
         .await
         .unwrap();
     let before: (i64, i64) = sqlx::query_as("select config_revision, (select count(*) from admin_audit_events) from runtime_settings where id=1").fetch_one(&database.pool).await.unwrap();
     assert!(
         keys.update_client_key(
-            update(Some(CodexAccessBinding {
+            update(Some(CodexAccessUpdate {
                 enabled: true,
+                mode: Some(CodexAccessMode::Fixed),
                 account_id: ProviderAccountId::new("acct_codex_b").unwrap()
             })),
             &context
@@ -930,7 +941,9 @@ async fn codex_binding_checks_scope_on_creation_and_keeps_existing_switch_editab
         client_keys::{NewClientKey, UpdateClientKey},
     };
     use gateway_core::{
-        account::ProviderAccountId, policy::CodexAccessBinding, routing::AccountGroupId,
+        account::ProviderAccountId,
+        policy::{CodexAccessBinding, CodexAccessMode, CodexAccessUpdate},
+        routing::AccountGroupId,
     };
     use gateway_store::postgres::{PgProviderAccountRepository, ProviderAccountRepository};
     let Some(database) = TestDatabase::create("codex_key_scope").await else {
@@ -959,6 +972,7 @@ async fn codex_binding_checks_scope_on_creation_and_keeps_existing_switch_editab
     let command = |account: &str, group_ids| NewClientKey {
         codex_access: Some(CodexAccessBinding {
             enabled: true,
+            mode: CodexAccessMode::Fixed,
             account_id: ProviderAccountId::new(account).unwrap(),
         }),
         request_profile_overrides: Default::default(),
@@ -1015,12 +1029,17 @@ async fn codex_binding_checks_scope_on_creation_and_keeps_existing_switch_editab
         for enabled in [true, false, true] {
             let expected = CodexAccessBinding {
                 enabled,
+                mode: CodexAccessMode::Fixed,
                 account_id: ProviderAccountId::new("acct_codex_oauth").unwrap(),
             };
             let (_, saved) = keys
                 .update_client_key(
                     UpdateClientKey {
-                        codex_access: Some(expected.clone()),
+                        codex_access: Some(CodexAccessUpdate {
+                            enabled: expected.enabled,
+                            mode: Some(expected.mode),
+                            account_id: expected.account_id.clone(),
+                        }),
                         request_profile_override_updates: Default::default(),
                         id: ClientApiKeyId::new("key_scope").unwrap(),
                         name: "Codex scope".into(),
@@ -1042,5 +1061,194 @@ async fn codex_binding_checks_scope_on_creation_and_keeps_existing_switch_editab
             .await
             .unwrap();
     }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn codex_session_owner_claims_once_and_keeps_identity_references() {
+    use gateway_admin::model::{
+        MutationActor, MutationContext,
+        client_keys::{DeleteClientKey, NewClientKey, UpdateClientKey},
+    };
+    use gateway_core::{
+        account::{ProviderAccountId, ProviderAccountStore as _},
+        policy::{CodexAccessBinding, CodexAccessMode, CodexAccessUpdate},
+        provider_ports::{
+            CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort as _,
+            ProviderSessionAffinityKey,
+        },
+    };
+    use gateway_store::postgres::{
+        PgCodexSessionOwnership, PgProviderAccountRepository, ProviderAccountRepository,
+    };
+    let Some(database) = TestDatabase::create("codex_session_owner").await else {
+        return;
+    };
+    let repository = PgProviderAccountRepository::new(database.pool.clone());
+    for (id, authentication, enabled) in [
+        ("acct_session_a", "oauth", true),
+        ("acct_session_b", "oauth", true),
+        ("acct_session_disabled", "oauth", false),
+        ("acct_session_api", "api_key", true),
+    ] {
+        let mut account = super::provider_accounts::account(id, id);
+        account.authentication_kind = authentication.into();
+        account.enabled = enabled;
+        account.upstream_account_id = Some(format!("workspace-{id}"));
+        repository.insert_provider_account(account).await.unwrap();
+    }
+    let revision = |id: &str| {
+        let repository = repository.clone();
+        let id = id.to_owned();
+        async move {
+            repository
+                .load_current_credential(&ProviderAccountId::new(id).unwrap())
+                .await
+                .unwrap()
+                .account
+                .revision()
+                .get()
+        }
+    };
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "codex-session".into(),
+    };
+    let key_id = ClientApiKeyId::new("key_codex_session").unwrap();
+    keys.create_client_key(
+        NewClientKey {
+            codex_access: Some(CodexAccessBinding {
+                enabled: true,
+                mode: CodexAccessMode::SessionPool,
+                account_id: ProviderAccountId::new("acct_session_a").unwrap(),
+            }),
+            request_profile_overrides: Default::default(),
+            id: key_id.clone(),
+            name: "Codex session".into(),
+            label: None,
+            group_ids: Vec::new(),
+            limits: Default::default(),
+            budget: Default::default(),
+            plaintext: "test-codex-session".into(),
+        },
+        &context,
+    )
+    .await
+    .unwrap();
+    let ownership = PgCodexSessionOwnership::new(database.pool.clone());
+    let session = |key: &str| ProviderSessionAffinityKey::try_new(key).unwrap();
+    let claim = |session_key: &ProviderSessionAffinityKey, account: &str, revision: u64| {
+        CodexSessionClaim {
+            key_id: key_id.clone(),
+            session_key: session_key.clone(),
+            account_id: ProviderAccountId::new(account).unwrap(),
+            credential_revision: revision,
+        }
+    };
+    let owner_a = ProviderAccountId::new("acct_session_a").unwrap();
+    let session_a = session("session-a");
+    let claim_a = claim(
+        &session_a,
+        "acct_session_a",
+        revision("acct_session_a").await,
+    );
+    assert_eq!(
+        ownership.claim(&claim_a).await.unwrap(),
+        CodexSessionClaimOutcome::Owned
+    );
+    assert_eq!(
+        ownership.load(&key_id, &session_a).await.unwrap(),
+        Some(owner_a.clone())
+    );
+    // 同号重复认领是幂等复用，不新增归属行
+    assert_eq!(
+        ownership.claim(&claim_a).await.unwrap(),
+        CodexSessionClaimOutcome::Owned
+    );
+    let rows: i64 = sqlx::query_scalar("select count(*) from client_api_key_codex_sessions")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    // 异号认领不覆盖，只报告真实 owner
+    let conflict = claim(
+        &session_a,
+        "acct_session_b",
+        revision("acct_session_b").await,
+    );
+    assert_eq!(
+        ownership.claim(&conflict).await.unwrap(),
+        CodexSessionClaimOutcome::ConflictingOwner(owner_a)
+    );
+    // 停用、非 OAuth 与版本变化的账号都不能承载原生会话
+    let unavailable = claim(
+        &session("session-disabled"),
+        "acct_session_disabled",
+        revision("acct_session_disabled").await,
+    );
+    assert_eq!(
+        ownership.claim(&unavailable).await.unwrap(),
+        CodexSessionClaimOutcome::Unavailable
+    );
+    let unavailable = claim(
+        &session("session-api"),
+        "acct_session_api",
+        revision("acct_session_api").await,
+    );
+    assert_eq!(
+        ownership.claim(&unavailable).await.unwrap(),
+        CodexSessionClaimOutcome::Unavailable
+    );
+    let session_stale = session("session-stale");
+    let stale = claim(
+        &session_stale,
+        "acct_session_a",
+        revision("acct_session_a").await + 1,
+    );
+    assert_eq!(
+        ownership.claim(&stale).await.unwrap(),
+        CodexSessionClaimOutcome::IdentityChanged
+    );
+    assert_eq!(ownership.load(&key_id, &session_stale).await.unwrap(), None);
+    // 模式与入口账号一样建立后不可原地切换；省略 mode 保留既有会话池模式
+    let update = |mode: Option<CodexAccessMode>| UpdateClientKey {
+        codex_access: Some(CodexAccessUpdate {
+            enabled: true,
+            mode,
+            account_id: ProviderAccountId::new("acct_session_a").unwrap(),
+        }),
+        request_profile_override_updates: Default::default(),
+        id: key_id.clone(),
+        name: "Codex session".into(),
+        label: None,
+        group_ids: Vec::new(),
+        limits: Default::default(),
+        daily_limit_usd: None,
+        weekly_limit_usd: None,
+    };
+    assert!(
+        keys.update_client_key(update(Some(CodexAccessMode::Fixed)), &context)
+            .await
+            .is_err(),
+        "会话池模式不能被原地切回固定账号"
+    );
+    keys.update_client_key(update(None), &context)
+        .await
+        .unwrap();
+    let record = keys.get_client_key(&key_id).await.unwrap().unwrap();
+    assert_eq!(
+        record.codex_access.unwrap().mode,
+        CodexAccessMode::SessionPool
+    );
+    // 删除 Key 时归属行随外键级联清理
+    keys.delete_client_key(DeleteClientKey { id: key_id }, &context)
+        .await
+        .unwrap();
+    let rows: i64 = sqlx::query_scalar("select count(*) from client_api_key_codex_sessions")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
     database.close().await;
 }

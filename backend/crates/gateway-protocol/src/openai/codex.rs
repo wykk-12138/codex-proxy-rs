@@ -31,6 +31,92 @@ pub fn codex_account_session_id(
         .or_else(|| codex_session_id(body, context))
 }
 
+/// 只取 turn metadata 里的逻辑会话身份
+///
+/// 供需要区分逻辑声明与传输/缓存键的调用方使用，不做任何传输层回退
+#[must_use]
+pub fn codex_turn_metadata_session_id(
+    body: &Map<String, Value>,
+    context: &Map<String, Value>,
+) -> Option<String> {
+    request_turn_metadata(body)
+        .and_then(turn_metadata_session_id)
+        .or_else(|| {
+            non_empty_string(context.get("turn_metadata")).and_then(turn_metadata_session_id)
+        })
+}
+
+/// 官方 client_metadata 里的逻辑会话身份
+#[must_use]
+pub fn codex_client_metadata_session_id(body: &Map<String, Value>) -> Option<String> {
+    client_metadata_string(body, "session_id").map(str::to_owned)
+}
+
+/// session_pool 的会话身份判定结果
+///
+/// 逻辑会话缺失或多来源冲突都必须由调用方显式失败，不能退回入口账号或任意选号
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSessionIdentity {
+    Resolved(String),
+    Missing,
+    Conflict,
+}
+
+/// 池会话身份的候选来源
+///
+/// `turn_metadata` 与 `session_id` 是中间件最终请求头的值；头值以 `&str` 传入，
+/// 使本层不依赖网关的中间件类型。`endpoint_session` 是端点级逻辑会话字段（如 Search 的 id）
+#[derive(Debug, Clone, Copy)]
+pub struct CodexSessionSources<'a> {
+    pub body: &'a Map<String, Value>,
+    pub context: &'a Map<String, Value>,
+    pub turn_metadata: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub endpoint_session: Option<&'a str>,
+}
+
+/// 只在 session_pool 使用：区分逻辑会话声明与传输/缓存键
+///
+/// 逻辑声明固定为请求头 turn metadata、正文与请求上下文的 turn metadata、
+/// 官方 `client_metadata.session_id` 与端点级会话字段；`session-id` 请求头和正文
+/// `session_id` 可能只是缓存路由键，因此只在没有逻辑声明时兜底，与逻辑声明的差异
+/// 不视为冲突。fixed 与普通 `/v1` 不读取该判定
+#[must_use]
+pub fn codex_session_identity(sources: CodexSessionSources<'_>) -> CodexSessionIdentity {
+    let mut logical = Vec::new();
+    push_distinct(
+        &mut logical,
+        sources.turn_metadata.and_then(turn_metadata_session_id),
+    );
+    push_distinct(
+        &mut logical,
+        codex_turn_metadata_session_id(sources.body, sources.context),
+    );
+    push_distinct(&mut logical, codex_client_metadata_session_id(sources.body));
+    push_distinct(&mut logical, sources.endpoint_session.map(str::to_owned));
+    match logical.len() {
+        1 => CodexSessionIdentity::Resolved(logical.remove(0)),
+        0 => non_empty_str(sources.session_id)
+            .map(str::to_owned)
+            .or_else(|| codex_session_id(sources.body, sources.context))
+            .map_or(
+                CodexSessionIdentity::Missing,
+                CodexSessionIdentity::Resolved,
+            ),
+        _ => CodexSessionIdentity::Conflict,
+    }
+}
+
+fn push_distinct(values: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = non_empty_str(value.as_deref()) else {
+        return;
+    };
+    if values.iter().any(|existing| existing.as_str() == value) {
+        return;
+    }
+    values.push(value.to_owned());
+}
+
 /// 每条请求的逻辑线程身份，与缓存路由头分开解析
 #[must_use]
 pub fn codex_account_thread_id(
@@ -221,8 +307,9 @@ fn multi_agent_mode_from_text(text: &str) -> Option<&str> {
 }
 
 fn non_empty_string(value: Option<&Value>) -> Option<&str> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    non_empty_str(value.and_then(Value::as_str))
+}
+
+fn non_empty_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }

@@ -17,11 +17,13 @@ use gateway_core::account::{
 };
 use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection, WaitPriority};
 use gateway_core::engine::{AttemptContext, ContinuationAttempt, policy::AccountPolicyError};
+use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
+    CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort,
     ProviderConcurrencyPool, ProviderLeaseAcquisition, ProviderLeaseGuard, ProviderLeasePort,
     ProviderLeaseRequest, ProviderSchedulingLeaseRequest, ProviderSessionAffinityKey,
     ProviderSessionAffinityPort, ProviderSessionBinding, ProviderSessionExclusionPort,
-    ProviderSessionExclusions, ProviderStoreError,
+    ProviderSessionExclusions, ProviderStoreError, ProviderStoreErrorKind,
 };
 use gateway_core::routing::ProviderKind;
 use secrecy::ExposeSecret;
@@ -192,6 +194,8 @@ pub struct CodexCredentialSelector {
     cookie_policy: CodexCookiePolicy,
     risk_recovery: Mutex<HashMap<String, RiskRecoveryState>>,
     account_feedback: Arc<AccountFeedbackStats>,
+    /// session_pool 的会话归属；未装配时该模式如实失败，fixed 不受影响
+    codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +332,7 @@ impl CodexCredentialSelector {
         quota: Arc<CodexCredentialQuotaService>,
         account_feedback: Arc<AccountFeedbackStats>,
         cookie_policy: CodexCookiePolicy,
+        codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
     ) -> Self {
         Self {
             provider_kind,
@@ -341,6 +346,7 @@ impl CodexCredentialSelector {
             waiting: ConcurrencyWaitQueue::default(),
             reserved_waiting: ConcurrencyWaitQueue::default(),
             account_feedback,
+            codex_sessions,
         }
     }
 
@@ -572,7 +578,38 @@ impl CodexCredentialSelector {
         {
             return Err(CredentialSelectionError::NoEligibleCredential);
         }
-        let pinned_account = required_account.or_else(|| continuation_account.clone());
+        // session_pool：PostgreSQL 归属优先于软亲和；已有 owner 时本次 attempt 不得换号
+        let owner_key = request
+            .session_affinity_key
+            .filter(|_| !diagnostic && request.attempt.codex_session_pool());
+        let mut session_owner = match owner_key {
+            Some(key) => {
+                self.load_session_owner(request.attempt.client_api_key_ref(), key)
+                    .await?
+            }
+            None => None,
+        };
+        // 已知续接或状态 owner 却缺少持久归属，说明归属事实已丢失；
+        // 此时不能把它当作新会话重新认领，明确交回客户端按续接合同处理
+        if owner_key.is_some()
+            && session_owner.is_none()
+            && (continuation_account.is_some() || request.attempt.account_state_owner().is_some())
+        {
+            return Err(CredentialSelectionError::SessionBound(Box::new(
+                CredentialSelectionError::ContinuationOwnerChanged,
+            )));
+        }
+        let mut pinned_account = required_account.or_else(|| continuation_account.clone());
+        if let Some(owner) = session_owner.as_ref() {
+            // 显式固定或续写 owner 与持久归属不一致时直接失败，不做迁移
+            if pinned_account
+                .as_ref()
+                .is_some_and(|pinned| pinned != owner)
+            {
+                return Err(CredentialSelectionError::ContinuationOwnerChanged);
+            }
+            pinned_account = Some(owner.clone());
+        }
         let mut snapshot_retries = 0;
         'capacity: loop {
             let binding = if let Some(key) = binding_key {
@@ -1012,6 +1049,42 @@ impl CodexCredentialSelector {
                             drop(guard);
                             continue 'capacity;
                         }
+                        // session_pool：首次请求在取得租约、首次上游发送前原子认领；
+                        // 已有归属只复验，不在每次请求重写归属
+                        if let Some(key) = owner_key
+                            && session_owner.as_ref() != Some(account.id())
+                        {
+                            let claim = CodexSessionClaim {
+                                key_id: request.attempt.client_api_key_ref().clone(),
+                                session_key: key.clone(),
+                                account_id: account.id().clone(),
+                                credential_revision: account.revision().get(),
+                            };
+                            match self.claim_session_owner(&claim).await? {
+                                CodexSessionClaimOutcome::Owned => {}
+                                CodexSessionClaimOutcome::ConflictingOwner(owner) => {
+                                    // 并发首请求已有赢家：释放临时租约并按该 owner 重新选号
+                                    drop(guard);
+                                    session_owner = Some(owner.clone());
+                                    pinned_account = Some(owner);
+                                    continue 'capacity;
+                                }
+                                CodexSessionClaimOutcome::IdentityChanged => {
+                                    // 账号行锁内发现凭据已替换，选号快照不能继续使用
+                                    drop(guard);
+                                    retry_account_snapshot(
+                                        request.attempt,
+                                        &account,
+                                        &mut snapshot_retries,
+                                    )?;
+                                    continue 'capacity;
+                                }
+                                CodexSessionClaimOutcome::Unavailable => {
+                                    drop(guard);
+                                    return Err(CredentialSelectionError::NoEligibleCredential);
+                                }
+                            }
+                        }
                         let affinity_telemetry = affinity.telemetry(account.id());
                         let affinity_observation = request.session_affinity_observation;
                         tracing::info!(
@@ -1435,19 +1508,48 @@ impl CodexCredentialSelector {
         }
     }
 
-    /// 原生辅助请求只核对固定账号的授权与凭据，不消费模型额度或参与换号
+    /// 读取持久会话归属；存储不可用时如实失败，不能退回任意选号
+    pub(crate) async fn load_session_owner(
+        &self,
+        key_id: &ClientApiKeyId,
+        key: &ProviderSessionAffinityKey,
+    ) -> Result<Option<ProviderAccountId>, CredentialSelectionError> {
+        let port = self.codex_sessions.as_ref().ok_or_else(|| {
+            CredentialSelectionError::Coordinator(ProviderStoreError::new(
+                ProviderStoreErrorKind::Unavailable,
+                "load Codex session owner",
+            ))
+        })?;
+        Ok(port.load(key_id, key).await?)
+    }
+
+    pub(crate) async fn claim_session_owner(
+        &self,
+        claim: &CodexSessionClaim,
+    ) -> Result<CodexSessionClaimOutcome, CredentialSelectionError> {
+        let port = self.codex_sessions.as_ref().ok_or_else(|| {
+            CredentialSelectionError::Coordinator(ProviderStoreError::new(
+                ProviderStoreErrorKind::Unavailable,
+                "claim Codex session owner",
+            ))
+        })?;
+        Ok(port.claim(claim).await?)
+    }
+
+    /// 原生辅助请求只核对指定账号的授权与凭据，不消费模型额度或参与换号
     pub(crate) async fn native_credential(
         &self,
         context: &gateway_core::engine::codex::CodexAuthorizedContext,
+        account_id: &ProviderAccountId,
     ) -> Result<(ProviderAccount, super::security::CodexRuntimeCredential), CredentialSelectionError>
     {
-        if !context.account_scope().allows(context.account_id()) {
+        if !context.account_scope().allows(account_id) {
             return Err(CredentialSelectionError::NoEligibleCredential);
         }
         let loaded = self
             .repository
             .store()
-            .load_current_credential(context.account_id())
+            .load_current_credential(account_id)
             .await
             .map_err(|source| CredentialSelectionError::Store(ErrorSource::new(source)))?;
         if loaded.account.provider() != &self.provider_kind
@@ -1715,6 +1817,12 @@ impl CodexCredentialLease {
     #[must_use]
     pub const fn authentication(&self) -> &CodexRuntimeAuthentication {
         &self.authentication
+    }
+
+    /// 本次租约准入的会话键；中间件改写会话后不能再沿用
+    #[must_use]
+    pub(crate) fn admitted_session(&self) -> Option<&ProviderSessionAffinityKey> {
+        self.admitted_session.as_ref()
     }
 
     #[must_use]

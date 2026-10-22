@@ -125,11 +125,25 @@ impl CodexProvider {
             .get("turn_metadata")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let session_affinity = derive_codex_endpoint_session_affinity(
-            search.payload(),
-            context.client_api_key_ref(),
-            "id",
-        );
+        let session_affinity = if context.codex_session_pool() {
+            // session_pool：可关联 Search 跟随同一逻辑会话归属
+            // 官方 ext/web-search 以会话身份填 `id`，因此正文 `id` 属端点级逻辑来源
+            let body = serde_json::from_slice::<Map<String, Value>>(search.payload().body())
+                .map_err(|_| pool_session_error("session_key_invalid"))?;
+            Some(self.pool_session_affinity(
+                &context,
+                &body,
+                search.payload().context(),
+                &[],
+                body.get("id").and_then(Value::as_str),
+            )?)
+        } else {
+            derive_codex_endpoint_session_affinity(
+                search.payload(),
+                context.client_api_key_ref(),
+                "id",
+            )
+        };
         let response_origin = self.search_url.clone();
         self.execute_raw_json_endpoint(
             context,
@@ -236,12 +250,33 @@ impl CodexProvider {
                 self.image_session_affinity(image.payload(), &middleware_headers, &context)
                     .await?
             }
-            Operation::Search(search) => derive_endpoint_affinity_with_headers(
-                search.payload(),
-                context.client_api_key_ref(),
-                "id",
-                &middleware_headers,
-            ),
+            Operation::Search(search) => {
+                // session_pool：中间件改写后的正文必须仍是同一逻辑会话，
+                // 且后续校验与 turn 记录沿用同一池亲和
+                if context.codex_session_pool() {
+                    let body =
+                        serde_json::from_slice::<Map<String, Value>>(search.payload().body())
+                            .map_err(|_| pool_session_error("session_key_invalid"))?;
+                    let affinity = self.pool_session_affinity(
+                        &context,
+                        &body,
+                        search.payload().context(),
+                        &middleware_headers,
+                        body.get("id").and_then(Value::as_str),
+                    )?;
+                    if lease.admitted_session() != Some(affinity.key()) {
+                        return Err(pool_session_error("session_changed"));
+                    }
+                    Some(affinity)
+                } else {
+                    derive_endpoint_affinity_with_headers(
+                        search.payload(),
+                        context.client_api_key_ref(),
+                        "id",
+                        &middleware_headers,
+                    )
+                }
+            }
             _ => None,
         };
         if !context.is_diagnostic_required_account() {

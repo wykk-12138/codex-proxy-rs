@@ -65,6 +65,7 @@ pub(super) struct CoordinationExtensions {
     endpoint: String,
     client_transport: super::execution::ClientTransport,
     extension_scope: super::extensions::ExtensionCallScope,
+    codex_session_pool: bool,
 }
 
 impl CoordinationExtensions {
@@ -101,6 +102,7 @@ impl CoordinationExtensions {
             endpoint: String::new(),
             client_transport: super::execution::ClientTransport::InternalProbe,
             extension_scope: super::extensions::ExtensionCallScope::default(),
+            codex_session_pool: false,
         }
     }
 
@@ -110,6 +112,13 @@ impl CoordinationExtensions {
         extension_scope: super::extensions::ExtensionCallScope,
     ) -> Self {
         self.extension_scope = extension_scope;
+        self
+    }
+
+    /// 标记本次执行属于 session_pool 原生请求；Provider 据此读取会话归属
+    #[must_use]
+    pub(super) fn with_codex_session_pool(mut self, session_pool: bool) -> Self {
+        self.codex_session_pool = session_pool;
         self
     }
 
@@ -263,6 +272,7 @@ where
             endpoint,
             client_transport,
             extension_scope,
+            codex_session_pool,
         } = extensions;
         let request_id = request.id.clone();
         let client_api_key_ref = request.client_api_key_ref.clone();
@@ -354,6 +364,7 @@ where
             endpoint,
             client_transport,
             extension_scope,
+            codex_session_pool,
             account_selection,
             continuation,
             continuation_attempt,
@@ -501,6 +512,8 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     endpoint: String,
     client_transport: super::execution::ClientTransport,
     extension_scope: super::extensions::ExtensionCallScope,
+    /// session_pool 下每个 attempt 都必须携带同一会话归属事实
+    codex_session_pool: bool,
     account_selection: AccountSelection,
     continuation: Option<ContinuationBinding>,
     continuation_attempt: ContinuationAttempt,
@@ -1151,6 +1164,7 @@ where
                     self.client_transport,
                 )
                 .with_extension_scope(self.extension_scope.clone())
+                .with_codex_session_pool(self.codex_session_pool)
                 .with_trace(self.trace.clone()),
             next_attempt,
             self.deadline,

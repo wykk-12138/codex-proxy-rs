@@ -310,6 +310,7 @@ pub struct RequestAttemptContext {
     endpoint: String,
     client_transport: execution::ClientTransport,
     extension_scope: extensions::ExtensionCallScope,
+    codex_session_pool: bool,
 }
 
 impl RequestAttemptContext {
@@ -325,6 +326,13 @@ impl RequestAttemptContext {
         metadata: Arc<crate::provider_ports::ProviderLeaseMetadata>,
     ) -> Self {
         self.lease_metadata = Some(metadata);
+        self
+    }
+
+    /// session_pool 原生请求必须按持久会话归属选号，普通入口保持默认值
+    #[must_use]
+    pub const fn with_codex_session_pool(mut self, session_pool: bool) -> Self {
+        self.codex_session_pool = session_pool;
         self
     }
 
@@ -417,6 +425,7 @@ impl RequestAttemptContext {
             endpoint: String::new(),
             client_transport: execution::ClientTransport::InternalProbe,
             extension_scope: extensions::ExtensionCallScope::default(),
+            codex_session_pool: false,
         }
     }
 
@@ -623,6 +632,12 @@ impl AttemptContext {
     #[must_use]
     pub fn privacy(&self) -> Option<Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>> {
         self.request.privacy.clone()
+    }
+
+    /// 本次 attempt 是否必须遵守会话级账号归属
+    #[must_use]
+    pub const fn codex_session_pool(&self) -> bool {
+        self.request.codex_session_pool
     }
 
     #[must_use]

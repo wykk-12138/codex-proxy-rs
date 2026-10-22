@@ -4,6 +4,33 @@ use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 
+/// 只在 session_pool 使用：从中间件最终请求头补全来源后委托协议层判定
+///
+/// 头只提供 turn metadata 与 session-id 两个值；来源优先级、缺失与冲突语义
+/// 统一由 `codex_session_identity` 决定，fixed 与普通 `/v1` 不调用该函数
+pub(crate) fn pool_session_identity(
+    body: &Map<String, Value>,
+    context: &Map<String, Value>,
+    headers: &[gateway_core::engine::middleware::MiddlewareHeader],
+    endpoint_session: Option<&str>,
+) -> gateway_protocol::openai::CodexSessionIdentity {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case(name))
+            .and_then(|header| std::str::from_utf8(header.value()).ok())
+    };
+    gateway_protocol::openai::codex_session_identity(
+        gateway_protocol::openai::CodexSessionSources {
+            body,
+            context,
+            turn_metadata: header("x-codex-turn-metadata"),
+            session_id: header("session-id"),
+            endpoint_session,
+        },
+    )
+}
+
 /// 只有能识别出的后代线程禁止迁移会话；没有身份的普通客户端沿用现有调度
 pub(crate) fn follows_session_with_headers(
     body: &Map<String, Value>,

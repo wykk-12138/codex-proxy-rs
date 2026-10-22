@@ -594,6 +594,21 @@ pub(super) fn websocket_retry_backoff(retry_index: NonZeroU32) -> Duration {
     Duration::from_millis(base_ms.saturating_mul(jitter_per_mille) / 1_000)
 }
 
+/// session_pool 的会话键缺失或来源冲突只对该模式生效
+///
+/// fixed 与普通 `/v1` 不新增拒绝；该错误不携带上游正文，也不允许重试换号
+pub(super) fn pool_session_error(code: &'static str) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        UpstreamSendState::NotSent,
+    )
+    .with_retry_prohibited()
+    .with_diagnostic(
+        ProviderDiagnostic::new("codex session identity is unusable")
+            .with_classification("session_pool", code),
+    )
+}
+
 pub(super) fn continuation_replay_required_error(reason: &'static str) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::ContinuationRecoveryRequired,

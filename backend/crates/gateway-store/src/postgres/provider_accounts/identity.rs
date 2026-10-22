@@ -44,8 +44,10 @@ pub(super) async fn validate_credential_identity_in_transaction(
         CredentialIdentityWrite::UnidentifiedReplacement => true,
     };
     if changed {
+        // 入口绑定与会话归属都引用账号身份；任一存在都不能替换上游 user/workspace
         let bound: bool = sqlx::query_scalar(
-            "select exists(select 1 from client_api_key_codex_bindings where account_id = $1)",
+            "select exists(select 1 from client_api_key_codex_bindings where account_id = $1)
+                 or exists(select 1 from client_api_key_codex_sessions where account_id = $1)",
         )
         .bind(account_id)
         .fetch_one(&mut **transaction)
@@ -73,7 +75,13 @@ fn credential_identity_conflict(account_id: &str, kind: ConflictKind) -> StoreEr
 pub(super) fn map_account_delete_error(source: sqlx::Error) -> StoreError {
     if source.as_database_error().is_some_and(|error| {
         error.is_foreign_key_violation()
-            && error.constraint() == Some("client_api_key_codex_bindings_account_id_fkey")
+            && matches!(
+                error.constraint(),
+                Some(
+                    "client_api_key_codex_bindings_account_id_fkey"
+                        | "client_api_key_codex_sessions_account_id_fkey"
+                )
+            )
     }) {
         return StoreError::Conflict {
             source: Some(source.into()),

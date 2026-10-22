@@ -14,12 +14,13 @@ use gateway_core::{
         },
     },
     lifecycle::CancellationToken,
-    policy::CodexAccessBinding,
+    policy::{CodexAccessBinding, CodexAccessMode},
 };
 
 fn binding(enabled: bool, account: &str) -> CodexAccessBinding {
     CodexAccessBinding {
         enabled,
+        mode: CodexAccessMode::Fixed,
         account_id: ProviderAccountId::new(account).unwrap(),
     }
 }
@@ -140,8 +141,8 @@ struct NativeGateway {
 
 impl NativeGateway {
     fn observe(&self, context: &CodexAuthorizedContext) {
-        assert_eq!(context.account_id().as_str(), "acct_start");
-        assert!(context.account_scope().allows(context.account_id()));
+        assert_eq!(context.entry_account_id().as_str(), "acct_start");
+        assert!(context.account_scope().allows(context.entry_account_id()));
         assert!(
             !context
                 .account_scope()

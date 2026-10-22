@@ -614,6 +614,12 @@ impl RuntimeSnapshot {
         &self.settings.values
     }
 
+    /// 会话归属与辅助选号共用的冻结账号调度策略
+    #[must_use]
+    pub(crate) fn account_selection_policy(&self) -> crate::account::AccountSelectionPolicy {
+        self.settings.account_selection_policy
+    }
+
     pub(crate) fn resolve_settings(
         self: &Arc<Self>,
         values: &SettingsValues,

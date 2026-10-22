@@ -284,7 +284,11 @@ async fn connect(
         runtime_policy,
         oauth_pending,
         diagnostics.clone(),
-    );
+    )
+    // 会话归属由 PostgreSQL 持有；Redis 软亲和只保留可丢失的调度提示
+    .with_codex_sessions(Arc::new(postgres::PgCodexSessionOwnership::new(
+        pool.clone(),
+    )));
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
     ));

@@ -257,7 +257,7 @@ impl UpdateClientKeyRequest {
         Ok(UpdateClientKey {
             codex_access: self
                 .codex_access
-                .map(CodexAccessWire::into_binding)
+                .map(CodexAccessWire::into_update)
                 .transpose()?,
             request_profile_override_updates,
             id: client_key_id(self.id, "clientKeyMutationNotFound")?,
@@ -1100,17 +1100,45 @@ fn deserialize_profile_override<'de, D: serde::Deserializer<'de>>(
 }
 
 /// 原生访问的持久账号绑定，更新不接受清空
+///
+/// 创建时省略 `mode` 为 fixed；更新时省略 `mode` 保留既有模式
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CodexAccessWire {
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     account_id: String,
 }
 
 impl CodexAccessWire {
+    fn parse_mode(
+        &self,
+    ) -> Result<Option<gateway_core::policy::CodexAccessMode>, WireValidationError> {
+        self.mode
+            .as_deref()
+            .map(|mode| {
+                gateway_core::policy::CodexAccessMode::parse(mode)
+                    .ok_or_else(|| WireValidationError::new("codexAccess"))
+            })
+            .transpose()
+    }
+
     fn into_binding(self) -> Result<gateway_core::policy::CodexAccessBinding, WireValidationError> {
+        let mode = self.parse_mode()?.unwrap_or_default();
         Ok(gateway_core::policy::CodexAccessBinding {
             enabled: self.enabled,
+            mode,
+            account_id: gateway_core::account::ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("codexAccess"))?,
+        })
+    }
+
+    fn into_update(self) -> Result<gateway_core::policy::CodexAccessUpdate, WireValidationError> {
+        let mode = self.parse_mode()?;
+        Ok(gateway_core::policy::CodexAccessUpdate {
+            enabled: self.enabled,
+            mode,
             account_id: gateway_core::account::ProviderAccountId::new(self.account_id)
                 .map_err(|_| WireValidationError::new("codexAccess"))?,
         })
@@ -1121,6 +1149,7 @@ impl From<gateway_core::policy::CodexAccessBinding> for CodexAccessWire {
     fn from(binding: gateway_core::policy::CodexAccessBinding) -> Self {
         Self {
             enabled: binding.enabled,
+            mode: Some(binding.mode.as_str().to_owned()),
             account_id: binding.account_id.to_string(),
         }
     }
