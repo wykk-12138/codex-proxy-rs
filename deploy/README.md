@@ -287,7 +287,7 @@ Compose 默认只绑定 `127.0.0.1`。从其他设备访问时，在应用前配
 HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 会话 Cookie 合同见 [管理接口鉴权](../docs/api.md#管理接口)
 
-反向代理需要保留 `Authorization`，支持 `/v1/responses` 与 `/codex/backend-api/codex/responses` 的 WebSocket Upgrade，
+反向代理需要保留 `Authorization`，支持 `/v1/responses` 与 `/backend-api/codex/responses` 的 WebSocket Upgrade，
 并关闭 SSE 响应缓冲。读取超时应覆盖长时间生成任务。
 客户端使用部署地址下的 `/v1`，协议与部署一致，不要使用前端开发服务的 `5173/dev/v1`。
 当前应用只支持单副本，不能通过复制容器扩容
@@ -386,11 +386,24 @@ V2 远程压缩通过 Responses 接口发送 `compaction_trigger`，网关和上
 ### 原生 Codex 接入
 
 官方 Codex 客户端可以不用 `model_providers` 而直接连 `/codex` 原生入口。先完成两项管理端配置：
-在「API 密钥」创建或编辑时开启「原生 Codex 访问」并选择已识别身份的 OpenAI OAuth 账号，
+在「API 密钥」创建或编辑时开启「原生 Codex 访问」，选择访问模式并选择已识别身份的 OpenAI OAuth 账号，
 在「系统设置」的「安全与访问」填写原生 Codex 公共地址
 
-绑定后只能切换启停，换账号需要新建 Key；删除 Key 一并解除绑定。绑定账号不在 Key 的有效分组范围、
-账号凭据失效或停止启用时，原生请求被拒绝，不会改用其他账号
+两种访问模式共用一个入口账号，建立后只能切换启停，换账号或换模式都需要新建 Key，删除 Key 一并解除绑定：
+
+- 固定账号：全部原生请求使用入口账号
+- 会话池：不同会话可以使用 Key 授权池中的不同账号；同一逻辑会话固定使用首次认领的账号，不自动换号，
+  也不做跨账号迁移
+
+会话池下 history、notes 与推理请求使用同一账号即可，不需要为辅助请求单独选择账号
+
+入口账号或会话 owner 不在 Key 的有效分组范围、凭据失效或停止启用时，原生请求被拒绝，不会改用其他账号。
+会话池的归属随数据库备份；回退不是只换镜像：schema 已前移，旧版本无法对含该表的数据库启动，
+必须连同数据库一起恢复到不含该表的备份。恢复后已认领会话的归属已丢失，带已知续接信息的请求会明确失败，
+只有新会话才重新认领
+
+多个 Key 可以绑定同一个 OAuth 账号，但共享该账号的官方数据空间，不能仅凭 Key 不同获得历史隔离。
+新建 Key、会话池的新会话或切换客户端接入都不会由网关搬移官方归档历史和 notes
 
 以下配置适用于官方 Codex `0.163.0-alpha.10.2`，使用独立目录和登录上下文，不覆盖桌面默认配置。
 先创建目录，并将权限限制为仅本人访问：
@@ -405,8 +418,8 @@ chmod 700 "$HOME/.codex-native"
 ```toml
 model_provider = "openai"
 cli_auth_credentials_store = "file"
-openai_base_url = "https://cpr.example.com/codex/backend-api/codex"
-chatgpt_base_url = "https://cpr.example.com/codex/backend-api"
+openai_base_url = "https://cpr.example.com/backend-api/codex"
+chatgpt_base_url = "https://cpr.example.com/backend-api"
 
 [features.token_budget]
 enabled = true
@@ -430,7 +443,7 @@ use_history_notes_extension = true
 chmod 600 "$HOME/.codex-native/auth.json"
 env -u OPENAI_API_KEY -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_BASE_URL \
   CODEX_HOME="$HOME/.codex-native" \
-  CODEX_AUTHAPI_BASE_URL="https://cpr.example.com/codex/auth" \
+  CODEX_AUTHAPI_BASE_URL="https://cpr.example.com" \
   codex
 ```
 

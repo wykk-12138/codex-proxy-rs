@@ -600,37 +600,63 @@ call 与账号的绑定保存在网关进程内，未连接时一小时过期；
 
 ### 原生 Codex 入口
 
-固定前缀 `/codex` 供官方 Codex 客户端原生接入，只转发下表列出的路径与方法，其余 `/codex` 路径返回 `404`，
-不进入管理端页面，也不作为任意上游代理：
+固定使用 `/v1/user-auth-credential` 与 `/backend-api` 两组路径供官方 Codex 客户端原生接入，只转发下表列出的路径与方法，
+其余路径返回 `404`，不进入管理端页面，也不作为任意上游代理：
 
 | 方法 | 路由 | 说明 |
 | --- | --- | --- |
-| `GET` | `/codex/auth/v1/user-auth-credential/whoami` | 绑定账号的身份投影 |
-| `GET` | `/codex/backend-api/wham/accounts/check` | 账号检查与工作区路由地址 |
-| `GET` | `/codex/backend-api/codex/models` | 模型目录，保留 `client_version` 与已支持的 query |
-| `POST` | `/codex/backend-api/codex/responses` | Responses 请求，支持 SSE |
-| `GET` | `/codex/backend-api/codex/responses` | Responses WebSocket |
-| `POST` | `/codex/backend-api/codex/alpha/search` | 搜索 |
-| `POST` | `/codex/backend-api/codex/alpha/history/v2/{list_windows,list_items,read_item,search_contents}` | history 读取 |
-| `POST` | `/codex/backend-api/codex/alpha/notes/v2/{thread_hint,list_files_by_prefix,read_file,search_contents,append_to_file,write_file}` | notes 读取与写入 |
-| `GET` | `/codex/backend-api/wham/{usage,profiles/me,settings/user,workspace-messages,config/bundle}` | 只读账号信息 |
+| `GET` | `/v1/user-auth-credential/whoami` | 入口账号的身份投影 |
+| `GET` | `/backend-api/wham/accounts/check` | 账号检查与工作区路由地址 |
+| `GET` | `/backend-api/codex/models` | 模型目录，保留 `client_version` 与已支持的 query |
+| `POST` | `/backend-api/codex/responses` | Responses 请求，支持 SSE |
+| `GET` | `/backend-api/codex/responses` | Responses WebSocket |
+| `POST` | `/backend-api/codex/alpha/search` | 搜索 |
+| `POST` | `/backend-api/codex/alpha/history/v2/{list_windows,list_items,read_item,search_contents}` | history 读取 |
+| `POST` | `/backend-api/codex/alpha/notes/v2/{thread_hint,list_files_by_prefix,read_file,search_contents,append_to_file,write_file}` | notes 读取与写入 |
+| `GET` | `/backend-api/wham/{usage,profiles/me,settings/user,workspace-messages,config/bundle}` | 只读账号信息 |
 
 入口认证与 `/v1` 一致，使用 `Authorization: Bearer <Client Key>`。只有启用
-[codexAccess](#7-client-key) 的 Key 可以使用原生入口，每次请求重新求 Key 有效分组、OpenAI OAuth 账号和
-绑定账号的交集，范围失效时拒绝，不扩大范围或改用其他账号；WebSocket 在每轮 `response.create`
-后执行同样的认证与绑定收窄。上游 OAuth 凭据不出网关，下游 Cookie、Client Key 与账号身份头不向上游透传
+[codexAccess](#7-client-key) 的 Key 可以使用原生入口，每次请求按 Key 当前有效的分组与 OpenAI OAuth 账号范围复验，
+范围失效时拒绝，不扩大范围或改用其他账号；WebSocket 在每轮 `response.create` 后执行同样的认证与范围复验。
+上游 OAuth 凭据不出网关，下游 Cookie、Client Key 与账号身份头不向上游透传
 
-whoami 与 accounts/check 由绑定账号的真实 Provider 事实投影，只公布该账号。套餐沿用 Provider 的解析结果，
-FedRAMP 声明保留官方值或默认值，不补造成更高档位。accounts/check 的工作区路由地址使用运行设置中的
-[原生 Codex 公共地址](#原生-codex-公共地址)，不从 `Host` 或转发头推导
+`codexAccess.mode` 决定执行账号的来源：
 
-模型目录沿用 `/v1/models` 的只读合同，按绑定账号范围过滤，不创建推理 attempt 或计量，也不执行模型准入。
+- `fixed`：全部原生请求使用入口账号，范围进一步收窄到该账号
+- `session_pool`：Key 的有效授权池就是请求范围，每个逻辑会话在第一次上游发送前从池中认领一个账号。
+  归属按 `(Client Key, 逻辑会话)` 持久保存，之后该会话的 Responses、SSE、WebSocket 后续轮次、搜索、history、notes、
+  `/compact` 与 `new_context` 都只使用这个账号。不同会话可以使用不同账号，同一会话不自动换号
+
+`session_pool` 的逻辑会话取自 `x-codex-turn-metadata` 请求头、正文与请求上下文中的 turn metadata、
+`client_metadata.session_id` 以及 Search 正文的 `id`；这些来源去重后必须唯一，多于一个值即冲突。
+逻辑会话缺失时才使用兜底来源：先取 `session-id` 请求头，再取正文顶层 `session_id` 或 history、notes 正文的
+`context.session_id`。兜底可能只是缓存路由键，取值与逻辑会话不同不算冲突。
+逻辑会话与兜底都缺失，或逻辑来源互相冲突时返回 `400 invalid_request`，不重试、不换号，也不退回入口账号；
+WebSocket 在 `response.create` 阶段按同一合同失败。`fixed` 与普通 `/v1` 不应用这条拒绝规则
+
+会话 owner 额度耗尽、凭据失效、被停用或移出 Key 范围时，该会话按真实原因失败并沿现有有界等待处理，不迁移到其他账号；
+其他新会话仍可按当前有效范围使用池内其他账号。归属读取失败时请求如实失败，不绕过存储发送。
+已知续接或状态 owner 却缺少持久归属时同样明确失败，不把该请求当作新会话重新认领
+
+whoami 与 accounts/check 由入口账号的真实 Provider 事实投影，只公布该账号，`session_pool` 也不展示池内其他账号。
+套餐沿用 Provider 的解析结果，FedRAMP 声明保留官方值或默认值，不补造成更高档位。accounts/check 的工作区路由地址
+使用运行设置中的 [原生 Codex 公共地址](#原生-codex-公共地址)，不从 `Host` 或转发头推导
+
+模型目录沿用 `/v1/models` 的只读合同，按 Key 当前有效的 OpenAI OAuth 账号范围过滤，不创建推理 attempt 或计量，
+也不执行模型准入。`session_pool` 的目录来自整个授权池，不保证已认领会话能使用池内任意模型；
+模型不被 owner 支持时返回真实限制，不通过迁移会话补偿。
 Responses 与搜索沿用 `/v1` 的 Key 限额与并发准入。whoami、accounts/check、history、notes 与只读账号信息共享
 Key RPM、并发与排队，不进入模型金额门禁或生成模型费用，取消或丢弃响应正文时释放准入。
 辅助请求与同一 Key 的模型流重叠时也受该并发限制，容量不足按现有配置拒绝或排队，不设独立辅助并发池
 
-history、notes 仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放
+history、notes 仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放。
+`session_pool` 下 history、notes 与模型请求使用同一逻辑会话的 owner 账号；`usage`、`profiles/me`、`settings/user`、
+`workspace-messages`、`config/bundle` 等账号级只读信息仍使用入口账号。辅助操作的业务结果也可封装在
+`encrypted_output` 中，HTTP `200` 不代表文件存在或命中历史；客户端按官方工具合同消费结果，
+网关不将密文或业务错误改写为成功空对象
 
+接口不提供归档历史或 notes 的导入、迁移，不能把客户端重放当前有效上下文等同于官方存储迁移。
+新建 Key、切到其他会话池账号或切换客户端接入都不会由网关搬移官方归档与 notes；
 同一 OAuth 账号被多个 Key 绑定时共享官方账号空间，原生入口不提供 Key 级历史隔离
 
 ## 4. 浏览器认证
@@ -1419,12 +1445,15 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 创建时省略或 `null` 表示无覆盖；更新时省略保留、`null` 清除。与通用字段同时提交时必须一致，否则拒绝整个请求；
 响应中的兼容字段从同一映射派生，不是第二份配置
 
-`codexAccess` 是可选的原生 Codex 账号绑定：`{"enabled": true, "accountId": "<CPRS 账号 ID>"}`。
-创建时省略或 `null` 表示不绑定；更新时省略保留，`null` 拒绝。已建立的绑定只能修改 `enabled`，
-换 `accountId` 会被拒绝，需要其他账号时新建 Key；删除 Key 一并解除绑定，列表无绑定时返回 `codexAccess: null`。
-首次绑定要求账号存在、已识别 user 与 workspace、属于 OpenAI OAuth，并在该 Key 的有效分组范围内，
-无分组表示全部账号。每次原生请求重新求范围交集，因此分组停用或成员移除后，同值保存、停用和重新启用仍可执行，
-是否放行由请求时的范围决定。入口合同见 [原生 Codex 入口](#原生-codex-入口)
+`codexAccess` 是可选的原生 Codex 绑定：`{"enabled": true, "mode": "session_pool", "accountId": "<CPRS 账号 ID>"}`。
+`mode` 为 `fixed` 或 `session_pool`，创建时省略按 `fixed`；`accountId` 是入口账号，`fixed` 用它执行全部原生请求，
+`session_pool` 只用它提供稳定身份与账号级辅助信息。创建时省略或 `null` 表示不绑定；更新时省略保留，`null` 拒绝。
+已建立的绑定只能修改 `enabled`，换 `accountId` 或换 `mode` 都会被拒绝，需要其他账号或模式时新建 Key；
+更新时省略 `mode` 保留既有模式，旧客户端不会因此被切回 `fixed`。列表始终返回 `mode`，无绑定时为 `codexAccess: null`；
+删除 Key 一并解除绑定及其会话归属。首次绑定要求账号存在、已识别 user 与 workspace、属于 OpenAI OAuth，
+并在该 Key 的有效分组范围内，无分组表示全部账号。每次原生请求重新求范围交集，因此分组停用或成员移除后，
+同值保存、停用和重新启用仍可执行，是否放行由请求时的范围决定。各模式的执行账号与会话归属见
+[原生 Codex 入口](#原生-codex-入口)
 
 密钥列表的 `search` 仅匹配名称和标签，不匹配密钥值或可见前缀；搜索不区分大小写，使用字面量前缀匹配。
 创建和更新时去除名称首尾空白，并按忽略大小写、首尾空格的名称查重，重复返回 `409`。
@@ -1480,7 +1509,7 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 与无候选账号的 `no_available_provider` 区分；排队不绕过账号范围、模型权限、RPM 或金额限额
 
 OpenAI 会话因之前的上游 `cyber_policy` 拒绝而排除全部可选账号时，选号失败返回 `400` / `cyber_policy`，
-提示停止反复重试该会话，不代表账号被封或服务整体不可用；固定账号请求只判断其绑定范围。
+提示停止反复重试该会话，不代表账号被封或服务整体不可用；锁定单一账号的请求只判断其绑定范围。
 该本地失败禁止自动重放；会话排除期限为一小时，严格亲和后代线程仍按上述规则等待。
 同次请求换号耗尽时保留已收到的原始上游错误；后续请求没有上游失败可交付时才使用上述本地提示。
 已开始交付的请求沿用流内错误合同，不能再改变 HTTP 状态
