@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ApiKey } from '@/api'
+import type { ApiKey, ApiKeyCodexAccessMode } from '@/api'
 import { ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable } from '@codex-proxy/ui'
 
 import { ref, shallowRef, watch } from 'vue'
@@ -22,7 +22,12 @@ import { useApiKeyMutations } from './composables/useApiKeyMutations'
 import { useApiKeysQuery } from './composables/useApiKeysQuery'
 import { useApiKeyUse } from './composables/useApiKeyUse'
 import { useCodexAccountCandidates } from './composables/useCodexAccountCandidates'
-import { apiKeyColumns } from './constants'
+import { apiKeyColumns, codexAccessModeLabels } from './constants'
+
+// 旧响应缺少 mode 时与后端缺省语义一致，按固定账号展示
+function codexAccessModeLabel(mode: ApiKeyCodexAccessMode | undefined) {
+  return codexAccessModeLabels[mode ?? 'fixed']
+}
 
 const selectedIds = ref<Set<string>>(new Set())
 const showBudgetResetModal = shallowRef(false)
@@ -177,7 +182,10 @@ watch(
               <ApiKeyScopeCell :api-key="row" />
             </template>
             <template #codexAccess="{ row }">
-              <ApiKeyStatusBadge v-if="row.codexAccess" :api-key="row.codexAccess" />
+              <div v-if="row.codexAccess" class="grid w-full justify-items-center gap-1">
+                <ApiKeyStatusBadge :api-key="row.codexAccess" />
+                <span class="text-cp-xs text-cp-text-tertiary">{{ codexAccessModeLabel(row.codexAccess.mode) }}</span>
+              </div>
               <span v-else class="text-cp-text-quaternary">—</span>
             </template>
             <template #budget="{ row }">

@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyEditor'
 import type { CodexAccountCandidate } from '../composables/useCodexAccountCandidates'
-import type { AccountGroupRef } from '@/api'
-import { ZButton, ZDialog, ZForm, ZFormItem, ZInput, ZSelect, ZSwitch } from '@codex-proxy/ui'
+import type { AccountGroupRef, ApiKeyCodexAccessMode } from '@/api'
+import { ZButton, ZDialog, ZForm, ZFormItem, ZInput, ZSegmented, ZSelect, ZSwitch } from '@codex-proxy/ui'
 
 import { DollarSign, KeyRound } from '@lucide/vue'
 import { computed, watch } from 'vue'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import ProviderRequestProfilesEditor from '@/components/client-profile/ProviderRequestProfilesEditor.vue'
+import { codexAccessModeLabels } from '../constants'
 
 const props = defineProps<{
   groups: AccountGroupRef[]
@@ -40,9 +41,31 @@ const boundAccountLabel = computed(() =>
   props.accounts.find(account => account.id === form.value.codexAccountId)?.label ?? form.value.codexAccountId,
 )
 
+// 两种模式共用同一份账号选择；差别只在执行账号如何确定
+const modeOptions: { label: string, value: ApiKeyCodexAccessMode }[] = [
+  { label: codexAccessModeLabels.fixed, value: 'fixed' },
+  { label: codexAccessModeLabels.session_pool, value: 'session_pool' },
+]
+const FIXED_MODE_HINT = '所有原生请求都使用这个账号'
+const SESSION_POOL_MODE_HINT = '不同会话可使用不同账号，同一会话不自动换号；入口账号只提供稳定身份与账号级辅助信息'
+
+const activeModeLabel = computed(() => codexAccessModeLabels[form.value.codexAccessMode])
+
+const modeHint = computed(() =>
+  form.value.codexAccessMode === 'session_pool' ? SESSION_POOL_MODE_HINT : FIXED_MODE_HINT,
+)
+
+// 已建立的绑定只维护启停，模式与账号都不提供原地迁移
+const lockedModeHint = computed(() => `模式建立后不能切换，需要其他模式时新建密钥；${modeHint.value}`)
+
 const codexDescription = computed(() => props.codexLocked
-  ? '已绑定的账号不能更换，需要其他账号时新建密钥'
+  ? '已建立的账号与模式都不能更换，只能调整启停'
   : '只列出当前分组范围内已识别身份的 OpenAI OAuth 账号')
+
+// 未知值按 fixed 处理，旧响应缺少 mode 时与后端缺省语义一致
+function updateMode(value: string) {
+  updateForm('codexAccessMode', value === 'session_pool' ? 'session_pool' : 'fixed')
+}
 
 // 分组变化后已选账号不在绑定范围时清空选择，避免提交服务端会拒绝的组合
 watch(() => form.value.groupIds, () => {
@@ -123,24 +146,41 @@ watch(() => form.value.groupIds, () => {
 
           <div
             v-if="codexLocked"
-            class="flex min-w-0 items-center gap-2 rounded-cp bg-cp-fill-quaternary px-3 py-2"
+            class="grid gap-1 rounded-cp bg-cp-fill-quaternary px-3 py-2"
           >
-            <span class="min-w-0 truncate text-cp-sm text-cp-text" :title="boundAccountLabel">
-              {{ boundAccountLabel }}
-            </span>
+            <div class="flex min-w-0 items-center gap-2">
+              <span class="shrink-0 text-cp-xs text-cp-text-tertiary">{{ activeModeLabel }}</span>
+              <span class="min-w-0 truncate text-cp-sm text-cp-text" :title="boundAccountLabel">
+                {{ boundAccountLabel }}
+              </span>
+            </div>
+            <p class="m-0 text-cp-xs text-cp-text-tertiary">
+              {{ lockedModeHint }}
+            </p>
           </div>
 
           <template v-else-if="form.codexAccessEnabled">
+            <ZSegmented
+              :model-value="form.codexAccessMode"
+              class="w-full"
+              aria-label="原生 Codex 访问模式"
+              :options="modeOptions"
+              :disabled="saving"
+              @update:model-value="updateMode"
+            />
             <ZSelect
               :model-value="form.codexAccountId"
               class="w-full"
               :options="codexOptions"
               :disabled="saving || accountLoading"
-              aria-label="原生 Codex 绑定账号"
+              :aria-label="form.codexAccessMode === 'session_pool' ? '原生 Codex 入口账号' : '原生 Codex 绑定账号'"
               placeholder="选择 OpenAI OAuth 账号"
               empty-text="暂无 OpenAI OAuth 账号"
               @update:model-value="updateForm('codexAccountId', $event ?? '')"
             />
+            <p class="m-0 text-cp-xs text-cp-text-tertiary">
+              {{ modeHint }}
+            </p>
           </template>
         </div>
       </ZFormItem>

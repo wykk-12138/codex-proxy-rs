@@ -1,4 +1,4 @@
-import type { ApiKey } from '@/api'
+import type { ApiKey, ApiKeyCodexAccess, ApiKeyCodexAccessMode } from '@/api'
 import type { ProviderRequestProfiles, ProviderRequestProfileUpdates } from '@/api/modules/settings/profiles'
 import { ZNotification } from '@codex-proxy/ui'
 import { cloneDeep } from 'es-toolkit'
@@ -11,6 +11,8 @@ export interface ApiKeyFormValue {
   customKey: string
   codexAccountId: string
   codexAccessEnabled: boolean
+  // 仅新建绑定时可编辑；已有绑定沿用其模式，不允许原地切换
+  codexAccessMode: ApiKeyCodexAccessMode
   name: string
   label: string
   groupIds: string[]
@@ -44,6 +46,7 @@ export function useApiKeyEditor(options: {
       customKey: '',
       codexAccountId: key.codexAccess?.accountId ?? '',
       codexAccessEnabled: key.codexAccess?.enabled ?? false,
+      codexAccessMode: key.codexAccess?.mode ?? 'fixed',
       name: key.name,
       label: key.label ?? '',
       groupIds: key.groups.map(group => group.id),
@@ -86,12 +89,20 @@ export function useApiKeyEditor(options: {
           weeklyLimitUsd: form.value.weeklyLimitUsd.trim() || '0',
         }
         const current = editingKey.value
-        // 已有绑定只能切换启停，账号 ID 始终沿用原值
+        // 已有绑定只能切换启停，账号 ID 与模式始终沿用原值
         const boundAccountId = current?.codexAccess?.accountId ?? null
         const codexAccountId = boundAccountId ?? (form.value.codexAccessEnabled ? form.value.codexAccountId : '')
-        const codexAccess = codexAccountId
-          ? { enabled: form.value.codexAccessEnabled, accountId: codexAccountId }
-          : undefined
+        let codexAccess: ApiKeyCodexAccess | undefined
+        if (codexAccountId) {
+          // 已有绑定的模式不可原地切换；省略 mode 即保留既有模式，不会退成 fixed
+          codexAccess = current?.codexAccess
+            ? { enabled: form.value.codexAccessEnabled, accountId: codexAccountId }
+            : {
+                enabled: form.value.codexAccessEnabled,
+                mode: form.value.codexAccessMode,
+                accountId: codexAccountId,
+              }
+        }
         let created: { key: string, name: string } | undefined
         if (current) {
           await updateApiKey({
@@ -173,6 +184,7 @@ function emptyForm(): ApiKeyFormValue {
     customKey: '',
     codexAccountId: '',
     codexAccessEnabled: false,
+    codexAccessMode: 'fixed',
     name: '',
     label: '',
     groupIds: [],

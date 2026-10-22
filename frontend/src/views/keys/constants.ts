@@ -1,6 +1,12 @@
-import type { ApiKey } from '@/api'
+import type { ApiKey, ApiKeyCodexAccessMode } from '@/api'
 
 import { defineTableColumns } from '@codex-proxy/ui'
+
+// 列表与表单共用同一套模式文案
+export const codexAccessModeLabels: Record<ApiKeyCodexAccessMode, string> = {
+  fixed: '固定账号',
+  session_pool: '会话池',
+}
 
 export const apiKeyColumns = defineTableColumns<ApiKey>([
   { key: 'selection', kind: 'selection' },
