@@ -12,9 +12,15 @@ export type ApiKeyCodexAccessMode = 'fixed' | 'session_pool'
 // 原生 Codex 访问的持久绑定；建立后只能切换 enabled，模式与账号不能原地更换
 export interface ApiKeyCodexAccess {
   enabled: boolean
-  // 读取响应始终返回；旧响应缺省按 fixed 解释
-  mode?: ApiKeyCodexAccessMode
+  mode: ApiKeyCodexAccessMode
   // fixed 的实际执行账号，session_pool 的入口身份与账号级信息来源
+  accountId: string
+}
+
+// 写入绑定的形状：创建时省略 mode 按 fixed，更新时省略 mode 保留既有模式
+export interface ApiKeyCodexAccessWrite {
+  enabled: boolean
+  mode?: ApiKeyCodexAccessMode
   accountId: string
 }
 
@@ -95,13 +101,13 @@ interface ApiKeyUpdateParam extends ApiKeyWriteParam {
   id: string
   providerRequestProfileOverrides: Record<string, ProviderRequestProfile | null>
   // 省略保留原绑定；已有绑定只接受同一 accountId 与 mode，省略 mode 即保留既有模式。
-  codexAccess?: ApiKeyCodexAccess
+  codexAccess?: ApiKeyCodexAccessWrite
 }
 
 interface ApiKeyCreateParam extends ApiKeyWriteParam {
   providerRequestProfileOverrides: ProviderRequestProfiles
   customKey?: string
-  codexAccess?: ApiKeyCodexAccess | null
+  codexAccess?: ApiKeyCodexAccessWrite | null
 }
 
 interface ApiKeyIdParam {

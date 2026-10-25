@@ -289,6 +289,10 @@ async fn connect(
     .with_codex_sessions(Arc::new(postgres::PgCodexSessionOwnership::new(
         pool.clone(),
     )));
+    let codex_session_state = Arc::new(postgres::PgCodexSessionState::new(pool.clone()));
+    let provider_ports = provider_ports
+        .with_codex_session_state(codex_session_state.clone())
+        .with_codex_session_content(codex_session_state);
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
     ));

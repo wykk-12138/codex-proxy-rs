@@ -82,6 +82,7 @@ impl CodexBackendClient {
             profile,
             websocket_pool: None,
             websocket_origin_breaker: WebSocketOriginBreaker::default(),
+            native_history: None,
         }
     }
 
@@ -131,6 +132,14 @@ impl CodexBackendClient {
         }
         profile.apply_context_versions(&mut upstream_body);
         self.apply_privacy(&mut upstream_body, &mut headers)?;
+        // 采集与检索声明适配都作用在隐私规则之后的最终业务正文上
+        if let Some(history) = self.native_history.as_ref()
+            && let Some(object) = upstream_body.as_object_mut()
+        {
+            history.prepare(object);
+            // 输入落库失败必须在发送前中止，不能让请求先离开网关
+            history.commit_request(object).await?;
+        }
         let body =
             serde_json::to_vec(&upstream_body).map_err(CodexClientError::RequestBodyEncode)?;
         let endpoint = endpoint_url(&self.base_url, self.protocol.responses_path());
@@ -300,6 +309,20 @@ impl CodexBackendClient {
                 reason: "WS 请求正文必须是对象",
             })
         })?;
+        // WS 也可能在 opening 前回退 HTTP：这里只适配检索声明，请求采集留到实际发送路径
+        let native_body = if let Some(history) = self.native_history.as_ref() {
+            let prepared = body.as_object_mut().ok_or_else(|| {
+                CodexClientError::Privacy(gateway_core::settings::privacy::PrivacyError {
+                    rule_index: 0,
+                    reason: "WS 请求正文必须是对象",
+                })
+            })?;
+            history.prepare(prepared);
+            *websocket_request.body_mut() = prepared.clone();
+            Some(prepared.clone())
+        } else {
+            None
+        };
         let mut websocket_create = CodexWebSocketConnection::responses_create_request_for_path(
             &self.base_url,
             self.protocol.responses_path(),
@@ -444,6 +467,7 @@ impl CodexBackendClient {
             route: PreparedResponseRoute::WebSocket(Box::new(PreparedWebSocketRoute {
                 request: websocket_create,
                 prepared,
+                native_body,
             })),
             metrics,
         })
@@ -480,7 +504,15 @@ impl CodexBackendClient {
                 let PreparedWebSocketRoute {
                     request: websocket_request,
                     prepared,
+                    native_body,
                 } = *route;
+                // 只有实际走 WS 发送时才写入请求采集，HTTP 回退不会重复记录
+                // 输入落库失败必须在发出 create 帧前中止
+                if let Some(history) = self.native_history.as_ref()
+                    && let Some(body) = native_body.as_ref()
+                {
+                    history.commit_request(body).await?;
+                }
                 let mut exchange = execute_prepared_response_create_request_stream(
                     &websocket_request,
                     prepared,

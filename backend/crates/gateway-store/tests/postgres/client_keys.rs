@@ -1252,3 +1252,130 @@ async fn codex_session_owner_claims_once_and_keeps_identity_references() {
     assert_eq!(rows, 0);
     database.close().await;
 }
+
+#[tokio::test]
+async fn codex_session_owner_concurrent_first_claims_keep_one_winner() {
+    use gateway_admin::model::{MutationActor, MutationContext, client_keys::NewClientKey};
+    use gateway_core::{
+        account::{ProviderAccountId, ProviderAccountStore as _},
+        policy::{CodexAccessBinding, CodexAccessMode},
+        provider_ports::{
+            CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort as _,
+            ProviderSessionAffinityKey,
+        },
+    };
+    use gateway_store::postgres::{
+        PgCodexSessionOwnership, PgProviderAccountRepository, ProviderAccountRepository,
+    };
+    let Some(database) = TestDatabase::create("codex_session_concurrent").await else {
+        return;
+    };
+    let repository = PgProviderAccountRepository::new(database.pool.clone());
+    for id in ["acct_session_a", "acct_session_b"] {
+        let mut account = super::provider_accounts::account(id, id);
+        account.authentication_kind = "oauth".into();
+        account.upstream_account_id = Some(format!("workspace-{id}"));
+        repository.insert_provider_account(account).await.unwrap();
+    }
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "codex-session-concurrent".into(),
+    };
+    let key_id = ClientApiKeyId::new("key_codex_session_concurrent").unwrap();
+    keys.create_client_key(
+        NewClientKey {
+            codex_access: Some(CodexAccessBinding {
+                enabled: true,
+                mode: CodexAccessMode::SessionPool,
+                account_id: ProviderAccountId::new("acct_session_a").unwrap(),
+            }),
+            request_profile_overrides: Default::default(),
+            id: key_id.clone(),
+            name: "Codex session concurrent".into(),
+            label: None,
+            group_ids: Vec::new(),
+            limits: Default::default(),
+            budget: Default::default(),
+            plaintext: "test-codex-session-concurrent".into(),
+        },
+        &context,
+    )
+    .await
+    .unwrap();
+    let revision = |id: &str| {
+        let repository = repository.clone();
+        let id = id.to_owned();
+        async move {
+            repository
+                .load_current_credential(&ProviderAccountId::new(id).unwrap())
+                .await
+                .unwrap()
+                .account
+                .revision()
+                .get()
+        }
+    };
+    let ownership = PgCodexSessionOwnership::new(database.pool.clone());
+    let session_key = ProviderSessionAffinityKey::try_new("session-shared").unwrap();
+    let claim = |account: &str, revision: u64| CodexSessionClaim {
+        key_id: key_id.clone(),
+        session_key: session_key.clone(),
+        account_id: ProviderAccountId::new(account).unwrap(),
+        credential_revision: revision,
+    };
+    let claim_a = claim("acct_session_a", revision("acct_session_a").await);
+    let claim_b = claim("acct_session_b", revision("acct_session_b").await);
+    // 两连接池会同时被两个认领事务占满，观察连接单独连到同一隔离 schema
+    let observer = database.observer_pool().await;
+    let mut holding = observer.begin().await.unwrap();
+    sqlx::query("lock table client_api_key_codex_sessions in exclusive mode")
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    let (first, second, ()) = tokio::join!(
+        ownership.claim(&claim_a),
+        ownership.claim(&claim_b),
+        async {
+            // 两个事务都读过归属后才放开插入，才能覆盖插入冲突后读回赢家的分支
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "select count(*) from pg_locks
+                         where database = (select oid from pg_database where datname = current_database())
+                           and relation = 'client_api_key_codex_sessions'::regclass
+                           and mode = 'RowExclusiveLock'
+                           and not granted",
+                    )
+                    .fetch_one(&mut *holding)
+                    .await
+                    .unwrap();
+                    if waiting == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("两个认领事务都要先越过初次归属查询才放开插入");
+            holding.commit().await.unwrap();
+        }
+    );
+    let (winner, owner) = match (first.unwrap(), second.unwrap()) {
+        (CodexSessionClaimOutcome::Owned, CodexSessionClaimOutcome::ConflictingOwner(owner)) => {
+            ("acct_session_a", owner)
+        }
+        (CodexSessionClaimOutcome::ConflictingOwner(owner), CodexSessionClaimOutcome::Owned) => {
+            ("acct_session_b", owner)
+        }
+        (first, second) => panic!("并发首绑必须只有一个赢家: {first:?} {second:?}"),
+    };
+    assert_eq!(owner.as_str(), winner);
+    // 后到的认领只报告真实赢家，归属行不被覆盖
+    assert_eq!(
+        ownership.load(&key_id, &session_key).await.unwrap(),
+        Some(ProviderAccountId::new(winner).unwrap())
+    );
+    observer.close().await;
+    database.close().await;
+}

@@ -609,7 +609,7 @@ pub(super) fn pool_session_error(code: &'static str) -> ProviderError {
     )
 }
 
-pub(super) fn continuation_replay_required_error(reason: &'static str) -> ProviderError {
+pub(crate) fn continuation_replay_required_error(reason: &'static str) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::ContinuationRecoveryRequired,
         UpstreamSendState::NotSent,
@@ -753,6 +753,18 @@ pub(super) fn map_client_error(
     uncertain_state: UpstreamSendState,
     observe_transport: bool,
 ) -> MappedProviderFailure {
+    // 发送前的采集失败已经带有真实分类与未发送状态，不重新解释
+    match error {
+        CodexClientError::History(error) => MappedProviderFailure::plain(error),
+        error => map_client_error_inner(error, uncertain_state, observe_transport),
+    }
+}
+
+fn map_client_error_inner(
+    error: CodexClientError,
+    uncertain_state: UpstreamSendState,
+    observe_transport: bool,
+) -> MappedProviderFailure {
     let local_connection_capacity = crate::transport::connection::is_admission_failure(&error);
     let diagnostic = if local_connection_capacity {
         Some(
@@ -804,6 +816,11 @@ pub(super) fn map_client_error(
     let connect_retry = !local_connection_capacity
         && matches!(&error, CodexClientError::Http(error) if transient_http_connect(error));
     let mut failure = match &error {
+        // 采集失败在外层已经保留原 Provider 分类；这里只保证匹配穷尽
+        CodexClientError::History(_) => MappedProviderFailure::plain(provider_error(
+            ProviderErrorKind::Unavailable,
+            UpstreamSendState::NotSent,
+        )),
         CodexClientError::Privacy(_) => MappedProviderFailure::plain(
             provider_error(
                 ProviderErrorKind::InvalidRequest,
@@ -1067,6 +1084,7 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "model_catalog_invalid",
             "OpenAI model catalog validation failed".to_owned(),
         ),
+        CodexClientError::History(_) => return None,
         CodexClientError::Upstream { .. } => return None,
     };
     Some(ProviderDiagnostic::new(message).with_classification(stage, code))

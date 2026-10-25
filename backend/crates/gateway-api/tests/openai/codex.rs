@@ -34,7 +34,7 @@ use gateway_core::{
         },
         provider::{Provider, ProviderRegistry, ProviderRequest, ProviderStream},
     },
-    error::ProviderError,
+    error::{ProviderDiagnostic, ProviderError, ProviderErrorKind},
     operation::OperationKind,
     policy::{
         ClientApiKeyId, ClientPolicy, CodexAccessBinding, CodexAccessMode, PlaintextClientApiKey,
@@ -47,6 +47,7 @@ use gateway_core::{
         RuntimeSnapshot, UpstreamModelId,
     },
     runtime::RuntimeSnapshotHandle,
+    upstream::UpstreamSendState,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -167,7 +168,26 @@ struct NativeProvider {
     gateway: Arc<Gateway>,
     versions: Mutex<Vec<String>>,
     operations: Mutex<Vec<gateway_core::operation::Operation>>,
+    /// 只有会话池 attempt 才进入拒绝分支；fixed 与 `/v1` 必须继续走成功路径
+    pool_rejections: AtomicUsize,
 }
+
+/// Provider 侧的会话键冲突错误：与 `provider/failure.rs::pool_session_error` 同形
+///
+/// 本文件只验证 Core/API 的原样投影；真实解析与零认领由协议、Provider 用例覆盖，
+/// 不在这里伪造整条会话池链路
+fn pool_session_conflict_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        UpstreamSendState::NotSent,
+    )
+    .with_retry_prohibited()
+    .with_diagnostic(
+        ProviderDiagnostic::new("codex session identity is unusable")
+            .with_classification("session_pool", "session_key_conflict"),
+    )
+}
+
 #[async_trait]
 impl Provider for NativeProvider {
     fn name(&self) -> &'static str {
@@ -216,17 +236,41 @@ impl Provider for NativeProvider {
         use gateway_core::engine::provider::ProviderCallMetadata;
         use gateway_core::event::{GatewayEvent, ProtocolWireEvent, ProviderEvent, ResponseMeta};
         use gateway_core::upstream::UpstreamTransport;
-        assert_eq!(
-            context.required_account().map(ProviderAccountId::as_str),
-            Some("acct_native")
-        );
+        if context.codex_session_pool() {
+            assert!(context.required_account().is_none());
+            assert!(
+                context
+                    .account_scope()
+                    .unwrap()
+                    .allows(&ProviderAccountId::new("acct_other").unwrap())
+            );
+            self.pool_rejections.fetch_add(1, Ordering::SeqCst);
+            return Err(pool_session_conflict_error());
+        }
         assert!(!context.is_diagnostic_required_account());
         assert!(
-            !context
+            context
                 .account_scope()
                 .unwrap()
-                .allows(&ProviderAccountId::new("acct_other").unwrap())
+                .allows(&ProviderAccountId::new("acct_native").unwrap())
         );
+        if let Some(account) = context.required_account() {
+            assert_eq!(account.as_str(), "acct_native");
+            assert!(
+                !context
+                    .account_scope()
+                    .unwrap()
+                    .allows(&ProviderAccountId::new("acct_other").unwrap())
+            );
+        } else {
+            // 普通 `/v1` 不读取 Codex 绑定，范围保持 Key 的完整授权
+            assert!(
+                context
+                    .account_scope()
+                    .unwrap()
+                    .allows(&ProviderAccountId::new("acct_other").unwrap())
+            );
+        }
         self.operations
             .lock()
             .unwrap()
@@ -283,6 +327,28 @@ struct Fixture {
 }
 
 fn snapshot(enabled: bool) -> RuntimeSnapshot {
+    snapshot_with_binding(
+        CodexAccessBinding {
+            enabled,
+            mode: CodexAccessMode::Fixed,
+            account_id: ProviderAccountId::new("acct_native").unwrap(),
+        },
+        if enabled { 1 } else { 2 },
+    )
+}
+
+fn pool_snapshot() -> RuntimeSnapshot {
+    snapshot_with_binding(
+        CodexAccessBinding {
+            enabled: true,
+            mode: CodexAccessMode::SessionPool,
+            account_id: ProviderAccountId::new("acct_native").unwrap(),
+        },
+        3,
+    )
+}
+
+fn snapshot_with_binding(binding: CodexAccessBinding, revision: u64) -> RuntimeSnapshot {
     let provider = ProviderKind::new("openai").unwrap();
     let directory = Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([
         (
@@ -295,7 +361,7 @@ fn snapshot(enabled: bool) -> RuntimeSnapshot {
         ),
     ])));
     RuntimeSnapshot::new(
-        ConfigRevision::new(if enabled { 1 } else { 2 }).unwrap(),
+        ConfigRevision::new(revision).unwrap(),
         gateway_core::settings::SettingsValues::new(2, "smart", Default::default(), None, None)
             .with_codex_public_origin(Some("https://configured.example.test:8443".into())),
         vec![provider.clone()],
@@ -315,11 +381,7 @@ fn snapshot(enabled: bool) -> RuntimeSnapshot {
                 true,
                 RateLimits::unlimited(),
             )
-            .with_codex_access(Some(CodexAccessBinding {
-                enabled,
-                mode: CodexAccessMode::Fixed,
-                account_id: ProviderAccountId::new("acct_native").unwrap(),
-            })),
+            .with_codex_access(Some(binding)),
         ],
     )
     .unwrap()
@@ -327,13 +389,22 @@ fn snapshot(enabled: bool) -> RuntimeSnapshot {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(snapshot(true)).await
+}
+
+async fn pool_fixture() -> Fixture {
+    fixture_with(pool_snapshot()).await
+}
+
+async fn fixture_with(snapshot: RuntimeSnapshot) -> Fixture {
     let provider = Arc::new(NativeProvider {
         gateway: Arc::default(),
         versions: Mutex::default(),
         operations: Mutex::default(),
+        pool_rejections: AtomicUsize::new(0),
     });
     let admissions = Arc::new(Admissions::default());
-    let snapshots = RuntimeSnapshotHandle::new(snapshot(true));
+    let snapshots = RuntimeSnapshotHandle::new(snapshot);
     let execution = Arc::new(DefaultExecutionService::new(
         snapshots.clone(),
         Arc::new(ModelStore),
@@ -907,6 +978,122 @@ async fn dropping_auxiliary_http_response_releases_the_primed_body_lease() {
     assert_eq!(fixture.admissions.active.load(Ordering::SeqCst), 1);
     drop(response);
     assert_eq!(fixture.admissions.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pool_session_conflict_is_http_400_and_websocket_error_without_reaching_upstream() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Message, client::IntoClientRequest},
+    };
+    let fixture = pool_fixture().await;
+    let body = json!({"model":"gpt-native","input":[]}).to_string();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            request(Method::POST, "/backend-api/codex/responses")
+                .header("content-type", "application/json")
+                .header("thread-id", "pool-thread")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "invalid_request");
+    assert_eq!(fixture.provider.pool_rejections.load(Ordering::SeqCst), 1);
+    assert!(fixture.provider.operations.lock().unwrap().is_empty());
+    assert_eq!(fixture.admissions.active.load(Ordering::SeqCst), 0);
+
+    // WS `response.create` 走同一 Core 错误投影，上游一次不发送
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = fixture.app;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut opening = format!("ws://{address}/backend-api/codex/responses")
+        .into_client_request()
+        .unwrap();
+    opening
+        .headers_mut()
+        .insert("authorization", format!("Bearer {KEY}").parse().unwrap());
+    let (mut socket, response) = connect_async(opening).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let create = json!({"type":"response.create","model":"gpt-native","input":[]}).to_string();
+    socket.send(Message::Text(create.into())).await.unwrap();
+    let mut metadata_received = false;
+    let event = loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = message {
+            let event: Value = serde_json::from_str(&text).unwrap();
+            // 网关先交付本轮元数据，再交付 Provider 的发送前错误
+            if event["type"] == "response.metadata" {
+                assert!(!metadata_received, "每轮只有一份元数据");
+                metadata_received = true;
+                continue;
+            }
+            break event;
+        }
+    };
+    assert!(metadata_received);
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["status"], 400);
+    assert_eq!(event["error"]["type"], "invalid_request_error");
+    assert_eq!(event["error"]["code"], "invalid_request");
+    assert_eq!(fixture.provider.pool_rejections.load(Ordering::SeqCst), 2);
+    assert!(fixture.provider.operations.lock().unwrap().is_empty());
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn fixed_binding_and_plain_v1_do_not_apply_pool_session_rejection() {
+    let body = json!({"model":"gpt-native","input":[]}).to_string();
+    let fixed = fixture().await;
+    let response = fixed
+        .app
+        .clone()
+        .oneshot(
+            request(Method::POST, "/backend-api/codex/responses")
+                .header("content-type", "application/json")
+                .header("thread-id", "fixed-thread")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(fixed.provider.pool_rejections.load(Ordering::SeqCst), 0);
+    assert_eq!(fixed.provider.operations.lock().unwrap().len(), 1);
+
+    // 同一个 session_pool 绑定的 Key 走普通 `/v1` 仍按非池路径执行
+    let pool = pool_fixture().await;
+    let response = pool
+        .app
+        .clone()
+        .oneshot(
+            request(Method::POST, "/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "resp_native");
+    assert_eq!(pool.provider.pool_rejections.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.provider.operations.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

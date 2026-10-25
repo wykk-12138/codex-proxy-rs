@@ -693,6 +693,23 @@ pub(crate) struct TestLeaseCoordinator {
     pub(crate) signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
     pub(crate) reserved_signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
     round_robin_cursor: Mutex<u64>,
+    live_leases: Arc<AtomicUsize>,
+}
+
+impl TestLeaseCoordinator {
+    /// 当前仍被持有的调度租约数量；能够区分“请求过租约”与“租约已释放”
+    pub(crate) fn live_leases(&self) -> usize {
+        self.live_leases.load(Ordering::SeqCst)
+    }
+}
+
+/// 在 guard 销毁时递减占用计数，用来断言临时租约没有遗留
+struct TestLeaseGuard(Arc<AtomicUsize>);
+
+impl Drop for TestLeaseGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ProviderLeasePort for TestLeaseCoordinator {
@@ -764,7 +781,10 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                     retry_after: Some(Duration::from_millis(25)),
                 })
             } else {
-                Ok(ProviderLeaseAcquisition::Acquired(Box::new(())))
+                self.live_leases.fetch_add(1, Ordering::SeqCst);
+                Ok(ProviderLeaseAcquisition::Acquired(Box::new(
+                    TestLeaseGuard(self.live_leases.clone()),
+                )))
             }
         })
     }
@@ -962,6 +982,8 @@ pub(crate) struct MemoryCodexSessions {
     claims: Mutex<Vec<CodexSessionClaim>>,
     conflict_with: Mutex<Option<ProviderAccountId>>,
     identity_changed: AtomicBool,
+    identity_changed_once: AtomicBool,
+    unavailable_once: AtomicBool,
 }
 
 impl MemoryCodexSessions {
@@ -1008,6 +1030,16 @@ impl MemoryCodexSessions {
     pub(crate) fn identity_changed(&self) {
         self.identity_changed.store(true, Ordering::SeqCst);
     }
+
+    /// 仅下一次认领报告凭据版本已变化，用于验证预算内的重新选号
+    pub(crate) fn identity_changed_once(&self) {
+        self.identity_changed_once.store(true, Ordering::SeqCst);
+    }
+
+    /// 仅下一次认领报告账号已不可用，模拟认领时发现账号不再承载会话
+    pub(crate) fn unavailable_once(&self) {
+        self.unavailable_once.store(true, Ordering::SeqCst);
+    }
 }
 
 impl CodexSessionOwnershipPort for MemoryCodexSessions {
@@ -1028,8 +1060,13 @@ impl CodexSessionOwnershipPort for MemoryCodexSessions {
                 .lock()
                 .expect("session claim lock")
                 .push(claim.clone());
-            if self.identity_changed.load(Ordering::SeqCst) {
+            if self.identity_changed.load(Ordering::SeqCst)
+                || self.identity_changed_once.swap(false, Ordering::SeqCst)
+            {
                 return Ok(CodexSessionClaimOutcome::IdentityChanged);
+            }
+            if self.unavailable_once.swap(false, Ordering::SeqCst) {
+                return Ok(CodexSessionClaimOutcome::Unavailable);
             }
             let key = (
                 claim.key_id.as_str().to_owned(),

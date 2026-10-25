@@ -111,6 +111,41 @@ impl CodexAuthorizedContext {
     }
 }
 
+/// 模型 attempt 已授权的会话范围
+///
+/// 只携带会话级 notes 重建需要的授权事实，刻意不含入口账号：
+/// 模型请求没有固定入口身份，目标账号不能被伪称 entry identity
+/// 由 [`AttemptContext::session_authorization`](super::AttemptContext::session_authorization) 投影
+#[derive(Debug, Clone)]
+pub struct CodexSessionAuthorization {
+    pub(crate) client_api_key_id: ClientApiKeyId,
+    pub(crate) account_scope: Arc<FrozenAccountScope>,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) deadline: Deadline,
+}
+
+impl CodexSessionAuthorization {
+    #[must_use]
+    pub const fn client_api_key_id(&self) -> &ClientApiKeyId {
+        &self.client_api_key_id
+    }
+
+    #[must_use]
+    pub fn account_scope(&self) -> &FrozenAccountScope {
+        &self.account_scope
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+}
+
 /// 仅携带业务 bytes；API 过滤凭据、Cookie、账号身份与传输头
 #[derive(Debug)]
 pub struct CodexAuxiliaryRequest {

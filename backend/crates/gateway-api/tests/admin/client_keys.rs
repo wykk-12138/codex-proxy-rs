@@ -694,6 +694,34 @@ fn generic_profile_override_clear_rejects_conflicting_legacy_update() {
 }
 
 #[test]
+fn codex_access_creation_defaults_to_fixed_only_when_mode_is_omitted() {
+    use gateway_core::policy::CodexAccessMode;
+
+    for (mode, expected) in [
+        (None, CodexAccessMode::Fixed),
+        (Some("fixed"), CodexAccessMode::Fixed),
+        (Some("session_pool"), CodexAccessMode::SessionPool),
+    ] {
+        let mut payload = json!({
+            "name":"Codex", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0,
+            "codexAccess":{"enabled":true, "accountId":"acct_codex"}
+        });
+        if let Some(mode) = mode {
+            payload["codexAccess"]["mode"] = json!(mode);
+        }
+        let binding = serde_json::from_value::<CreateClientKeyRequest>(payload)
+            .unwrap()
+            .into_command()
+            .unwrap()
+            .codex_access
+            .unwrap();
+        assert_eq!(binding.mode, expected);
+        assert_eq!(binding.account_id.as_str(), "acct_codex");
+        assert!(binding.enabled);
+    }
+}
+
+#[test]
 fn codex_access_update_distinguishes_omission_from_forbidden_clear() {
     use gateway_core::{
         account::ProviderAccountId,

@@ -62,9 +62,9 @@ const codexDescription = computed(() => props.codexLocked
   ? '已建立的账号与模式都不能更换，只能调整启停'
   : '只列出当前分组范围内已识别身份的 OpenAI OAuth 账号')
 
-// 未知值按 fixed 处理，旧响应缺少 mode 时与后端缺省语义一致
+// ZSegmented 的 model 事件是 string，值只来自本组件静态声明的模式选项，在此处对齐类型
 function updateMode(value: string) {
-  updateForm('codexAccessMode', value === 'session_pool' ? 'session_pool' : 'fixed')
+  updateForm('codexAccessMode', value as ApiKeyCodexAccessMode)
 }
 
 // 分组变化后已选账号不在绑定范围时清空选择，避免提交服务端会拒绝的组合

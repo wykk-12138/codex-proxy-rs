@@ -5,6 +5,9 @@ pub mod authentication;
 pub mod budget;
 pub mod client_retry;
 pub mod codex;
+pub mod codex_history;
+pub mod codex_history_capture;
+pub mod codex_notes;
 pub mod connection;
 pub mod continuation;
 pub mod coordinator;
@@ -841,6 +844,20 @@ impl AttemptContext {
     #[must_use]
     pub const fn account_scope(&self) -> Option<&Arc<crate::account::scope::FrozenAccountScope>> {
         self.account.account_scope()
+    }
+
+    /// 模型 attempt 已授权的会话范围
+    ///
+    /// 只复用本次 attempt 冻结的 Key、账号范围、取消与期限；没有账号范围的诊断
+    /// attempt 不能发起会话级 notes 重建，因此返回 None
+    #[must_use]
+    pub fn session_authorization(&self) -> Option<codex::CodexSessionAuthorization> {
+        Some(codex::CodexSessionAuthorization {
+            client_api_key_id: self.request.client_api_key_ref.clone(),
+            account_scope: Arc::clone(self.account.account_scope()?),
+            cancellation: self.cancellation.clone(),
+            deadline: self.deadline,
+        })
     }
 
     #[must_use]

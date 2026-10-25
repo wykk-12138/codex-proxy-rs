@@ -41,6 +41,11 @@ pub struct OpenAiConfig {
     pub auth: CodexAuthSettings,
     #[serde(default = "default_stream_max_retries")]
     pub stream_max_retries: u64,
+    /// 新会话是否进入托管状态存储；关闭时已有 managed 会话继续服务
+    ///
+    /// 只控制新会话的采集、notes 日志与切号准入，不影响 fixed、普通 /v1 或旧 legacy 会话
+    #[serde(default)]
+    pub codex_state_storage_enabled: bool,
     #[serde(default)]
     pub residency: Option<CodexResidency>,
     #[serde(skip)]
@@ -123,6 +128,7 @@ impl Default for OpenAiConfig {
             quota: CodexQuotaSettings::default(),
             auth: CodexAuthSettings::default(),
             stream_max_retries: DEFAULT_STREAM_MAX_RETRIES,
+            codex_state_storage_enabled: false,
             residency: None,
             identity_secret_path: PathBuf::new(),
         }

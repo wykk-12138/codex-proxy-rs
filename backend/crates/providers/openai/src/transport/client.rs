@@ -195,6 +195,9 @@ impl fmt::Debug for CodexClientVisibleUpstreamResponse {
 /// Codex 上游 HTTP 客户端错误
 #[derive(Error)]
 pub enum CodexClientError {
+    /// 发送前的原生 history 采集失败；保留 Provider 分类与未发送状态
+    #[error("native history capture failed before send")]
+    History(#[from] gateway_core::error::ProviderError),
     #[error("privacy policy rejected the request: {0}")]
     Privacy(#[from] gateway_core::settings::privacy::PrivacyError),
     #[error("connection recovery budget exhausted")]
@@ -282,6 +285,10 @@ impl fmt::Debug for CodexClientError {
                 formatter.write_str("CodexClientError::ConnectionBudgetExhausted")
             }
             Self::Privacy(error) => std::fmt::Debug::fmt(error, formatter),
+            Self::History(error) => formatter
+                .debug_tuple("CodexClientError::History")
+                .field(error)
+                .finish(),
             Self::Http(_) => formatter.write_str("CodexClientError::Http([REDACTED])"),
             Self::HttpJson(_) => formatter.write_str("CodexClientError::HttpJson([REDACTED])"),
             Self::ErrorBodyRead {
@@ -349,6 +356,7 @@ impl CodexClientError {
                 Some(*transport)
             }
             Self::Privacy(_)
+            | Self::History(_)
             | Self::ConnectionBudgetExhausted
             | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
@@ -700,6 +708,8 @@ pub struct CodexBackendClient {
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
     pub(super) middleware_headers: Vec<MiddlewareHeader>,
+    /// 本次 Responses 请求的原生 history 采集句柄；None 表示不采集
+    pub(super) native_history: Option<Arc<crate::native_history::CodexNativeHistoryRequest>>,
 }
 
 impl CodexBackendClient {
@@ -709,6 +719,15 @@ impl CodexBackendClient {
         timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         self.timezone = timezone;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_native_history(
+        mut self,
+        history: Option<Arc<crate::native_history::CodexNativeHistoryRequest>>,
+    ) -> Self {
+        self.native_history = history;
         self
     }
 
@@ -837,6 +856,8 @@ pub(super) enum PreparedResponseRoute {
 pub(super) struct PreparedWebSocketRoute {
     pub(super) request: CodexWebSocketRequest,
     pub(super) prepared: PreparedWebSocket,
+    /// 最终发送的 `response.create` 正文；只有实际走 WS 时才用于历史采集
+    pub(super) native_body: Option<Map<String, Value>>,
 }
 
 // ---------------------------------------------------------------------------

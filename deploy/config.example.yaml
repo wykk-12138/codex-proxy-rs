@@ -80,6 +80,12 @@ api:
 openai:
   # 数据驻留约束；省略或 null 不指定地域约束，与管理端客户端身份无关。
   residency: us
+  # 原生 Codex 会话状态存储，默认关闭。
+  # 开启后新会话由网关保存 history 与 notes 加密操作日志，会话 owner 额度耗尽时可换号；
+  # 仍需要 PostgreSQL，重启后从库里恢复。
+  # 关闭只停止新会话进入托管：已托管会话继续使用本地 history 与已发布的 notes 域。
+  # fixed 与普通 /v1 不受影响；详见 deploy/README.md#原生会话状态存储。
+  codex_state_storage_enabled: false
 
 # Compose 启动桥接区；密码仍只维护在 store 中。
 services:

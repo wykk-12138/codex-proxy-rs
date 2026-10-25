@@ -106,3 +106,16 @@ fn openai_stream_retry_budget_uses_the_official_hard_cap() {
 fn valid_config() -> OpenAiConfig {
     OpenAiConfig::default()
 }
+
+#[test]
+fn codex_state_storage_is_disabled_unless_explicitly_enabled() {
+    let config = OpenAiConfig::default();
+    assert!(!config.codex_state_storage_enabled);
+
+    let enabled: OpenAiConfig =
+        serde_json::from_str(r#"{"codex_state_storage_enabled":true}"#).unwrap();
+    assert!(enabled.codex_state_storage_enabled);
+    // 省略时保持关闭，不因现有配置缺少该键而隐式开启托管
+    let omitted: OpenAiConfig = serde_json::from_str(r#"{"stream_max_retries":3}"#).unwrap();
+    assert!(!omitted.codex_state_storage_enabled);
+}

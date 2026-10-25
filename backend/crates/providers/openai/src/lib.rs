@@ -1,8 +1,11 @@
 //! OpenAI Provider 专属能力
 
 mod admin;
+mod buffered_body;
 pub mod config;
 mod jitter;
+mod native_history;
+mod native_notes;
 mod provider;
 mod request_identity;
 mod session_transport;
@@ -183,8 +186,8 @@ pub async fn initialize(
         )
         .map_err(|_| OpenAiInitializeError::TokenClient)?,
     );
-    let core_provider: Arc<dyn Provider> = Arc::new(
-        CodexProvider::new(
+    let core_provider: Arc<dyn Provider> = Arc::new({
+        let provider = CodexProvider::new(
             selector,
             Arc::clone(&catalog),
             Arc::clone(&quota),
@@ -199,8 +202,33 @@ pub async fn initialize(
         .with_session_identity(session_identity)
         .with_timezone(config.timezone)
         .with_live_support(repository.clone())
-        .with_native_token_client(Arc::clone(&token_client)),
-    );
+        .with_native_token_client(Arc::clone(&token_client));
+        // 原生状态协调：存储已提供 state/content 时装配，fixed 与普通 /v1 不受影响
+        // history 与 notes 共用同一份持久事实，且各自只保留一个 service 实例
+        // 开关只控制新会话是否进入托管，已有 managed 会话继续使用本地 history 与已发布域
+        let managed_admission = config.codex_state_storage_enabled;
+        match ports
+            .codex_session_state()
+            .zip(ports.codex_session_content())
+        {
+            Some((state, content)) => provider
+                .with_native_history(Arc::new(
+                    gateway_core::engine::codex_history::CodexHistoryService::new(
+                        Arc::clone(&content),
+                        Arc::clone(&state),
+                        managed_admission,
+                    ),
+                ))
+                .with_native_notes(Arc::new(
+                    gateway_core::engine::codex_notes::CodexNotesService::new(
+                        state,
+                        content,
+                        managed_admission,
+                    ),
+                )),
+            None => provider,
+        }
+    });
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client.clone();
     let credential_admin = Arc::new(

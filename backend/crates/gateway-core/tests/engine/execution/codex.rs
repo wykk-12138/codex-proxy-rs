@@ -87,20 +87,28 @@ fn snapshot(revision: u64, binding: Option<CodexAccessBinding>, allowed: bool) -
 
 fn service_for(
     snapshot: RuntimeSnapshot,
-    provider: Arc<NativeProvider>,
+    provider: Arc<dyn Provider>,
     admissions: Arc<dyn ClientAdmissionPort>,
 ) -> (DefaultExecutionService, RuntimeSnapshotHandle) {
     let snapshots = RuntimeSnapshotHandle::new(snapshot);
     let service = DefaultExecutionService::new(
         snapshots.clone(),
         Arc::new(TrackingExecutionStore::default()),
-        ProviderRegistry::new([provider as Arc<dyn Provider>]).unwrap(),
+        ProviderRegistry::new([provider]).unwrap(),
         admissions,
         Arc::new(UnusedContinuation),
         Arc::new(RecordingClientApiKeyUsage::default()),
         Arc::new(crate::RecordingDiagnostics::default()),
     );
     (service, snapshots)
+}
+
+fn pool_binding(enabled: bool, account: &str) -> CodexAccessBinding {
+    CodexAccessBinding {
+        enabled,
+        mode: CodexAccessMode::SessionPool,
+        account_id: ProviderAccountId::new(account).unwrap(),
+    }
 }
 
 async fn authenticate(
@@ -120,6 +128,208 @@ async fn prepare(service: &DefaultExecutionService) -> PreparedRootExecution {
         .prepare_execution(authenticate(service).await.unwrap())
         .await
         .unwrap()
+}
+
+/// 只记录 Core 交给 Provider 的池标志与账号范围，随后如实失败以结束本次执行
+///
+/// 会话键解析与拒绝规则属于 Provider，本文件的职责仅是确认 `session_pool` 与授权池
+/// 经 Core 到达 attempt；fixed 与普通 `/v1` 必须继续拿到关闭的标志
+/// `retry_round` 打开的用例先返回一个可重试的选号失败，让 coordinator 走既有重试
+/// 决策进入第二轮，再由拒绝重试的失败收尾，因此两轮都经过真实执行路径
+#[derive(Default)]
+struct AttemptWiringProvider {
+    observed: Mutex<Vec<AttemptWiring>>,
+    retry_round: bool,
+}
+
+struct AttemptWiring {
+    session_pool: bool,
+    required_account: Option<String>,
+    allows_entry: bool,
+    allows_pool_peer: bool,
+    allows_other_provider: bool,
+    /// 本次 attempt 向 Core 声明的执行账号，用来确认池内改选仍被授权范围接受
+    account: &'static str,
+}
+
+#[async_trait]
+impl Provider for AttemptWiringProvider {
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+    fn catalog_generation(&self) -> ProviderCatalogGeneration {
+        ProviderCatalogGeneration::default()
+    }
+    async fn query_model_capabilities(
+        &self,
+    ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
+        Ok(Vec::new())
+    }
+    async fn execute(
+        self: Arc<Self>,
+        request: ProviderRequest,
+        context: AttemptContext,
+    ) -> Result<ProviderStream, ProviderError> {
+        let scope = context.account_scope().expect("attempt account scope");
+        let account = |id: &str| ProviderAccountId::new(id).unwrap();
+        let retry_round = self.retry_round;
+        let mut observed = self.observed.lock().unwrap();
+        // 尚未认领的首请求发送前失败后，第二轮可在同一授权池继续选择
+        let selected = if retry_round && !observed.is_empty() {
+            "acct_other"
+        } else {
+            "acct_start"
+        };
+        observed.push(AttemptWiring {
+            session_pool: context.codex_session_pool(),
+            required_account: context
+                .required_account()
+                .map(|account| account.as_str().to_owned()),
+            allows_entry: scope.allows(&account("acct_start")),
+            allows_pool_peer: scope.allows(&account("acct_other")),
+            allows_other_provider: scope.allows(&account("acct_xai")),
+            account: selected,
+        });
+        let round = observed.len();
+        drop(observed);
+        if !retry_round {
+            return Err(attempt_wiring_error());
+        }
+        // 第一轮如实给出可重试的本地选号失败，第二轮才用拒绝重试的失败终止执行
+        let error = if round == 1 {
+            ProviderError::new(
+                ProviderErrorKind::NoEligibleAccount,
+                UpstreamSendState::NotSent,
+            )
+        } else {
+            attempt_wiring_error()
+        };
+        let metadata = ProviderCallMetadata::new(
+            request.candidate().provider().clone(),
+            request.candidate().upstream_model().unwrap().clone(),
+            account(selected),
+            UpstreamTransport::new("websocket").unwrap(),
+        );
+        Ok(ProviderStream::new(
+            metadata,
+            futures::stream::iter([Err(error)]),
+            (),
+        ))
+    }
+}
+
+fn attempt_wiring_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::NoEligibleAccount,
+        UpstreamSendState::NotSent,
+    )
+    .with_retry_prohibited()
+}
+
+async fn start_attempt_wiring(
+    service: &DefaultExecutionService,
+    codex_request: bool,
+) -> gateway_core::engine::execution::StartedExecution {
+    let client = if codex_request {
+        authenticate(service).await.unwrap()
+    } else {
+        service.authenticate("sk_start_test").unwrap()
+    };
+    service
+        .start(StartExecution {
+            client,
+            public_model: PublicModelId::new("gpt-start").unwrap(),
+            operation: start_operation(),
+            metadata: ExecutionRequestMetadata {
+                protocol: "openai".into(),
+                endpoint: if codex_request {
+                    "/backend-api/codex/responses"
+                } else {
+                    "/v1/responses"
+                }
+                .into(),
+                transport: ClientTransport::WebSocket,
+                stream: true,
+                client_ip: None,
+                user_agent: None,
+                previous_response_id: None,
+            },
+        })
+        .await
+        .unwrap()
+}
+
+async fn assert_attempt_wiring(binding: CodexAccessBinding, codex_request: bool, pool: bool) {
+    let provider = Arc::new(AttemptWiringProvider::default());
+    let (service, _) = service_for(
+        snapshot(1, Some(binding), true),
+        provider.clone(),
+        Arc::new(UnusedAdmissions),
+    );
+    let mut started = start_attempt_wiring(&service, codex_request).await;
+    assert!(started.session.next_event().await.is_err());
+    started.session.detach_finalize().await;
+    let observed = provider.observed.lock().unwrap();
+    assert_eq!(observed.len(), 1, "one attempt per execution");
+    let attempt = &observed[0];
+    let required = (codex_request && !pool).then_some("acct_start");
+    assert_eq!(attempt.session_pool, pool);
+    assert_eq!(attempt.required_account.as_deref(), required);
+    assert!(attempt.allows_entry);
+    // 会话池只保留同一 Provider 的授权池；普通 `/v1` 仍持有 Key 的完整范围
+    assert_eq!(attempt.allows_pool_peer, !codex_request || pool);
+    assert_eq!(attempt.allows_other_provider, !codex_request);
+}
+
+#[test]
+fn codex_binding_mode_reaches_the_attempt_as_pool_flag_and_authorized_scope() {
+    block_on(async {
+        assert_attempt_wiring(binding(true, "acct_start"), true, false).await;
+        assert_attempt_wiring(pool_binding(true, "acct_start"), true, true).await;
+        assert_attempt_wiring(pool_binding(true, "acct_start"), false, false).await;
+    });
+}
+
+#[test]
+fn session_pool_retry_keeps_pool_flag_and_authorized_scope_in_both_rounds() {
+    block_on(async {
+        let provider = Arc::new(AttemptWiringProvider {
+            retry_round: true,
+            ..Default::default()
+        });
+        let (service, _) = service_for(
+            snapshot(1, Some(pool_binding(true, "acct_start")), true),
+            provider.clone(),
+            Arc::new(UnusedAdmissions),
+        );
+        let mut started = start_attempt_wiring(&service, true).await;
+        // Core 不把会话池入口账号当作固定执行账号，首轮发送前失败后仍保留授权池
+        let result = started.session.next_event().await;
+        assert!(matches!(
+            result,
+            Err(EngineError::Provider(ref error))
+                if error.kind() == ProviderErrorKind::NoEligibleAccount
+        ));
+        started.session.detach_finalize().await;
+        let observed = provider.observed.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "second round ends on the retry-prohibited failure"
+        );
+        for attempt in observed.iter() {
+            assert!(attempt.session_pool);
+            assert!(attempt.required_account.is_none());
+            assert!(attempt.allows_entry);
+            assert!(attempt.allows_pool_peer);
+            assert!(!attempt.allows_other_provider);
+        }
+        assert_eq!(observed[0].account, "acct_start");
+        assert_eq!(
+            observed[1].account, "acct_other",
+            "round two reselects inside the pool the client was authorized for"
+        );
+    });
 }
 
 fn request() -> CodexAuxiliaryRequest {
@@ -342,7 +552,7 @@ fn native_authorization_requires_enabled_binding_valid_intersection_and_origin()
         ] {
             let (service, _) = service_for(
                 snapshot(1, binding, allowed),
-                Arc::default(),
+                Arc::<NativeProvider>::default(),
                 Arc::new(UnusedAdmissions),
             );
             assert!(authenticate(&service).await.is_err());
@@ -355,7 +565,11 @@ fn native_authorization_requires_enabled_binding_valid_intersection_and_origin()
         let snapshot = snapshot
             .with_settings(&snapshot.settings().clone().with_codex_public_origin(None))
             .unwrap();
-        let (service, _) = service_for(snapshot, Arc::default(), Arc::new(UnusedAdmissions));
+        let (service, _) = service_for(
+            snapshot,
+            Arc::<NativeProvider>::default(),
+            Arc::new(UnusedAdmissions),
+        );
         assert!(authenticate(&service).await.is_err());
         assert!(service.authenticate("sk_start_test").is_ok());
     });
@@ -366,7 +580,7 @@ fn native_scope_survives_settings_and_catalog_while_v1_keeps_full_scope() {
     block_on(async {
         let (service, _) = service_for(
             snapshot(1, Some(binding(true, "acct_start")), true),
-            Arc::default(),
+            Arc::<NativeProvider>::default(),
             Arc::new(UnusedAdmissions),
         );
         let client = authenticate(&service).await.unwrap();
@@ -415,7 +629,7 @@ fn next_round_reauthenticates_binding_and_scope_but_started_request_keeps_snapsh
             let admissions = Arc::new(Admissions::default());
             let (service, snapshots) = service_for(
                 snapshot(1, Some(binding(true, "acct_start")), true),
-                Arc::default(),
+                Arc::<NativeProvider>::default(),
                 admissions.clone(),
             );
             let client = authenticate(&service).await.unwrap();
@@ -624,7 +838,7 @@ fn cancellation_during_admission_reclaims_granted_but_unobserved_lease() {
         admissions.hold_acquisition.store(true, Ordering::SeqCst);
         let (service, _) = service_for(
             snapshot(1, Some(binding(true, "acct_start")), true),
-            Arc::default(),
+            Arc::<NativeProvider>::default(),
             admissions.clone(),
         );
         let prepared = prepare(&service).await;

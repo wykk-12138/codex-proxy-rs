@@ -3,17 +3,27 @@
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use gateway_core::{
-    account::{ProviderAccount, ProviderAccountId},
+    account::{ProviderAccount, ProviderAccountId, scope::FrozenAccountScope},
     engine::{
-        codex::{CodexAuthorizedContext, CodexAuxiliaryRequest, CodexGateway, CodexIdentity},
+        codex::{
+            CodexAuthorizedContext, CodexAuxiliaryRequest, CodexGateway, CodexIdentity,
+            CodexSessionAuthorization,
+        },
+        codex_history::CODEX_ROOT_AGENT_NAME,
+        codex_notes::{CodexNotesDomain, CodexNotesError, CodexNotesService},
         middleware::{
             MiddlewareBody, MiddlewareError, MiddlewareFrame, MiddlewareFraming, MiddlewareHeader,
             MiddlewareResponse,
         },
     },
-    error::{ProviderError, ProviderErrorKind},
+    error::{ProviderDiagnostic, ProviderError, ProviderErrorKind},
     lifecycle::{CancellationToken, Deadline},
-    provider_ports::{CodexSessionClaim, CodexSessionClaimOutcome},
+    policy::ClientApiKeyId,
+    provider_ports::{
+        CodexNotesCompletion, CodexNotesOperationKind, CodexNotesOperationStatus,
+        CodexNotesPublishOutcome, CodexSessionClaim, CodexSessionClaimOutcome,
+        ProviderSessionAffinityKey,
+    },
     upstream::UpstreamSendState,
 };
 // 池会话身份在协议层判定，与 transport 的同名 CodexSessionIdentity 必须别名区分
@@ -27,9 +37,16 @@ use super::{
     observation::map_selection_error,
 };
 use crate::{
+    buffered_body::BufferedBody,
     credential::{
         CodexCredentialLease, CodexOAuthSecret, CodexSelectionModel,
         SelectCodexProviderEndpointCredential, derive_pool_session_affinity, oauth_metadata,
+        retry_account_snapshot,
+    },
+    native_history::{history_tool, local_history_response},
+    native_notes::{
+        declared_agent_name, is_notes_operation, map_outbound_domain, notes_body_error,
+        replay_request, write_kind,
     },
     request_identity::pool_session_identity,
     transport::{CodexClientError, CodexRequestContext},
@@ -48,7 +65,7 @@ impl CodexGateway for CodexProvider {
                 result = async {
                     // 身份投影与账号级辅助固定使用入口账号，session_pool 不改变它
                     let account_id = context.entry_account_id();
-                    let (account, runtime) = self.selector.native_credential(context, account_id).await.map_err(map_selection_error)?;
+                    let (account, runtime) = self.selector.native_credential(context.account_scope(), account_id).await.map_err(map_selection_error)?;
                     let secret = runtime.authentication.oauth().ok_or_else(invalid_identity)?;
                     self.native_identity(&account, secret).await
                 } => result,
@@ -63,11 +80,20 @@ impl CodexGateway for CodexProvider {
     ) -> BoxFuture<'a, Result<MiddlewareResponse, ProviderError>> {
         Box::pin(async move {
             // 从读取凭据到取得响应头都受同一取消和期限约束；不创建后台请求任务
-            let response = tokio::select! {
+            let outcome = tokio::select! {
                 biased;
                 () = context.cancellation().cancelled() => return Err(provider_error(ProviderErrorKind::Cancelled, UpstreamSendState::Ambiguous)),
                 () = context.deadline().wait() => return Err(provider_error(ProviderErrorKind::Timeout, UpstreamSendState::Ambiguous)),
                 result = async {
+                    // history 四工具在读取凭据前分流：本地 history 不需要账号、whoami 或推理额度
+                    if let Some(local) = self.local_history(context, &request).await? {
+                        return Ok(AuxiliaryOutcome::Ready(local));
+                    }
+                    // notes 六端点按会话已发布落点交付，写类还要记录顺序与原始响应
+                    if self.notes_applicable(context, &request) {
+                        let response = self.native_notes_auxiliary(context, request).await?;
+                        return Ok(AuxiliaryOutcome::Ready(response));
+                    }
                     // 账号解析（含 session_pool 首绑）先于发送；固定账号仍只做资格与凭据复验
                     let target = self.auxiliary_target(context, &request).await?;
                     let response = self.client.for_account(&target.account)
@@ -76,50 +102,439 @@ impl CodexGateway for CodexProvider {
                             &target.authorization, Some(&target.identity.account_id), "codex_auxiliary", None,
                         ), target.identity.is_fedramp).await
                         .map_err(|error| map_client_error(error, UpstreamSendState::Ambiguous, false).error)?;
-                    Ok((response, target.lease))
+                    Ok(AuxiliaryOutcome::Upstream {
+                        response,
+                        lease: target.lease,
+                    })
                 } => result?,
             };
-            let (response, lease) = response;
-            let status = response.status().as_u16();
-            let connection_options = response
-                .headers()
-                .get_all("connection")
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .flat_map(|value| value.split(','))
-                .map(|value| value.trim().to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            let headers = response
-                .headers()
-                .iter()
-                .filter(|(name, _)| {
-                    name.as_str() == "content-type"
-                        || gateway_protocol::openai::response_header_is_forwardable(
-                            name.as_str(),
-                            &connection_options,
-                        )
-                })
-                .map(|(name, value)| {
-                    MiddlewareHeader::new(name.as_str(), Bytes::copy_from_slice(value.as_bytes()))
-                })
-                .collect();
-            Ok(MiddlewareResponse::new(
-                "openai".to_owned(),
-                status,
-                headers,
-                Box::new(NativeBody {
-                    response: Some(response),
-                    // 辅助首绑取得的账号租约随正文生命周期释放，不能提前结束占用
-                    _lease: lease,
-                    cancellation: context.cancellation().clone(),
-                    deadline: context.deadline(),
-                }),
-            ))
+            match outcome {
+                AuxiliaryOutcome::Ready(response) => Ok(response),
+                AuxiliaryOutcome::Upstream { response, lease } => {
+                    Ok(self.forwarded_response(context, response, lease))
+                }
+            }
         })
     }
 }
 
 impl CodexProvider {
+    /// notes 六端点是否由已发布副本处理
+    ///
+    /// fixed 与普通 /v1 不改变现有转发；未装配协调服务时同样保持原行为
+    fn notes_applicable(
+        &self,
+        context: &CodexAuthorizedContext,
+        request: &CodexAuxiliaryRequest,
+    ) -> bool {
+        self.native_notes.is_some()
+            && context.session_pool()
+            && is_notes_operation(request.operation)
+    }
+
+    /// 按会话已发布 notes 落点交付一次 notes 调用
+    ///
+    /// 写类先取得会话互斥再读取落点并决定写入目标，避免等待期间用旧 owner 写回其它域；
+    /// 读类只取一次快照，不参与互斥也不阻塞模型请求
+    async fn native_notes_auxiliary(
+        &self,
+        context: &CodexAuthorizedContext,
+        request: CodexAuxiliaryRequest,
+    ) -> Result<MiddlewareResponse, ProviderError> {
+        let service = self.native_notes.as_deref().ok_or_else(|| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let affinity = self.auxiliary_session_affinity(context, &request)?;
+        let session_key = affinity.key().clone();
+        let kind = write_kind(request.operation);
+        // 写类在整个发送与落库生命周期内持有会话互斥；读类不参与
+        let _guard = match kind {
+            Some(_) => Some(
+                service
+                    .lock_session(context.client_api_key_id(), &session_key)
+                    .await,
+            ),
+            None => None,
+        };
+        let target = self.auxiliary_target(context, &request).await?;
+        let domain = service
+            .domain(context.client_api_key_id(), &session_key)
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?
+            .ok_or_else(|| {
+                notes_coordination_error(CodexNotesError::SessionAbsent, UpstreamSendState::NotSent)
+            })?;
+        // 读类不持互斥，读 owner 与读 notes 域之间可能刚好发布切换；
+        // 最终凭据必须与所读域属于同一账号，不能用旧 owner 的凭据访问新域
+        let target = if target.account.id() == domain.replica.account() {
+            target
+        } else {
+            self.unleased_auxiliary_target(context.account_scope(), domain.replica.account())
+                .await?
+        };
+        let body = map_outbound_domain(&request.body, domain.replica.generation())?;
+        let call = NotesCall {
+            context,
+            service,
+            key_id: context.client_api_key_id().clone(),
+            session_key,
+            domain,
+            target,
+            request,
+            body,
+        };
+        // legacy 会话沿既有原生域转发，不新增日志，也不把旧状态迁到新域
+        let records = call.domain.records_operations();
+        match kind {
+            Some(kind) if records => self.notes_write(call, kind).await,
+            _ => self.notes_passthrough(call).await,
+        }
+    }
+
+    /// 读类与 legacy 写类：域映射后单次发送，正文沿既有惰性生命周期交付
+    async fn notes_passthrough(
+        &self,
+        call: NotesCall<'_>,
+    ) -> Result<MiddlewareResponse, ProviderError> {
+        let NotesCall {
+            context,
+            target,
+            mut request,
+            body,
+            ..
+        } = call;
+        request.body = body;
+        let AuxiliaryTarget {
+            account,
+            identity,
+            authorization,
+            lease,
+        } = target;
+        let response = self
+            .client
+            .for_account(&account)
+            .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+            .native_auxiliary(
+                request,
+                CodexRequestContext::auxiliary(
+                    &authorization,
+                    Some(&identity.account_id),
+                    "codex_auxiliary",
+                    None,
+                ),
+                identity.is_fedramp,
+            )
+            .await
+            .map_err(|error| map_client_error(error, UpstreamSendState::Ambiguous, false).error)?;
+        Ok(self.forwarded_response(context, response, lease))
+    }
+
+    /// 托管写类：先记录 seq 与开始事实，再发送一次并在交付前保存完整响应
+    ///
+    /// 传输失败不重试，如实记录结果不明；2xx 只表示收到响应，不判断加密业务结果
+    async fn notes_write(
+        &self,
+        call: NotesCall<'_>,
+        kind: CodexNotesOperationKind,
+    ) -> Result<MiddlewareResponse, ProviderError> {
+        let NotesCall {
+            // 写类响应必须整体缓冲后先落库，正文租约与取消不再随正文生命周期流转
+            context: _,
+            service,
+            key_id,
+            session_key,
+            domain,
+            target,
+            mut request,
+            body,
+        } = call;
+        let agent_name =
+            declared_agent_name(&request.body).unwrap_or_else(|| CODEX_ROOT_AGENT_NAME.to_owned());
+        let stored = std::str::from_utf8(&request.body)
+            .map_err(|_| notes_body_error())?
+            .to_owned();
+        let operation = service
+            .append_operation(
+                &key_id,
+                &session_key,
+                domain.replica,
+                kind,
+                agent_name,
+                stored,
+            )
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
+        // 没有开始事实就不允许字节离开网关
+        service
+            .start_operation(&key_id, &session_key, operation.seq)
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
+        let AuxiliaryTarget {
+            account,
+            identity,
+            authorization,
+            lease: _lease,
+        } = target;
+        request.body = body;
+        let sent = self
+            .client
+            .for_account(&account)
+            .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+            .native_auxiliary(
+                request,
+                CodexRequestContext::auxiliary(
+                    &authorization,
+                    Some(&identity.account_id),
+                    "codex_auxiliary",
+                    None,
+                ),
+                identity.is_fedramp,
+            )
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                // 字节可能已经离开网关；顺序位置保留到显式处理为止
+                record_unknown(service, &key_id, &session_key, operation.seq, None).await;
+                return Err(map_client_error(error, UpstreamSendState::Ambiguous, false).error);
+            }
+        };
+        let status = response.status();
+        let headers = forwardable_headers(&response);
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                record_unknown(
+                    service,
+                    &key_id,
+                    &session_key,
+                    operation.seq,
+                    Some(status.as_u16()),
+                )
+                .await;
+                return Err(map_client_error(
+                    CodexClientError::HttpJson(error),
+                    UpstreamSendState::Ambiguous,
+                    false,
+                )
+                .error);
+            }
+        };
+        // 完整响应先落库再交给客户端；非 2xx 记录真实状态，不解读加密业务结果
+        let recorded = if status.is_success() {
+            CodexNotesOperationStatus::Responded
+        } else {
+            CodexNotesOperationStatus::Failed
+        };
+        let Ok(response_body) = std::str::from_utf8(&bytes) else {
+            record_unknown(
+                service,
+                &key_id,
+                &session_key,
+                operation.seq,
+                Some(status.as_u16()),
+            )
+            .await;
+            return Err(notes_body_error());
+        };
+        service
+            .complete_operation(&CodexNotesCompletion {
+                key_id: key_id.clone(),
+                session_key: session_key.clone(),
+                seq: operation.seq,
+                status: recorded,
+                response: Some(response_body.to_owned()),
+                response_status: Some(status.as_u16()),
+            })
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::Sent))?;
+        Ok(buffered_response(status.as_u16(), headers, bytes))
+    }
+
+    /// 上游响应投影为下游惰性正文；租约随正文生命周期释放
+    fn forwarded_response(
+        &self,
+        context: &CodexAuthorizedContext,
+        response: reqwest::Response,
+        lease: Option<Box<CodexCredentialLease>>,
+    ) -> MiddlewareResponse {
+        MiddlewareResponse::new(
+            "openai".to_owned(),
+            response.status().as_u16(),
+            forwardable_headers(&response),
+            Box::new(NativeBody {
+                response: Some(response),
+                // 辅助首绑取得的账号租约随正文生命周期释放，不能提前结束占用
+                _lease: lease,
+                cancellation: context.cancellation().clone(),
+                deadline: context.deadline(),
+            }),
+        )
+    }
+
+    /// 将会话 notes 重建到目标账号的新域并发布
+    ///
+    /// 只由模型 attempt 在选出目标账号、发出模型请求之前调用；重放与进度推进
+    /// 在本方法内完成，发布由 Core 以原代次 CAS 裁决，失败不发布也不重试 append
+    /// 授权来自同一 attempt 的 Key、账号范围、取消与期限，不伪造入口身份
+    ///
+    /// # Errors
+    ///
+    /// 未装配 notes 协调、目标账号不可用、日志存在未终结操作、重放失败、
+    /// 发布事务失败或 attempt 取消/超时
+    pub async fn rebuild_notes(
+        &self,
+        authorization: &CodexSessionAuthorization,
+        session_key: &ProviderSessionAffinityKey,
+        target: &ProviderAccountId,
+        credential_revision: u64,
+    ) -> Result<CodexNotesPublishOutcome, ProviderError> {
+        tokio::select! {
+            biased;
+            () = authorization.cancellation().cancelled() => Err(provider_error(
+                ProviderErrorKind::Cancelled,
+                UpstreamSendState::NotSent,
+            )),
+            () = authorization.deadline().wait() => Err(provider_error(
+                ProviderErrorKind::Timeout,
+                UpstreamSendState::NotSent,
+            )),
+            result = self.rebuild_notes_inner(
+                authorization,
+                session_key,
+                target,
+                credential_revision,
+            ) => result,
+        }
+    }
+
+    async fn rebuild_notes_inner(
+        &self,
+        authorization: &CodexSessionAuthorization,
+        session_key: &ProviderSessionAffinityKey,
+        target: &ProviderAccountId,
+        credential_revision: u64,
+    ) -> Result<CodexNotesPublishOutcome, ProviderError> {
+        let service = self.native_notes.as_deref().ok_or_else(|| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        // 正常写入与重建共用同一会话互斥，避免重建期间旧写入落到旧域
+        let _guard = service
+            .lock_session(authorization.client_api_key_id(), session_key)
+            .await;
+        let target_account = self
+            .unleased_auxiliary_target(authorization.account_scope(), target)
+            .await?;
+        // 准备阶段看到的身份已变化时重读状态重新准备，不用旧凭据重放
+        if target_account.account.revision().get() != credential_revision {
+            return Ok(CodexNotesPublishOutcome::IdentityChanged);
+        }
+        let mut rebuild = service
+            .begin_rebuild(authorization.client_api_key_id(), session_key, target)
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
+        let generation = rebuild.generation.clone();
+        let client = self
+            .client
+            .for_account(&target_account.account)
+            .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?;
+        // 步骤副本与冻结目标一致：重放期间同时推进 &mut 进度
+        let steps = rebuild.steps.clone();
+        for step in &steps {
+            let request = replay_request(&generation, step)?;
+            let response = client
+                .native_auxiliary(
+                    request,
+                    CodexRequestContext::auxiliary(
+                        &target_account.authorization,
+                        Some(&target_account.identity.account_id),
+                        "codex_auxiliary",
+                        None,
+                    ),
+                    target_account.identity.is_fedramp,
+                )
+                .await
+                .map_err(|error| {
+                    map_client_error(error, UpstreamSendState::Ambiguous, false).error
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                // 明确失败就停止：不发布半套副本，也不重试同一步
+                tracing::warn!(
+                    seq = step.seq,
+                    upstream_status_code = status.as_u16(),
+                    "Codex notes replay was rejected by the upstream"
+                );
+                return Err(provider_error(
+                    ProviderErrorKind::Unavailable,
+                    UpstreamSendState::NotSent,
+                )
+                .with_status(status.as_u16())
+                .with_retry_prohibited()
+                .with_diagnostic(
+                    ProviderDiagnostic::new("Codex notes replay was rejected by the upstream")
+                        .with_classification("notes", "replay_rejected"),
+                ));
+            }
+            // 只有完整读到响应才推进冻结进度
+            response.bytes().await.map_err(|error| {
+                map_client_error(
+                    CodexClientError::HttpJson(error),
+                    UpstreamSendState::Ambiguous,
+                    false,
+                )
+                .error
+            })?;
+            service
+                .advance_rebuild(
+                    authorization.client_api_key_id(),
+                    session_key,
+                    &mut rebuild,
+                    step.seq,
+                )
+                .await
+                .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
+        }
+        service
+            .publish_rebuild(
+                authorization.client_api_key_id(),
+                session_key,
+                &rebuild,
+                credential_revision,
+            )
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))
+    }
+}
+
+impl CodexProvider {
+    /// 本地回答 history 四工具
+    ///
+    /// 只有已装配原生 history 且 session_pool 的会话才可能本地回答；
+    /// legacy 与来源未判定会话返回 None，继续既有上游行为
+    async fn local_history(
+        &self,
+        context: &CodexAuthorizedContext,
+        request: &CodexAuxiliaryRequest,
+    ) -> Result<Option<MiddlewareResponse>, ProviderError> {
+        let Some(service) = self.native_history.as_deref() else {
+            return Ok(None);
+        };
+        if !context.session_pool() || history_tool(request.operation).is_none() {
+            return Ok(None);
+        }
+        let affinity = self.auxiliary_session_affinity(context, request)?;
+        local_history_response(
+            service,
+            context.client_api_key_id(),
+            affinity.key(),
+            request.operation,
+            &request.headers,
+            &request.body,
+        )
+        .await
+    }
+
     /// 解析辅助请求的执行账号
     ///
     /// fixed 只复验入口账号；session_pool 与模型请求共用持久归属，首次先到时可完成认领
@@ -131,65 +546,78 @@ impl CodexProvider {
         // fixed 与账号级辅助请求（usage/profile/settings 等）始终使用入口账号
         if !context.session_pool() || !request.operation.follows_codex_session() {
             let account_id = context.entry_account_id().clone();
-            return self.unleased_auxiliary_target(context, &account_id).await;
+            return self
+                .unleased_auxiliary_target(context.account_scope(), &account_id)
+                .await;
         }
         let affinity = self.auxiliary_session_affinity(context, request)?;
-        let owner = self
-            .selector
-            .load_session_owner(context.client_api_key_id(), affinity.key())
-            .await
-            .map_err(map_selection_error)?;
-        if let Some(owner) = owner {
-            // 已有归属只使用 owner，不因模型额度或池内其他账号重新选号
-            return self.unleased_auxiliary_target(context, &owner).await;
-        }
-        // 辅助请求可能先于模型请求到达；复用模型选号规则完成原子认领，不产生模型费用
         let attempt = context.selection().ok_or_else(|| {
             provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
         })?;
-        let lease = self
-            .selector
-            .select_for_provider_endpoint(&SelectCodexProviderEndpointCredential {
-                // 辅助端点与 Responses 同源，URL 只参与 cookie 适用域判断
-                request_url: &self.responses_url,
-                attempt,
-                session_affinity: Some(&affinity),
-                model: CodexSelectionModel::Search(None),
-                requires_oauth: true,
-            })
-            .await
-            .map_err(map_selection_error)?;
-        let claim = CodexSessionClaim {
-            key_id: context.client_api_key_id().clone(),
-            session_key: affinity.key().clone(),
-            account_id: lease.account_id().clone(),
-            credential_revision: lease.account().revision().get(),
-        };
-        match self
-            .selector
-            .claim_session_owner(&claim)
-            .await
-            .map_err(map_selection_error)?
-        {
-            CodexSessionClaimOutcome::Owned => self.leased_auxiliary_target(lease).await,
-            CodexSessionClaimOutcome::ConflictingOwner(owner) => {
-                // 并发首请求已有赢家；释放临时租约后按该 owner 执行
-                drop(lease);
-                self.unleased_auxiliary_target(context, &owner).await
+        // 与模型选号共用有界快照预算：账号行锁内发现凭据替换时重读归属、
+        // 重新选号并重新认领，正常刷新不会让首绑永久失败
+        let mut snapshot_retries = 0;
+        loop {
+            if let Some(owner) = self
+                .selector
+                .load_session_owner(context.client_api_key_id(), affinity.key())
+                .await
+                .map_err(map_selection_error)?
+            {
+                // 已有归属只使用 owner，不因模型额度或池内其他账号重新选号
+                return self
+                    .unleased_auxiliary_target(context.account_scope(), &owner)
+                    .await;
             }
-            CodexSessionClaimOutcome::IdentityChanged => {
-                drop(lease);
-                Err(provider_error(
-                    ProviderErrorKind::Unavailable,
-                    UpstreamSendState::NotSent,
-                ))
-            }
-            CodexSessionClaimOutcome::Unavailable => {
-                drop(lease);
-                Err(provider_error(
-                    ProviderErrorKind::NoEligibleAccount,
-                    UpstreamSendState::NotSent,
-                ))
+            // 辅助请求可能先于模型请求到达；复用模型选号规则完成原子认领，不产生模型费用
+            let lease = self
+                .selector
+                .select_for_provider_endpoint(&SelectCodexProviderEndpointCredential {
+                    // 辅助端点与 Responses 同源，URL 只参与 cookie 适用域判断
+                    request_url: &self.responses_url,
+                    attempt,
+                    session_affinity: Some(&affinity),
+                    model: CodexSelectionModel::Search(None),
+                    requires_oauth: true,
+                })
+                .await
+                .map_err(map_selection_error)?;
+            let claim = CodexSessionClaim {
+                key_id: context.client_api_key_id().clone(),
+                session_key: affinity.key().clone(),
+                account_id: lease.account_id().clone(),
+                credential_revision: lease.account().revision().get(),
+            };
+            match self
+                .selector
+                .claim_session_owner(&claim)
+                .await
+                .map_err(map_selection_error)?
+            {
+                CodexSessionClaimOutcome::Owned => {
+                    return self.leased_auxiliary_target(lease).await;
+                }
+                CodexSessionClaimOutcome::ConflictingOwner(owner) => {
+                    // 并发首请求已有赢家；释放临时租约后按该 owner 执行
+                    drop(lease);
+                    return self
+                        .unleased_auxiliary_target(context.account_scope(), &owner)
+                        .await;
+                }
+                CodexSessionClaimOutcome::IdentityChanged => {
+                    // 选号快照在账号行锁内已失效，释放临时租约后重跑整套首绑
+                    let account = lease.account().clone();
+                    drop(lease);
+                    retry_account_snapshot(attempt, &account, &mut snapshot_retries)
+                        .map_err(map_selection_error)?;
+                }
+                CodexSessionClaimOutcome::Unavailable => {
+                    drop(lease);
+                    return Err(provider_error(
+                        ProviderErrorKind::NoEligibleAccount,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
             }
         }
     }
@@ -215,12 +643,12 @@ impl CodexProvider {
 
     async fn unleased_auxiliary_target(
         &self,
-        context: &CodexAuthorizedContext,
+        scope: &FrozenAccountScope,
         account_id: &ProviderAccountId,
     ) -> Result<AuxiliaryTarget, ProviderError> {
         let (account, runtime) = self
             .selector
-            .native_credential(context, account_id)
+            .native_credential(scope, account_id)
             .await
             .map_err(map_selection_error)?;
         let secret = runtime
@@ -317,12 +745,125 @@ fn invalid_identity() -> ProviderError {
     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
 }
 
+/// 辅助请求的两种完成方式：已就绪响应或待惰性交付的上游响应
+enum AuxiliaryOutcome {
+    /// 本地 history 结果、notes 写响应等已完整取得的结果
+    Ready(MiddlewareResponse),
+    Upstream {
+        response: reqwest::Response,
+        lease: Option<Box<CodexCredentialLease>>,
+    },
+}
+
 /// 辅助请求解析出的执行账号；租约只在 session_pool 首绑时存在
 struct AuxiliaryTarget {
     account: ProviderAccount,
     identity: CodexIdentity,
     authorization: String,
     lease: Option<Box<CodexCredentialLease>>,
+}
+
+/// 一次 notes 调用已解析的会话事实
+struct NotesCall<'a> {
+    context: &'a CodexAuthorizedContext,
+    service: &'a CodexNotesService,
+    key_id: ClientApiKeyId,
+    session_key: ProviderSessionAffinityKey,
+    domain: CodexNotesDomain,
+    target: AuxiliaryTarget,
+    /// 客户端原始请求；日志按原字节保存，发送前只替换出站草稿的正文
+    request: CodexAuxiliaryRequest,
+    body: Bytes,
+}
+
+/// 上游响应头投影到下游；只保留正文类型与官方允许转发的字段
+fn forwardable_headers(response: &reqwest::Response) -> Vec<MiddlewareHeader> {
+    let connection_options = response
+        .headers()
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    response
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() == "content-type"
+                || gateway_protocol::openai::response_header_is_forwardable(
+                    name.as_str(),
+                    &connection_options,
+                )
+        })
+        .map(|(name, value)| {
+            MiddlewareHeader::new(name.as_str(), Bytes::copy_from_slice(value.as_bytes()))
+        })
+        .collect()
+}
+
+/// 已完整读取的上游响应；正文只交付原始字节，content-type 由响应头声明
+fn buffered_response(
+    status: u16,
+    headers: Vec<MiddlewareHeader>,
+    body: Bytes,
+) -> MiddlewareResponse {
+    MiddlewareResponse::new(
+        "openai".to_owned(),
+        status,
+        headers,
+        Box::new(BufferedBody::new(body)),
+    )
+}
+
+/// 发送异常时如实记录结果不明
+///
+/// 记录失败只补日志，不覆盖原发送错误；该 seq 随后会阻止发布并要求显式处理
+async fn record_unknown(
+    service: &CodexNotesService,
+    key_id: &ClientApiKeyId,
+    session_key: &ProviderSessionAffinityKey,
+    seq: u64,
+    response_status: Option<u16>,
+) {
+    let completion = CodexNotesCompletion {
+        key_id: key_id.clone(),
+        session_key: session_key.clone(),
+        seq,
+        status: CodexNotesOperationStatus::Unknown,
+        response: None,
+        response_status,
+    };
+    if let Err(error) = service.complete_operation(&completion).await {
+        tracing::warn!(
+            seq,
+            error = %error,
+            "Codex notes operation outcome could not be persisted"
+        );
+    }
+}
+
+/// notes 协调失败映射为稳定错误
+///
+/// 会话状态不完整、日志未终结与重放越序都不允许改用其它账号重试
+pub(super) fn notes_coordination_error(
+    error: CodexNotesError,
+    send_state: UpstreamSendState,
+) -> ProviderError {
+    let code = match &error {
+        CodexNotesError::Store(_) => "store_unavailable",
+        CodexNotesError::SessionAbsent => "session_absent",
+        CodexNotesError::LegacySession => "legacy_session",
+        CodexNotesError::OperationUnsettled { .. } => "operation_unsettled",
+        CodexNotesError::ReplayOutOfOrder => "replay_out_of_order",
+        CodexNotesError::ReplayNotComplete => "replay_not_complete",
+    };
+    provider_error(ProviderErrorKind::Unavailable, send_state)
+        .with_retry_prohibited()
+        .with_diagnostic(
+            ProviderDiagnostic::new("Codex notes coordination is unavailable")
+                .with_classification("notes", code),
+        )
 }
 
 struct NativeBody {

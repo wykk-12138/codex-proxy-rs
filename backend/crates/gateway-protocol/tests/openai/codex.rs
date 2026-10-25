@@ -260,6 +260,24 @@ fn pool_session_identity_resolves_each_single_source() {
             None,
             "header-turn",
         ),
+        // 正文与请求上下文都带 turn metadata，只有正文声明了会话
+        (
+            json!({"turnMetadata":"{\"session_id\":\"body-turn\"}"}),
+            json!({"turn_metadata":"{\"thread_id\":\"context-thread\"}"}),
+            None,
+            None,
+            None,
+            "body-turn",
+        ),
+        // 正文 turn metadata 未声明会话时回退到请求上下文
+        (
+            json!({"turnMetadata":"{\"thread_id\":\"body-thread\"}"}),
+            json!({"turn_metadata":"{\"session_id\":\"context-turn\"}"}),
+            None,
+            None,
+            None,
+            "context-turn",
+        ),
         // 没有逻辑声明时兜底到 session-id 请求头
         (
             json!({}),
@@ -308,6 +326,17 @@ fn pool_session_identity_deduplicates_same_logical_declaration() {
         codex_session_identity(sources),
         CodexSessionIdentity::Resolved("shared".to_owned())
     );
+    // 请求头、正文与请求上下文的 turn metadata 同值，也只算一个声明
+    let body = object(json!({"turnMetadata":"{\"session_id\":\"shared\"}"}));
+    let context = object(json!({"turn_metadata":"{\"session_id\":\"shared\"}"}));
+    let sources = CodexSessionSources {
+        turn_metadata: Some("{\"session_id\":\"shared\"}"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("shared".to_owned())
+    );
 }
 
 #[test]
@@ -333,11 +362,50 @@ fn pool_session_identity_prefers_logical_declaration_over_transport_fallback() {
         codex_session_identity(sources),
         CodexSessionIdentity::Resolved("header".to_owned())
     );
+    // 只有请求上下文声明逻辑会话时，兜底头同样不算冲突
+    let body = object(json!({}));
+    let context = object(json!({"turn_metadata":"{\"session_id\":\"context-turn\"}"}));
+    let sources = CodexSessionSources {
+        session_id: Some("header"),
+        ..session_sources(&body, &context)
+    };
+    assert_eq!(
+        codex_session_identity(sources),
+        CodexSessionIdentity::Resolved("context-turn".to_owned())
+    );
 }
 
 #[test]
 fn pool_session_identity_reports_conflict_between_logical_declarations() {
     for (body, context, turn_metadata, endpoint) in [
+        // 正文 turn metadata 与请求上下文 turn metadata 不同
+        (
+            json!({"turnMetadata":"{\"session_id\":\"session-a\"}"}),
+            json!({"turn_metadata":"{\"session_id\":\"session-b\"}"}),
+            None,
+            None,
+        ),
+        // 两个 turn metadata 字段分别来自正文与请求上下文
+        (
+            json!({"client_metadata":{"x-codex-turn-metadata":"{\"session_id\":\"session-a\"}"}}),
+            json!({"turn_metadata":"{\"session_id\":\"session-b\"}"}),
+            None,
+            None,
+        ),
+        // 请求头 turn metadata 与正文 turn metadata 不同
+        (
+            json!({"turnMetadata":"{\"session_id\":\"session-b\"}"}),
+            json!({}),
+            Some("{\"session_id\":\"session-a\"}"),
+            None,
+        ),
+        // 请求头 turn metadata 与请求上下文 turn metadata 不同
+        (
+            json!({}),
+            json!({"turn_metadata":"{\"session_id\":\"session-b\"}"}),
+            Some("{\"session_id\":\"session-a\"}"),
+            None,
+        ),
         // client_metadata 与请求上下文 turn metadata 不同
         (
             json!({"client_metadata":{"session_id":"session-a"}}),

@@ -65,9 +65,11 @@ impl PgCodexSessionOwnership {
             Some(owner) => CodexSessionClaimOutcome::ConflictingOwner(decode_owner(owner)?),
             None => {
                 // 并发首请求只有一个插入成功；竞争方读取胜出的 owner，绝不覆盖
+                // 新会话尚未判定采集来源；已有行保持迁移后的 legacy 默认
                 let inserted = sqlx::query(
-                    "insert into client_api_key_codex_sessions (key_id, session_key, account_id)
-                     values ($1, $2, $3)
+                    "insert into client_api_key_codex_sessions
+                       (key_id, session_key, account_id, origin)
+                     values ($1, $2, $3, 'unclassified')
                      on conflict (key_id, session_key) do nothing",
                 )
                 .bind(claim.key_id.as_str())

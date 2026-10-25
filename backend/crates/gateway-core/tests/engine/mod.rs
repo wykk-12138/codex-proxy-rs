@@ -1,6 +1,9 @@
 //! 执行引擎各阶段与端口合同的测试入口
 
 mod admission;
+mod codex_history;
+mod codex_history_capture;
+mod codex_notes;
 mod connection;
 mod continuation;
 mod coordinator;

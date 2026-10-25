@@ -1,8 +1,9 @@
 //! 按能力提供 Provider 所需的存储端口
 
 use super::{
-    CodexSessionOwnershipPort, OAuthPendingFlowPort, ProviderArtifactProfileCachePort,
-    ProviderCatalogCachePort, ProviderCooldownPort, ProviderCredentialStatePort, ProviderLeasePort,
+    CodexSessionContentPort, CodexSessionOwnershipPort, CodexSessionStatePort,
+    OAuthPendingFlowPort, ProviderArtifactProfileCachePort, ProviderCatalogCachePort,
+    ProviderCooldownPort, ProviderCredentialStatePort, ProviderLeasePort,
     ProviderRuntimePolicyPort, ProviderSessionAffinityPort, ProviderSessionExclusionPort,
 };
 use crate::account::{AccountFeedbackStats, ProviderAccountStore};
@@ -24,6 +25,10 @@ pub struct ProviderStorePorts {
     oauth_pending: Arc<dyn OAuthPendingFlowPort>,
     /// session_pool 的会话归属；未装配时该模式如实失败，fixed 不受影响
     codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
+    /// 原生会话状态（来源、代次、notes 落点与重建进度）
+    codex_session_state: Option<Arc<dyn CodexSessionStatePort>>,
+    /// history 条目与 notes 操作日志的内容存取
+    codex_session_content: Option<Arc<dyn CodexSessionContentPort>>,
     diagnostics: Arc<dyn crate::diagnostics::OperationalDiagnostics>,
 }
 
@@ -57,6 +62,8 @@ impl ProviderStorePorts {
             runtime_policy,
             oauth_pending,
             codex_sessions: None,
+            codex_session_state: None,
+            codex_session_content: None,
             diagnostics,
         }
     }
@@ -71,6 +78,30 @@ impl ProviderStorePorts {
     #[must_use]
     pub fn codex_sessions(&self) -> Option<Arc<dyn CodexSessionOwnershipPort>> {
         self.codex_sessions.clone()
+    }
+
+    /// 装配原生会话状态端口；与 owner 端口共用同一条会话记录
+    #[must_use]
+    pub fn with_codex_session_state(mut self, state: Arc<dyn CodexSessionStatePort>) -> Self {
+        self.codex_session_state = Some(state);
+        self
+    }
+
+    #[must_use]
+    pub fn codex_session_state(&self) -> Option<Arc<dyn CodexSessionStatePort>> {
+        self.codex_session_state.clone()
+    }
+
+    /// 装配 history 与 notes 操作日志的内容端口
+    #[must_use]
+    pub fn with_codex_session_content(mut self, content: Arc<dyn CodexSessionContentPort>) -> Self {
+        self.codex_session_content = Some(content);
+        self
+    }
+
+    #[must_use]
+    pub fn codex_session_content(&self) -> Option<Arc<dyn CodexSessionContentPort>> {
+        self.codex_session_content.clone()
     }
 
     #[must_use]

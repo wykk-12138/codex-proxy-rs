@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use gateway_core::account::{AccountFeedbackStats, ProviderAccount};
+use gateway_core::engine::codex_history::CodexHistoryService;
+use gateway_core::engine::codex_notes::CodexNotesService;
 use gateway_core::engine::continuation::{ContinuationBinding, NativeContinuationScope};
 use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_core::engine::provider::{
@@ -32,7 +34,9 @@ use gateway_core::operation::{
     CapabilityRequirements, GenerateRequest, ImageRequest, ImageRequestKind, Operation,
     OperationKind, ProviderSessionState, StandaloneSearchRequest,
 };
-use gateway_core::provider_ports::ProviderSessionAffinityKey;
+use gateway_core::provider_ports::{
+    CodexNotesPublishOutcome, CodexSessionOrigin, ProviderSessionAffinityKey,
+};
 use gateway_core::routing::{
     ModelCapabilities, ModelPresentation, ProviderCandidate, ProviderCatalogGeneration,
     ProviderKind, ProviderModelCapabilities, UpstreamModelId,
@@ -66,6 +70,7 @@ use crate::credential::{
     derive_endpoint_affinity_with_headers, derive_live_session_affinity,
     derive_pool_session_affinity, derive_previous_response_id_hash, derive_turn_alias,
 };
+use crate::native_history::CodexNativeHistoryRequest;
 use crate::request_identity::{
     account_session_with_headers, pool_session_identity, turn_id_with_headers,
 };
@@ -107,7 +112,7 @@ use crate::transport::{
 };
 
 mod execution;
-mod failure;
+pub(crate) mod failure;
 mod live;
 mod native;
 mod observation;
@@ -120,6 +125,7 @@ use execution::*;
 #[doc(hidden)]
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
+use native::notes_coordination_error;
 use observation::*;
 pub(crate) use workers::worker_contributions;
 
@@ -165,6 +171,10 @@ pub struct CodexProvider {
     live_registry: Arc<CodexLiveRegistry>,
     live_gateway: Option<Arc<CodexLiveGateway>>,
     native_token_client: Option<Arc<crate::credential::token_client::OpenAiTokenClient>>,
+    /// 原生 history 采集与本地四工具；未装配时完全保持既有转发行为
+    native_history: Option<Arc<CodexHistoryService>>,
+    /// notes 操作日志、已发布副本域映射与按序重建；未装配时完全保持既有转发行为
+    native_notes: Option<Arc<CodexNotesService>>,
 }
 
 struct PreparedGenerateRequest {
@@ -357,7 +367,27 @@ impl CodexProvider {
             live_registry: Arc::new(CodexLiveRegistry::default()),
             live_gateway: None,
             native_token_client: None,
+            native_history: None,
+            native_notes: None,
         })
+    }
+
+    /// 装配原生 history 的持久状态与内容端口
+    ///
+    /// 只有 session_pool 的 managed 会话会采集或本地回答；fixed 与普通 `/v1` 不受影响
+    #[must_use]
+    pub fn with_native_history(mut self, history: Arc<CodexHistoryService>) -> Self {
+        self.native_history = Some(history);
+        self
+    }
+
+    /// 装配 notes 会话顺序、日志与重建协调
+    ///
+    /// 同一实例由组合根交给 notes 辅助与切换入口；每请求另建实例会让会话互斥失效
+    #[must_use]
+    pub fn with_native_notes(mut self, notes: Arc<CodexNotesService>) -> Self {
+        self.native_notes = Some(notes);
+        self
     }
 
     pub(crate) fn with_native_token_client(
@@ -700,6 +730,14 @@ impl Provider for CodexProvider {
                     requires_websocket,
                 )
             });
+        // 只有已 managed 且装配了 notes 重建能力的会话才允许把持久 owner 迁到新账号；
+        // legacy、未判定与未装配存储保持永久归属
+        let session_owner_migration = match selection_session_affinity.as_ref() {
+            Some(affinity) if context.codex_session_pool() => {
+                self.session_owner_can_migrate(&context, affinity).await?
+            }
+            _ => false,
+        };
         let selection_started_at = Instant::now();
         let selection = async {
             self.selector
@@ -716,6 +754,7 @@ impl Provider for CodexProvider {
                     selection_session_affinity.as_ref(),
                     requires_websocket,
                     guardian,
+                    session_owner_migration,
                 )
                 .await
                 .map_err(map_selection_error)
@@ -838,7 +877,11 @@ impl CodexProvider {
                 &middleware_headers,
                 None,
             )?;
-            if lease.admitted_session() != Some(affinity.key()) {
+            if lease.admitted_session() != Some(affinity.key())
+                && !lease
+                    .session_migration()
+                    .is_some_and(|migration| &migration.session_key == affinity.key())
+            {
                 return Err(pool_session_error("session_changed"));
             }
             // 认领与后续复验必须同键：validate_translated_selection 与 remember_turn
@@ -846,15 +889,26 @@ impl CodexProvider {
             session_affinity = Some(affinity);
         }
         if !context.is_diagnostic_required_account() {
-            self.selector
-                .validate_translated_selection(
-                    &mut lease,
-                    session_affinity.as_ref(),
-                    cyber_policy_session_key.as_ref(),
-                    context.account_selection_policy(),
-                )
-                .await
-                .map_err(map_selection_error)?;
+            match lease.session_migration() {
+                // 待发布迁移的软亲和与 owner 都还没改绑，发布成功后再准入
+                Some(_) => {
+                    self.selector
+                        .validate_migrated_selection(&mut lease, cyber_policy_session_key.as_ref())
+                        .await
+                        .map_err(map_selection_error)?;
+                }
+                None => {
+                    self.selector
+                        .validate_translated_selection(
+                            &mut lease,
+                            session_affinity.as_ref(),
+                            cyber_policy_session_key.as_ref(),
+                            context.account_selection_policy(),
+                        )
+                        .await
+                        .map_err(map_selection_error)?;
+                }
+            }
         }
         if !context.is_diagnostic_required_account()
             && let Some(affinity) = session_affinity.as_ref()
@@ -1089,6 +1143,35 @@ impl CodexProvider {
             AttemptTransport::Retry(retry_index) => retry_index.get(),
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
+        // 已托管会话换到新账号后，先在目标域重建 notes 并 CAS 发布；
+        // 发布成功前不发送新账号的模型请求，失败也不回退到旧账号
+        if lease.session_migration().is_some() {
+            self.publish_session_migration(&context, &lease, &upstream_request)
+                .await?;
+        }
+        // 原生 history 只在 session_pool 且窗口事实可解析时采集；
+        // 采集点仍在隐私规则之后的实际发送路径
+        let native_history = if context.codex_session_pool() {
+            self.native_history
+                .as_ref()
+                .zip(session_affinity.as_ref())
+                .and_then(|(service, affinity)| {
+                    CodexNativeHistoryRequest::from_request(
+                        Arc::clone(service),
+                        context.client_api_key_ref(),
+                        affinity.key(),
+                        upstream_request.body(),
+                        generate.protocol_payload().context(),
+                    )
+                    .map(Arc::new)
+                })
+        } else {
+            None
+        };
+        if let Some(history) = native_history.as_ref() {
+            // 续链父响应必须在发送前确认；未知时让客户端改发完整输入
+            history.begin().await?;
+        }
         let events = cold_response_stream(ColdResponse {
             client: self
                 .client_for_request(&context)?
@@ -1098,7 +1181,8 @@ impl CodexProvider {
                 .with_connection_budget(context.connection_budget().clone())
                 .with_response_control(context.response_control().cloned())
                 .with_middleware_headers(middleware_headers)
-                .with_privacy(context.privacy(), context.cancellation().clone()),
+                .with_privacy(context.privacy(), context.cancellation().clone())
+                .with_native_history(native_history.clone()),
             response_origin: self.responses_url.clone(),
             request: upstream_request,
             upstream_model,
@@ -1114,6 +1198,7 @@ impl CodexProvider {
             websocket_retry_count,
             stream_max_retries: self.stream_max_retries,
             session_capture,
+            native_history,
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {
@@ -1125,6 +1210,120 @@ impl CodexProvider {
             stream
         })
     }
+}
+
+impl CodexProvider {
+    /// 已托管会话可在持久 owner 明确额度耗尽时换号
+    ///
+    /// 与 notes 辅助共用同一条会话状态事实；未装配 notes 时无法重建，也不迁移
+    /// legacy 与未判定会话保持永久归属
+    async fn session_owner_can_migrate(
+        &self,
+        context: &AttemptContext,
+        affinity: &CodexSessionAffinity,
+    ) -> Result<bool, ProviderError> {
+        let Some(service) = self.native_notes.as_deref() else {
+            return Ok(false);
+        };
+        let domain = service
+            .domain(context.client_api_key_ref(), affinity.key())
+            .await
+            .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
+        Ok(domain.is_some_and(|domain| domain.origin == CodexSessionOrigin::Managed))
+    }
+
+    /// 在目标账号发送前重建 notes 并发布新 owner 与新域
+    ///
+    /// 发布前不发送模型请求；发布后软亲和跟随新 owner，但 PostgreSQL owner 才是权威
+    async fn publish_session_migration(
+        &self,
+        context: &AttemptContext,
+        lease: &CodexCredentialLease,
+        upstream: &CodexResponsesRequest,
+    ) -> Result<(), ProviderError> {
+        let Some(migration) = lease.session_migration() else {
+            return Ok(());
+        };
+        // 旧账号的增量续接不能交给新账号；这种请求应由客户端重新发送完整输入
+        if upstream.previous_response_id().is_some() {
+            return Err(continuation_replay_required_error("scope_unavailable"));
+        }
+        let authorization = context.session_authorization().ok_or_else(|| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let target = lease.account_id().clone();
+        let credential_revision = lease.account().revision().get();
+        let outcome = self
+            .rebuild_notes(
+                &authorization,
+                &migration.session_key,
+                &target,
+                credential_revision,
+            )
+            .await?;
+        match outcome {
+            CodexNotesPublishOutcome::Published(state) => {
+                tracing::info!(
+                    request_id = context.request_id().as_str(),
+                    from_account_id = %migration.from,
+                    account_id = %target,
+                    session_generation = state.generation,
+                    "OpenAI managed session migrated with rebuilt notes"
+                );
+            }
+            // 并发请求已把同一个目标发布到更新的代次，域已就绪
+            CodexNotesPublishOutcome::GenerationChanged(state) if state.owner == target => {
+                tracing::info!(
+                    request_id = context.request_id().as_str(),
+                    account_id = %target,
+                    session_generation = state.generation,
+                    "OpenAI managed session migration was published concurrently"
+                );
+            }
+            CodexNotesPublishOutcome::GenerationChanged(_) => {
+                return Err(
+                    migration_publish_error("replay_generation_changed").with_retry_prohibited()
+                );
+            }
+            // 准备阶段观测到的账号身份已变化，重试会重新选号并重新准备
+            CodexNotesPublishOutcome::IdentityChanged => {
+                return Err(migration_publish_error("identity_changed"));
+            }
+            CodexNotesPublishOutcome::Unavailable => {
+                return Err(migration_publish_error("target_unavailable"));
+            }
+            CodexNotesPublishOutcome::ReplayNotReady => {
+                return Err(migration_publish_error("replay_not_ready").with_retry_prohibited());
+            }
+        }
+        // owner 已经切换；软亲和只是可丢失偏好，失败只补日志，不回退本次发送
+        if let Err(error) = self
+            .selector
+            .admit_migrated_session(
+                &migration.session_key,
+                &target,
+                context
+                    .account_selection_policy()
+                    .openai_session_affinity_ttl(),
+            )
+            .await
+        {
+            tracing::warn!(
+                account_id = %target,
+                error = %error,
+                "OpenAI session soft affinity could not follow the migrated owner"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 迁移发布失败：目标域与持久 owner 未同时生效，本次不发送模型请求
+fn migration_publish_error(code: &'static str) -> ProviderError {
+    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent).with_diagnostic(
+        ProviderDiagnostic::new("Codex managed session migration could not be published")
+            .with_classification("notes", code),
+    )
 }
 
 fn native_request_requirements(request: &GenerateRequest) -> CapabilityRequirements {

@@ -22,6 +22,7 @@ mod backup;
 mod backup_export;
 mod client_budgets;
 mod client_keys;
+mod codex_state;
 mod connection;
 mod control_plane;
 mod execution;
@@ -43,6 +44,14 @@ mod usage_data;
 mod usage_paging;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn test_connect_options(database_url: &str) -> PgConnectOptions {
+    // 临时 schema 验证事务可见性与回滚，不模拟 PostgreSQL 掉电恢复
+    // 仅这些测试连接异步刷 WAL，保持服务端配置和生产连接行为不变
+    PgConnectOptions::from_str(database_url)
+        .expect("parse test PostgreSQL URL")
+        .options([("synchronous_commit", "off")])
+}
 
 pub(super) struct TestDatabase {
     admin: PgPool,
@@ -71,11 +80,7 @@ impl TestDatabase {
     pub(super) async fn create(label: &str) -> Option<Self> {
         let database_url = crate::support::test_env("CPR_TEST_DATABASE_URL")?;
         let schema = format!("cpr_store_{label}_{}", Uuid::new_v4().simple());
-        // 临时 schema 验证事务可见性与回滚，不模拟 PostgreSQL 掉电恢复
-        // 仅这些测试连接异步刷 WAL，保持服务端配置和生产连接行为不变
-        let options = PgConnectOptions::from_str(&database_url)
-            .expect("parse test PostgreSQL URL")
-            .options([("synchronous_commit", "off")]);
+        let options = test_connect_options(&database_url);
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options.clone())
@@ -99,6 +104,20 @@ impl TestDatabase {
             pool,
             schema,
         })
+    }
+
+    /// 独立于两连接测试池的观察连接；并发认领占满池时仍能读到服务端状态
+    pub(super) async fn observer_pool(&self) -> PgPool {
+        let database_url =
+            crate::support::test_env("CPR_TEST_DATABASE_URL").expect("test database URL");
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                test_connect_options(&database_url)
+                    .options([("search_path", self.schema.as_str())]),
+            )
+            .await
+            .expect("connect isolated test schema observer")
     }
 
     pub(super) async fn close(self) {

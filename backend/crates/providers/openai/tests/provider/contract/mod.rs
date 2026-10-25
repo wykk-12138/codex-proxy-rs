@@ -34,6 +34,8 @@ use gateway_core::account::{
     ProviderAccountId, ProviderAccountStore as _, QuotaAccessChange, QuotaAccessState,
     QuotaEvidence, QuotaObservation, QuotaState,
 };
+use gateway_core::engine::codex_history::CodexHistoryService;
+use gateway_core::engine::codex_notes::CodexNotesService;
 use gateway_core::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, PreviousResponseId,
 };
@@ -1156,15 +1158,32 @@ pub(super) fn provider_with_base_url_and_codex_sessions(
     sessions: Arc<MemoryCodexSessions>,
     base_url: String,
 ) -> Arc<CodexProvider> {
+    provider_with_base_url_and_codex_sessions_and_leases(
+        store,
+        sessions,
+        Arc::new(TestLeaseCoordinator::default()),
+        base_url,
+    )
+}
+
+/// 池模式同时暴露调度租约观测，供首绑租约释放的用例断言
+pub(super) fn provider_with_base_url_and_codex_sessions_and_leases(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    leases: Arc<TestLeaseCoordinator>,
+    base_url: String,
+) -> Arc<CodexProvider> {
     provider_and_quota_with_codex_sessions(
         store,
         Arc::new(MemorySessionAffinity::default()),
         base_url,
-        Arc::new(TestLeaseCoordinator::default()),
+        leases,
         u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
         Arc::new(MemoryCooldownPort::new()),
         crate::support::runtime_policy(),
         Some(sessions),
+        None,
+        None,
     )
     .0
 }
@@ -1185,6 +1204,8 @@ pub(super) fn provider_with_affinity_and_codex_sessions(
         Arc::new(MemoryCooldownPort::new()),
         crate::support::runtime_policy(),
         Some(sessions),
+        None,
+        None,
     )
     .0
 }
@@ -1286,6 +1307,8 @@ fn provider_and_quota_with_runtime_ports(
         cooldowns,
         policy,
         None,
+        None,
+        None,
     )
 }
 
@@ -1302,6 +1325,8 @@ fn provider_and_quota_with_codex_sessions(
     cooldowns: Arc<MemoryCooldownPort>,
     policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
     codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
+    native_history: Option<Arc<CodexHistoryService>>,
+    native_notes: Option<Arc<CodexNotesService>>,
 ) -> (
     Arc<CodexProvider>,
     Arc<CodexCredentialQuotaService>,
@@ -1354,7 +1379,82 @@ fn provider_and_quota_with_codex_sessions(
         stream_max_retries,
     )
     .expect("official OpenAI provider");
+    let provider = match native_history {
+        Some(history) => provider.with_native_history(history),
+        None => provider,
+    };
+    let provider = match native_notes {
+        Some(notes) => provider.with_native_notes(notes),
+        None => provider,
+    };
     (Arc::new(provider), quota, websocket_pool)
+}
+
+/// 池模式并装配原生 history；其余构造与既有池用例一致
+/// 池模式并装配原生 notes；其余构造与既有池用例一致
+pub(super) fn provider_with_codex_sessions_and_native_notes(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+    notes: Arc<CodexNotesService>,
+) -> Arc<CodexProvider> {
+    provider_and_quota_with_codex_sessions(
+        store,
+        Arc::new(MemorySessionAffinity::default()),
+        base_url,
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+        None,
+        Some(notes),
+    )
+    .0
+}
+
+pub(super) fn provider_with_codex_sessions_and_native_history(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+    history: Arc<CodexHistoryService>,
+) -> Arc<CodexProvider> {
+    provider_and_quota_with_codex_sessions(
+        store,
+        Arc::new(MemorySessionAffinity::default()),
+        base_url,
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+        Some(history),
+        None,
+    )
+    .0
+}
+
+/// history 与 notes 同时装配的 session_pool Provider；换号时两个域共享同一份持久事实
+pub(super) fn provider_with_codex_sessions_native_history_and_notes(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+    history: Arc<CodexHistoryService>,
+    notes: Arc<CodexNotesService>,
+) -> Arc<CodexProvider> {
+    provider_and_quota_with_codex_sessions(
+        store,
+        Arc::new(MemorySessionAffinity::default()),
+        base_url,
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+        Some(history),
+        Some(notes),
+    )
+    .0
 }
 
 pub(super) async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {

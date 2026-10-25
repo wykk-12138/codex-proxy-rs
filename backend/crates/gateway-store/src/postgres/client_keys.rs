@@ -1729,12 +1729,10 @@ pub(super) fn decode_codex_binding(
     let Some(account_id) = account_id else {
         return Ok(None);
     };
-    // 只有缺少 mode 列值的旧 shape 才按 fixed 解释；未知值不静默回退
-    let mode = match mode {
-        Some(mode) => gateway_core::policy::CodexAccessMode::parse(&mode)
-            .ok_or_else(|| invalid("invalid Codex access mode"))?,
-        None => gateway_core::policy::CodexAccessMode::Fixed,
-    };
+    // 模式列非空且受约束，有绑定却缺模式或取值未知都说明数据不可用，不解释成 fixed
+    let mode = mode.ok_or_else(|| invalid("missing Codex access mode"))?;
+    let mode = gateway_core::policy::CodexAccessMode::parse(&mode)
+        .ok_or_else(|| invalid("invalid Codex access mode"))?;
     Ok(Some(gateway_core::policy::CodexAccessBinding {
         account_id: gateway_core::account::ProviderAccountId::new(account_id)
             .map_err(|source| invalid("invalid Codex account ID").with_source(source))?,

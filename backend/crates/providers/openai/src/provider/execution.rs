@@ -434,6 +434,8 @@ pub(super) struct ColdResponse {
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
+    /// 原生 history 采集句柄；None 表示该请求不采集
+    pub(super) native_history: Option<Arc<CodexNativeHistoryRequest>>,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -816,6 +818,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,
+        native_history,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -1133,6 +1136,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     (events, Some((error, semantic_output_seen)))
                 }
             };
+            if let Some(history) = native_history.as_ref() {
+                // 完整条目先落库再随本批事件交付；不等整段响应结束
+                history.observe_events(&events).await?;
+            }
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
                 &mut session_capture,
@@ -1260,6 +1267,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 (events, Some((error, semantic_output_seen)))
             }
         };
+        if let Some(history) = native_history.as_ref() {
+            // 终态前提交最后一批条目
+            history.observe_events(&events).await?;
+        }
         let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
             log_canonical_upstream_error(
                 UpstreamErrorLogContext::new(

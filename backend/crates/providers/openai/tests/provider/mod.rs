@@ -4,5 +4,7 @@ mod contract;
 mod failure;
 mod live;
 pub(crate) mod native;
+mod native_history;
+mod native_notes;
 
 pub(crate) use contract::assert_local_connection_capacity_is_not_an_upstream_failure;

@@ -1,4 +1,4 @@
-import type { ApiKey, ApiKeyCodexAccess, ApiKeyCodexAccessMode } from '@/api'
+import type { ApiKey, ApiKeyCodexAccessMode, ApiKeyCodexAccessWrite } from '@/api'
 import type { ProviderRequestProfiles, ProviderRequestProfileUpdates } from '@/api/modules/settings/profiles'
 import { ZNotification } from '@codex-proxy/ui'
 import { cloneDeep } from 'es-toolkit'
@@ -46,7 +46,8 @@ export function useApiKeyEditor(options: {
       customKey: '',
       codexAccountId: key.codexAccess?.accountId ?? '',
       codexAccessEnabled: key.codexAccess?.enabled ?? false,
-      codexAccessMode: key.codexAccess?.mode ?? 'fixed',
+      // 没有绑定时取新绑定的初始值；已建立的绑定直接沿用服务端返回的模式
+      codexAccessMode: key.codexAccess ? key.codexAccess.mode : 'fixed',
       name: key.name,
       label: key.label ?? '',
       groupIds: key.groups.map(group => group.id),
@@ -92,7 +93,7 @@ export function useApiKeyEditor(options: {
         // 已有绑定只能切换启停，账号 ID 与模式始终沿用原值
         const boundAccountId = current?.codexAccess?.accountId ?? null
         const codexAccountId = boundAccountId ?? (form.value.codexAccessEnabled ? form.value.codexAccountId : '')
-        let codexAccess: ApiKeyCodexAccess | undefined
+        let codexAccess: ApiKeyCodexAccessWrite | undefined
         if (codexAccountId) {
           // 已有绑定的模式不可原地切换；省略 mode 即保留既有模式，不会退成 fixed
           codexAccess = current?.codexAccess

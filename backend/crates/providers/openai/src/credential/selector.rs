@@ -172,8 +172,22 @@ struct CredentialSelectionInput<'a> {
     attempt: &'a AttemptContext,
     session_affinity_key: Option<&'a ProviderSessionAffinityKey>,
     session_affinity_observation: Option<&'a CodexSessionAffinity>,
+    /// 模型请求的已托管会话允许在 owner 明确额度耗尽时迁移；辅助首绑不设置
+    session_owner_migration: bool,
     /// Codex Guardian 自动审批请求；仅在配置独立额度时使用审批容量池
     guardian: bool,
+}
+
+/// session_pool 已托管会话的待发布迁移
+///
+/// 选号只取得目标账号租约，不改写 PostgreSQL owner；notes 在新域重建并 CAS 发布
+/// 成功后，本次模型请求才允许发送到目标账号
+#[derive(Debug, Clone)]
+pub(crate) struct CodexSessionMigration {
+    /// 迁移前的持久 owner
+    pub(crate) from: ProviderAccountId,
+    /// 本次请求的逻辑会话键；模型与 notes 共用同一键
+    pub(crate) session_key: ProviderSessionAffinityKey,
 }
 
 #[derive(Clone)]
@@ -361,6 +375,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation: None,
+            session_owner_migration: false,
             guardian: false,
         };
         self.select_inner(
@@ -371,6 +386,7 @@ impl CodexCredentialSelector {
         .await
     }
 
+    /// 模型选号；`session_owner_migration` 由调用方按已托管来源与 notes 能力决定
     pub(crate) async fn select_with_cyber_policy(
         &self,
         request: &SelectCodexCredential<'_>,
@@ -378,6 +394,7 @@ impl CodexCredentialSelector {
         session_affinity_observation: Option<&CodexSessionAffinity>,
         requires_websocket: bool,
         guardian: bool,
+        session_owner_migration: bool,
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let input = CredentialSelectionInput {
             requires_websocket,
@@ -386,6 +403,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation,
+            session_owner_migration,
             guardian,
         };
         self.select_inner(
@@ -445,6 +463,57 @@ impl CodexCredentialSelector {
         Ok(())
     }
 
+    /// 待发布迁移的租约在发送前复验会话策略
+    ///
+    /// 软亲和与持久 owner 都还没有改绑，此时只能拒绝被会话策略排除的目标账号；
+    /// 亲和改绑必须等 notes 发布成功之后
+    pub(crate) async fn validate_migrated_selection(
+        &self,
+        lease: &mut CodexCredentialLease,
+        cyber_policy_session_key: Option<&ProviderSessionAffinityKey>,
+    ) -> Result<(), CredentialSelectionError> {
+        let cyber_policy_scope = self
+            .prepare_cyber_policy_scope(cyber_policy_session_key)
+            .await;
+        if cyber_policy_scope
+            .as_ref()
+            .and_then(|scope| scope.state.as_ref())
+            .is_some_and(|state| state.excluded_accounts().contains(lease.account.id()))
+        {
+            return Err(CredentialSelectionError::SessionPolicyRestricted);
+        }
+        lease.cyber_policy_scope = cyber_policy_scope;
+        Ok(())
+    }
+
+    /// 迁移发布成功后把可丢失软亲和改绑到新 owner
+    ///
+    /// PostgreSQL owner 已经是权威，软亲和失败不影响本次发送；下次选号会按当前 owner 重塑
+    pub(crate) async fn admit_migrated_session(
+        &self,
+        key: &ProviderSessionAffinityKey,
+        account: &ProviderAccountId,
+        session_ttl: Duration,
+    ) -> Result<(), CredentialSelectionError> {
+        let current = self.lookup_session_affinity(key).await?;
+        if current
+            .as_ref()
+            .is_some_and(|binding| binding.account_id() == account)
+        {
+            return Ok(());
+        }
+        if !self
+            .admit_session(key, current.as_ref(), account, session_ttl)
+            .await?
+        {
+            tracing::warn!(
+                account_id = %account,
+                "OpenAI session soft affinity moved concurrently after owner migration"
+            );
+        }
+        Ok(())
+    }
+
     /// 为不属于 Responses 文本模型目录的 Provider 原生端点选择账号
     ///
     /// 账号范围、健康度、配额、并发租约、cookie 与认证准备仍走同一套选择链路；
@@ -461,6 +530,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity.map(CodexSessionAffinity::key),
             session_affinity_observation: request.session_affinity,
+            session_owner_migration: false,
             guardian: false,
         };
         self.select_inner(&input, None, request.model).await
@@ -599,17 +669,18 @@ impl CodexCredentialSelector {
                 CredentialSelectionError::ContinuationOwnerChanged,
             )));
         }
-        let mut pinned_account = required_account.or_else(|| continuation_account.clone());
-        if let Some(owner) = session_owner.as_ref() {
+        let explicit_pin = required_account.or_else(|| continuation_account.clone());
+        if let Some(owner) = session_owner.as_ref()
+            && explicit_pin.as_ref().is_some_and(|pinned| pinned != owner)
+        {
             // 显式固定或续写 owner 与持久归属不一致时直接失败，不做迁移
-            if pinned_account
-                .as_ref()
-                .is_some_and(|pinned| pinned != owner)
-            {
-                return Err(CredentialSelectionError::ContinuationOwnerChanged);
-            }
-            pinned_account = Some(owner.clone());
+            return Err(CredentialSelectionError::ContinuationOwnerChanged);
         }
+        // 只有持久归属、没有显式固定或续写的 owner 才可能迁移；显式约束保持永久归属
+        let mut owner_pin = match &explicit_pin {
+            Some(_) => None,
+            None => session_owner.clone(),
+        };
         let mut snapshot_retries = 0;
         'capacity: loop {
             let binding = if let Some(key) = binding_key {
@@ -652,7 +723,9 @@ impl CodexCredentialSelector {
                                 .attempt
                                 .account_scope()
                                 .is_some_and(|scope| scope.allows(account.id())))
-                        && (!request.requires_oauth
+                        // session_pool 只能把会话交给能生成 ChatGPT 身份的 OAuth 账号，
+                        // API Key 账号选中后无法认领归属，在共享候选过滤处就排除
+                        && (!(request.requires_oauth || request.attempt.codex_session_pool())
                             || account.authentication_kind() == CODEX_AUTHENTICATION_KIND_OAUTH)
                         && model.allows_account(account)
                         && (diagnostic || {
@@ -670,7 +743,7 @@ impl CodexCredentialSelector {
             let mut eligible = Vec::with_capacity(accounts.len());
             for account in accounts {
                 if request.requires_websocket
-                    && pinned_account.as_ref().is_none_or(|id| id == account.id())
+                    && explicit_pin.as_ref().is_none_or(|id| id == account.id())
                 {
                     let runtime = match self.repository.reload_selected_credential(&account).await {
                         Ok((_, runtime)) => runtime,
@@ -684,7 +757,7 @@ impl CodexCredentialSelector {
                         }
                         // 非固定账号的损坏凭据不能阻断其余账号的传输资格检查
                         Err(CredentialRepositoryError::InvalidCredentialData(_))
-                            if pinned_account.is_none() =>
+                            if explicit_pin.is_none() =>
                         {
                             continue;
                         }
@@ -772,8 +845,43 @@ impl CodexCredentialSelector {
             {
                 excluded.extend(state.excluded_accounts().iter().cloned());
             }
+            // 持久 owner 只有在本会话已托管、且它被明确判定额度耗尽时才解除永久钉选；
+            // 并发忙、临时限流、认证失效与任意 excluded 仍保持原 owner 失败语义
+            let owner_quota_exhausted = owner_pin.as_ref().is_some_and(|owner| {
+                request.session_owner_migration
+                    && !follow_only
+                    && request.attempt.continuation_attempt() == ContinuationAttempt::None
+                    && candidates
+                        .iter()
+                        .find(|candidate| candidate.account.id() == owner)
+                        .is_some_and(|candidate| {
+                            candidate
+                                .account
+                                .status_projection(SystemTime::now(), candidate.signals.cooldown)
+                                .status
+                                == AccountStatus::QuotaExhausted
+                        })
+            });
+            let migration = if owner_quota_exhausted {
+                // 选号阶段只取得候选租约，不改写 PostgreSQL owner；发布由 Provider 完成
+                excluded.extend(owner_pin.clone());
+                owner_pin
+                    .as_ref()
+                    .zip(binding_key)
+                    .map(|(from, key)| CodexSessionMigration {
+                        from: from.clone(),
+                        session_key: key.clone(),
+                    })
+            } else {
+                None
+            };
+            let pinned_account = if migration.is_some() {
+                explicit_pin.as_ref()
+            } else {
+                explicit_pin.as_ref().or(owner_pin.as_ref())
+            };
             // 原生续写归属和显式固定账号优先于会话偏好，不能把增量状态发送给其他账号
-            if let Some(required) = pinned_account.as_ref() {
+            if let Some(required) = pinned_account {
                 excluded.extend(
                     candidates
                         .iter()
@@ -793,7 +901,7 @@ impl CodexCredentialSelector {
 
             loop {
                 let preferred = pinned_account
-                    .clone()
+                    .cloned()
                     .or_else(|| affinity.preferred_account().cloned());
                 let mut context = AccountSelectionContext {
                     policy,
@@ -959,9 +1067,7 @@ impl CodexCredentialSelector {
                         .and_then(|scope| scope.state.as_ref())
                         .is_some_and(|state| {
                             let mut effective = candidates.iter().filter(|candidate| {
-                                pinned_account
-                                    .as_ref()
-                                    .is_none_or(|id| candidate.account.id() == id)
+                                pinned_account.is_none_or(|id| candidate.account.id() == id)
                             });
                             effective.next().is_some_and(|first| {
                                 state.excluded_accounts().contains(first.account.id())
@@ -1029,7 +1135,9 @@ impl CodexCredentialSelector {
                         busy_accounts.insert(account.id().clone());
                     }
                     ProviderLeaseAcquisition::Acquired(guard) => {
-                        if let Some(key) = binding_key
+                        // 待发布迁移先不改写软亲和与持久 owner：发布失败时两者仍指向旧账号
+                        if migration.is_none()
+                            && let Some(key) = binding_key
                             && !self
                                 .admit_session(
                                     key,
@@ -1051,7 +1159,9 @@ impl CodexCredentialSelector {
                         }
                         // session_pool：首次请求在取得租约、首次上游发送前原子认领；
                         // 已有归属只复验，不在每次请求重写归属
-                        if let Some(key) = owner_key
+                        // 已托管迁移必须先完成 notes 发布，不能在这里提前改写归属
+                        if migration.is_none()
+                            && let Some(key) = owner_key
                             && session_owner.as_ref() != Some(account.id())
                         {
                             let claim = CodexSessionClaim {
@@ -1066,7 +1176,7 @@ impl CodexCredentialSelector {
                                     // 并发首请求已有赢家：释放临时租约并按该 owner 重新选号
                                     drop(guard);
                                     session_owner = Some(owner.clone());
-                                    pinned_account = Some(owner);
+                                    owner_pin = Some(owner);
                                     continue 'capacity;
                                 }
                                 CodexSessionClaimOutcome::IdentityChanged => {
@@ -1132,6 +1242,9 @@ impl CodexCredentialSelector {
                                 serde_json::json!({"waitMs": waiting.elapsed().as_millis() as u64}),
                             );
                         }
+                        // owner 被排除后不会选中自己；只有真正换号才是待发布迁移
+                        let migration =
+                            migration.filter(|migration| migration.from != *account.id());
                         return Ok(CodexCredentialLease {
                             installation_id: runtime.installation_id,
                             transport: runtime.transport,
@@ -1141,7 +1254,12 @@ impl CodexCredentialSelector {
                             cyber_policy_scope,
                             allows_account_state_mutation,
                             affinity_telemetry,
-                            admitted_session: binding_key.cloned(),
+                            admitted_session: if migration.is_some() {
+                                None
+                            } else {
+                                binding_key.cloned()
+                            },
+                            session_migration: migration,
                             capacity: capacity.map(AccountCapacitySnapshot::with_acquired_request),
                             _guard: guard,
                         });
@@ -1537,13 +1655,15 @@ impl CodexCredentialSelector {
     }
 
     /// 原生辅助请求只核对指定账号的授权与凭据，不消费模型额度或参与换号
+    ///
+    /// 固定账号辅助与已授权模型 attempt 共用同一份账号范围校验，不各自复制规则
     pub(crate) async fn native_credential(
         &self,
-        context: &gateway_core::engine::codex::CodexAuthorizedContext,
+        scope: &FrozenAccountScope,
         account_id: &ProviderAccountId,
     ) -> Result<(ProviderAccount, super::security::CodexRuntimeCredential), CredentialSelectionError>
     {
-        if !context.account_scope().allows(account_id) {
+        if !scope.allows(account_id) {
             return Err(CredentialSelectionError::NoEligibleCredential);
         }
         let loaded = self
@@ -1795,6 +1915,8 @@ pub struct CodexCredentialLease {
     affinity_telemetry: AffinityTelemetry,
     // 已准入请求允许完成；只有中间件改变会话身份时才需要再次认领
     admitted_session: Option<ProviderSessionAffinityKey>,
+    /// 已托管会话的待发布迁移；发布前不得发送到目标账号
+    session_migration: Option<CodexSessionMigration>,
     capacity: Option<AccountCapacitySnapshot>,
     _guard: Box<dyn ProviderLeaseGuard>,
 }
@@ -1823,6 +1945,14 @@ impl CodexCredentialLease {
     #[must_use]
     pub(crate) fn admitted_session(&self) -> Option<&ProviderSessionAffinityKey> {
         self.admitted_session.as_ref()
+    }
+
+    /// 本次租约是否是已托管会话的待发布迁移
+    ///
+    /// 有值时必须先在目标账号重建 notes 并发布，才能发送模型请求
+    #[must_use]
+    pub(crate) fn session_migration(&self) -> Option<&CodexSessionMigration> {
+        self.session_migration.as_ref()
     }
 
     #[must_use]
@@ -1882,7 +2012,8 @@ impl fmt::Debug for CodexCredentialLease {
     }
 }
 
-fn retry_account_snapshot(
+/// 凭据快照冲突的有界重试；预算内返回 `Ok` 让调用方重新取快照，耗尽后如实失败
+pub(crate) fn retry_account_snapshot(
     attempt: &AttemptContext,
     account: &ProviderAccount,
     retries: &mut u32,

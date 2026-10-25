@@ -71,6 +71,7 @@ pub use selector::{
 };
 pub(crate) use selector::{
     CodexCyberPolicyScope, CodexSelectionModel, SelectCodexProviderEndpointCredential,
+    retry_account_snapshot,
 };
 pub use types::{
     CODEX_AUTHENTICATION_KIND_OAUTH, CodexAccountProfile, CodexCookie, CodexCookieCaptureOutcome,

@@ -14,12 +14,15 @@ pub mod codex;
 /// OpenAI/Codex 事件语义、用量与限流字段编解码
 pub mod events;
 mod headers;
+/// 官方 history 四工具参数、输出预算与结果编码、条目投影
+pub mod history;
 /// Server-Sent Events 帧的解析与编码
 pub mod sse;
 
 pub use codex::{
-    CodexResponsesRequestSemantics, CodexSessionIdentity, CodexSessionSources,
-    codex_account_session_id, codex_account_thread_id, codex_client_metadata_session_id,
+    CodexHistoryInitialization, CodexNativeStateMetadata, CodexResponsesRequestSemantics,
+    CodexSessionIdentity, CodexSessionSources, codex_account_session_id, codex_account_thread_id,
+    codex_client_metadata_session_id, codex_native_state_metadata,
     codex_responses_request_semantics, codex_responses_request_semantics_with_turn_metadata,
     codex_session_id, codex_session_identity, codex_thread_id, codex_turn_id,
     codex_turn_metadata_session_id, turn_metadata_session_id, turn_metadata_thread_id,
@@ -27,4 +30,16 @@ pub use codex::{
 };
 pub use headers::{
     is_transport_managed_request_header, parse_retry_after_seconds, response_header_is_forwardable,
+};
+pub use history::{
+    CodexHistoryAttachments, CodexHistoryImageAttachment, CodexHistoryItemEntry,
+    CodexHistoryItemListResult, CodexHistoryItemNotFoundResult, CodexHistoryItemProjection,
+    CodexHistoryListItemsArguments, CodexHistoryListWindowsArguments,
+    CodexHistoryReadItemArguments, CodexHistoryReadItemResult, CodexHistorySearchContentsArguments,
+    CodexHistoryTool, CodexHistoryToolArguments, CodexHistoryToolRequest, CodexHistoryWindowEntry,
+    CodexHistoryWindowListResult, CodexHistoryWireError, CodexToolOutputTruncationPolicy,
+    HISTORY_TOOL_NAMESPACE, OPAQUE_ITEM_NOTE, TOOL_OUTPUT_TRUNCATION_POLICY_HEADER,
+    codex_history_declared_item_id, codex_history_item_attachments, codex_history_item_projection,
+    codex_history_item_semantics, parse_codex_history_tool_request,
+    project_local_history_search_query,
 };

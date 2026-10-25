@@ -28,7 +28,7 @@ use gateway_core::{
         middleware::{MiddlewareHeader, MiddlewareResponse},
         provider::{Provider, ProviderRegistry},
     },
-    error::StoreError,
+    error::{GatewayErrorKind, StoreError},
     policy::{
         ClientApiKeyId, ClientPolicy, CodexAccessBinding, CodexAccessMode, PlaintextClientApiKey,
         RateLimits,
@@ -56,7 +56,9 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use crate::support::{MemoryAccountStore, MemoryCodexSessions, profile, secret};
+use crate::support::{
+    MemoryAccountStore, MemoryCodexSessions, TestLeaseCoordinator, profile, secret,
+};
 
 const ACCOUNT: &str = "acct_native_bound";
 
@@ -137,11 +139,11 @@ pub(crate) async fn prepare(service: &DefaultExecutionService) -> PreparedRootEx
     service.prepare_execution(client).await.unwrap()
 }
 
-async fn seed(store: &Arc<MemoryAccountStore>, id: &str, enabled: bool, fedramp: bool) {
+pub(crate) async fn seed(store: &Arc<MemoryAccountStore>, id: &str, enabled: bool, fedramp: bool) {
     seed_workspace(store, id, enabled, fedramp, "workspace_native").await;
 }
 
-async fn seed_workspace(
+pub(super) async fn seed_workspace(
     store: &Arc<MemoryAccountStore>,
     id: &str,
     enabled: bool,
@@ -921,4 +923,203 @@ async fn pool_auxiliary_without_session_identity_fails_before_send() {
     );
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(sessions.claims().is_empty());
+}
+
+#[tokio::test]
+async fn pool_auxiliary_identity_change_reselects_and_sends_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/read_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"notes".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions_and_leases(
+        &store,
+        sessions.clone(),
+        leases.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    let (service, _) = native_service_with_mode(provider.clone(), CodexAccessMode::SessionPool);
+    sessions.identity_changed_once();
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::NotesReadFile),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leases.live_leases(), 1, "认领成功的租约随正文持有");
+    let (status, _, body) = read_response(response).await;
+    assert_eq!((status, body.as_slice()), (200, b"notes".as_slice()));
+    assert_eq!(leases.live_leases(), 0, "正文结束后租约随之释放");
+    // 首次认领遇到凭据版本变化后在预算内重跑整套首绑，上游只收到一次
+    let claims = sessions.claims();
+    assert_eq!(claims.len(), 2);
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim.account_id.as_str() == ACCOUNT)
+    );
+    assert_eq!(
+        sessions.owner_of(
+            &ClientApiKeyId::new("key_native_test").unwrap(),
+            &auxiliary_session_key(&provider, "session-native"),
+        ),
+        Some(ProviderAccountId::new(ACCOUNT).unwrap())
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pool_auxiliary_snapshot_conflict_exhausts_budget_without_send() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions_and_leases(
+        &store,
+        sessions.clone(),
+        leases.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    sessions.identity_changed();
+    let error = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::NotesReadFile),
+        )
+        .await
+        .expect_err("持续的凭据版本变化必须在预算耗尽后失败");
+    assert_eq!(
+        error.kind(),
+        GatewayErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_eq!(
+        error
+            .diagnostic()
+            .expect("account selection diagnostic")
+            .code(),
+        Some("account_snapshot_conflict")
+    );
+    assert_eq!(sessions.claims().len(), 4, "首次认领加三次快照重试");
+    assert_eq!(leases.live_leases(), 0, "重试之间不遗留临时租约");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pool_auxiliary_follows_competing_owner_without_model_gate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/read_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"notes".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    seed_workspace(
+        &store,
+        "acct_native_other",
+        true,
+        false,
+        "workspace_native_other",
+    )
+    .await;
+    // 赢家额度耗尽且并发占满：它不会被模型选号选中，辅助请求仍按账号资格跟随归属
+    let winner = store.account("acct_native_other").unwrap();
+    store
+        .apply_quota_access(QuotaAccessChange {
+            account_id: winner.id().clone(),
+            expected_revision: winner.revision(),
+            state: QuotaState::exhausted(QuotaEvidence::UsageLimitReached, SystemTime::now(), None),
+        })
+        .await
+        .unwrap();
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    leases
+        .busy_accounts
+        .lock()
+        .unwrap()
+        .insert(winner.id().clone());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions_and_leases(
+        &store,
+        sessions.clone(),
+        leases.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    let (service, _) = native_service_with_mode(provider.clone(), CodexAccessMode::SessionPool);
+    sessions.conflict_with(winner.id().clone());
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::NotesReadFile),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = read_response(response).await;
+    assert_eq!((status, body.as_slice()), (200, b"notes".as_slice()));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "竞争得到的归属只发送一次");
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"],
+        "workspace_native_other"
+    );
+    // 只尝试过临时账号的一次认领，赢家账号不再认领，也不再申请它的账号租约
+    let claims = sessions.claims();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].account_id.as_str(), ACCOUNT);
+    assert_eq!(
+        leases
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.account_id().as_str())
+            .collect::<Vec<_>>(),
+        [ACCOUNT]
+    );
+    assert_eq!(leases.live_leases(), 0, "临时租约在发送前已释放");
+    assert_eq!(
+        sessions.owner_of(
+            &ClientApiKeyId::new("key_native_test").unwrap(),
+            &auxiliary_session_key(&provider, "session-native"),
+        ),
+        Some(winner.id().clone())
+    );
+}
+
+#[tokio::test]
+async fn pool_auxiliary_claim_unavailable_fails_before_send() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = super::contract::provider_with_base_url_and_codex_sessions_and_leases(
+        &store,
+        sessions.clone(),
+        leases.clone(),
+        format!("{}/backend-api", server.uri()),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    sessions.unavailable_once();
+    let error = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            request(CodexAuxiliaryOperation::NotesReadFile),
+        )
+        .await
+        .expect_err("认领发现账号不可用时必须在发送前失败");
+    assert_eq!(error.kind(), GatewayErrorKind::NoAvailableProvider);
+    assert_eq!(sessions.claims().len(), 1);
+    assert_eq!(leases.live_leases(), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

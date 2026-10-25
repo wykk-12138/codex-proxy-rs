@@ -2,6 +2,9 @@
 
 use serde_json::{Map, Value};
 
+/// 官方窗口 ID 在 `client_metadata` 中的投影键
+const X_CODEX_WINDOW_ID_KEY: &str = "x-codex-window-id";
+
 const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
 const PROACTIVE_MULTI_AGENT_MODE_PREFIX: &str = "Proactive multi-agent delegation is active.";
@@ -78,7 +81,8 @@ pub struct CodexSessionSources<'a> {
 /// 只在 session_pool 使用：区分逻辑会话声明与传输/缓存键
 ///
 /// 逻辑声明固定为请求头 turn metadata、正文与请求上下文的 turn metadata、
-/// 官方 `client_metadata.session_id` 与端点级会话字段；`session-id` 请求头和正文
+/// 官方 `client_metadata.session_id` 与端点级会话字段；正文与上下文各自独立收集，
+/// 正文内的字段回退不能吞掉上下文声明；`session-id` 请求头和正文
 /// `session_id` 可能只是缓存路由键，因此只在没有逻辑声明时兜底，与逻辑声明的差异
 /// 不视为冲突。fixed 与普通 `/v1` 不读取该判定
 #[must_use]
@@ -90,7 +94,11 @@ pub fn codex_session_identity(sources: CodexSessionSources<'_>) -> CodexSessionI
     );
     push_distinct(
         &mut logical,
-        codex_turn_metadata_session_id(sources.body, sources.context),
+        request_turn_metadata(sources.body).and_then(turn_metadata_session_id),
+    );
+    push_distinct(
+        &mut logical,
+        non_empty_string(sources.context.get("turn_metadata")).and_then(turn_metadata_session_id),
     );
     push_distinct(&mut logical, codex_client_metadata_session_id(sources.body));
     push_distinct(&mut logical, sources.endpoint_session.map(str::to_owned));
@@ -259,6 +267,119 @@ pub fn codex_responses_request_semantics_with_turn_metadata(
         reasoning_preset,
         compact,
     }
+}
+
+/// 官方 turn metadata 声明的 history 初始化来源
+///
+/// 只描述重建路径，不是工具 metadata 已完整采集的证明
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHistoryInitialization {
+    New,
+    Cleared,
+    ColdResume,
+    WarmFork,
+    ColdFork,
+    SuppliedHistory,
+}
+
+impl CodexHistoryInitialization {
+    /// 按官方 wire 值解析；未知取值不猜测
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "new" => Some(Self::New),
+            "cleared" => Some(Self::Cleared),
+            "cold_resume" => Some(Self::ColdResume),
+            "warm_fork" => Some(Self::WarmFork),
+            "cold_fork" => Some(Self::ColdFork),
+            "supplied_history" => Some(Self::SuppliedHistory),
+            _ => None,
+        }
+    }
+}
+
+/// 模型请求携带的原生 history/notes 状态事实
+///
+/// 会话身份复用 [`codex_session_identity`] 的冲突规则；其余字段只取官方
+/// turn metadata 与 `client_metadata` 投影，不扫描请求正文猜测
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexNativeStateMetadata {
+    /// 逻辑会话声明；缺失或冲突由调用方显式处理
+    pub session: CodexSessionIdentity,
+    /// 逻辑线程身份，与窗口 ID 内嵌线程一致
+    pub thread_id: Option<String>,
+    /// 官方 metadata 声明的 agent；缺省时由采集方按 root 解释
+    pub agent_name: Option<String>,
+    /// 官方窗口 ID，形状 `<thread_id>:<window_number>`
+    pub window_id: Option<String>,
+    /// 官方独立的 context window UUID，已规范化为小写连字符文本
+    pub context_window_id: Option<String>,
+    /// history 初始化来源
+    pub history_initialization: Option<CodexHistoryInitialization>,
+    /// 请求类型，如 turn、prewarm、compaction、memory
+    pub request_kind: Option<String>,
+    /// 客户端声明的父响应原值，不解释也不改写
+    pub previous_response_id: Option<String>,
+}
+
+/// 解析一次模型请求的原生状态事实
+///
+/// turn metadata 与逻辑会话收集同序：帧头投影、正文、请求上下文，取第一个可解析的对象
+/// 窗口 ID 缺少 turn metadata 时回退到官方 `client_metadata` 与请求头投影
+#[must_use]
+pub fn codex_native_state_metadata(sources: CodexSessionSources<'_>) -> CodexNativeStateMetadata {
+    let turn_metadata = state_turn_metadata(sources);
+    let turn_field = |name: &str| {
+        turn_metadata
+            .as_ref()
+            .and_then(|metadata| non_empty_string(metadata.get(name)))
+            .map(ToOwned::to_owned)
+    };
+    let window_id = turn_field("window_id")
+        .or_else(|| {
+            client_metadata_string(sources.body, X_CODEX_WINDOW_ID_KEY).map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            non_empty_string(sources.context.get("codex_window_id")).map(ToOwned::to_owned)
+        });
+    let context_window_id = turn_field("context_window_id")
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+        .map(|value| value.hyphenated().to_string());
+    let history_initialization = turn_field("history_initialization")
+        .as_deref()
+        .and_then(CodexHistoryInitialization::from_wire);
+
+    CodexNativeStateMetadata {
+        session: codex_session_identity(sources),
+        thread_id: turn_field("thread_id")
+            .or_else(|| codex_account_thread_id(sources.body, sources.context)),
+        agent_name: turn_field("agent_name"),
+        window_id,
+        context_window_id,
+        history_initialization,
+        request_kind: turn_field("request_kind"),
+        previous_response_id: raw_non_empty_string(sources.body.get("previous_response_id")),
+    }
+}
+
+fn raw_non_empty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// 第一个可解析的 turn metadata 对象；官方三个承载位置是同一快照的投影
+fn state_turn_metadata(sources: CodexSessionSources<'_>) -> Option<Value> {
+    [
+        sources.turn_metadata,
+        request_turn_metadata(sources.body),
+        non_empty_string(sources.context.get("turn_metadata")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|metadata| serde_json::from_str::<Value>(metadata).ok())
+    .find(Value::is_object)
 }
 
 fn request_turn_metadata(body: &Map<String, Value>) -> Option<&str> {

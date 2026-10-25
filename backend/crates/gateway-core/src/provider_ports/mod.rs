@@ -15,6 +15,15 @@ pub use affinity::{
 };
 mod session_owner;
 pub use session_owner::{CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort};
+mod codex_state;
+pub use codex_state::{
+    CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
+    CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem, CodexHistoryStoredWindow,
+    CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion, CodexNotesGeneration,
+    CodexNotesOperation, CodexNotesOperationKind, CodexNotesOperationStatus, CodexNotesPublish,
+    CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica, CodexSessionContentPort,
+    CodexSessionOrigin, CodexSessionState, CodexSessionStatePort, NewCodexNotesOperation,
+};
 mod catalog;
 pub use catalog::{
     ProviderArtifactProfile, ProviderArtifactProfileCachePort, ProviderCatalogCacheKey,

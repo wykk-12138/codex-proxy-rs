@@ -7,6 +7,7 @@ mod backup;
 mod client_budgets;
 mod client_keys;
 mod codex_sessions;
+mod codex_state;
 mod connection;
 mod control_plane;
 mod execution;
@@ -31,6 +32,7 @@ pub use backup::*;
 pub use client_budgets::PgClientBudgetStore;
 pub use client_keys::*;
 pub use codex_sessions::PgCodexSessionOwnership;
+pub use codex_state::PgCodexSessionState;
 pub use connection::connect_and_migrate;
 pub(crate) use connection::connect_read_only;
 pub use control_plane::{

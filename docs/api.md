@@ -623,9 +623,10 @@ call 与账号的绑定保存在网关进程内，未连接时一小时过期；
 `codexAccess.mode` 决定执行账号的来源：
 
 - `fixed`：全部原生请求使用入口账号，范围进一步收窄到该账号
-- `session_pool`：Key 的有效授权池就是请求范围，每个逻辑会话在第一次上游发送前从池中认领一个账号。
+- `session_pool`：Key 的有效授权池就是请求范围，池内只用 OpenAI OAuth 账号，每个逻辑会话在第一次上游发送前从池中认领一个账号。
   归属按 `(Client Key, 逻辑会话)` 持久保存，之后该会话的 Responses、SSE、WebSocket 后续轮次、搜索、history、notes、
-  `/compact` 与 `new_context` 都只使用这个账号。不同会话可以使用不同账号，同一会话不自动换号
+  `/compact` 与 `new_context` 都只使用这个账号。不同会话可以使用不同账号，同一会话在 owner 可用时保持粘性；
+  已托管会话的 owner 被确切判定额度耗尽时按下文迁移，`fixed` 与 legacy 会话不换号
 
 `session_pool` 的逻辑会话取自 `x-codex-turn-metadata` 请求头、正文与请求上下文中的 turn metadata、
 `client_metadata.session_id` 以及 Search 正文的 `id`；这些来源去重后必须唯一，多于一个值即冲突。
@@ -634,8 +635,9 @@ call 与账号的绑定保存在网关进程内，未连接时一小时过期；
 逻辑会话与兜底都缺失，或逻辑来源互相冲突时返回 `400 invalid_request`，不重试、不换号，也不退回入口账号；
 WebSocket 在 `response.create` 阶段按同一合同失败。`fixed` 与普通 `/v1` 不应用这条拒绝规则
 
-会话 owner 额度耗尽、凭据失效、被停用或移出 Key 范围时，该会话按真实原因失败并沿现有有界等待处理，不迁移到其他账号；
-其他新会话仍可按当前有效范围使用池内其他账号。归属读取失败时请求如实失败，不绕过存储发送。
+会话 owner 额度耗尽、凭据失效、被停用或移出 Key 范围时，只有下文规定的已托管会话会在额度耗尽时迁移，
+其余情况按真实原因失败并沿现有有界等待处理；其他新会话仍可按当前有效范围使用池内其他账号。
+归属读取失败时请求如实失败，不绕过存储发送。
 已知续接或状态 owner 却缺少持久归属时同样明确失败，不把该请求当作新会话重新认领
 
 whoami 与 accounts/check 由入口账号的真实 Provider 事实投影，只公布该账号，`session_pool` 也不展示池内其他账号。
@@ -649,15 +651,50 @@ Responses 与搜索沿用 `/v1` 的 Key 限额与并发准入。whoami、account
 Key RPM、并发与排队，不进入模型金额门禁或生成模型费用，取消或丢弃响应正文时释放准入。
 辅助请求与同一 Key 的模型流重叠时也受该并发限制，容量不足按现有配置拒绝或排队，不设独立辅助并发池
 
-history、notes 仍由官方保存，网关不建立本地副本，上游 `404` 与 `400` 原样交付；备注写入结果不明时不重放。
-`session_pool` 下 history、notes 与模型请求使用同一逻辑会话的 owner 账号；`usage`、`profiles/me`、`settings/user`、
+history 与 notes 的行为取决于会话是否由网关托管（配置见下文[原生会话状态存储](#原生会话状态存储)）：
+
+- 已托管会话：history 由网关采集并用本地 PostgreSQL 回答四个工具；notes 仍由上游执行，网关保存每个会话的原始加密
+  write/append 操作与 seq，owner 额度耗尽时先在新域按序重放并发布，之后才向新账号发送模型请求
+- legacy 会话（接入前已有云端状态、或来源无法证明从新建开始完整采集）与未开启托管时：history、notes 仍由官方保存，
+  网关不建立本地副本，上游 `404` 与 `400` 原样交付
+
+`session_pool` 下 history、notes 与模型请求使用同一逻辑会话的已发布 owner 账号；`usage`、`profiles/me`、`settings/user`、
 `workspace-messages`、`config/bundle` 等账号级只读信息仍使用入口账号。辅助操作的业务结果也可封装在
 `encrypted_output` 中，HTTP `200` 不代表文件存在或命中历史；客户端按官方工具合同消费结果，
-网关不将密文或业务错误改写为成功空对象
+网关不将密文或业务错误改写为成功空对象，也不解密或重造密文
 
-接口不提供归档历史或 notes 的导入、迁移，不能把客户端重放当前有效上下文等同于官方存储迁移。
-新建 Key、切到其他会话池账号或切换客户端接入都不会由网关搬移官方归档与 notes；
+已托管会话的 history 四端点由本地事实回答：`list_windows` 返回真实窗口 ID 与条目数，`list_items` 按窗口、role、tool
+过滤并给出稳定顺序，`read_item` 按窗口与条目 ID 精确读取字符范围，`search_contents` 对已保存的明文投影执行大小写敏感
+literal substring 匹配。纯密文对象（reasoning/compaction、加密工具参数与输出）保留原对象，`read_item` 返回
+`readable=false` 与附件而不伪造明文，也不参与检索匹配。托管会话的模型请求只在出站时去掉 `history` 检索参数的
+`encrypted` 声明，让模型产生网关可检索的明文词；工具名、描述与 notes 的加密声明都不改，客户端无需改动
+
+已托管会话的 notes 六端点路径与参数不变；写类在发送前分配会话内 seq 并保存原始请求体，读类只读已发布副本。
+重建后的副本以上游 `context.session_id` 承载网关生成的域代次，客户端会话 ID 与笔记路径含义不变。
+owner 额度耗尽后，网关在目标账号的新域按 seq 重放收到完整响应的写入并发布，发布成功才发送模型请求；
+重放或发布失败时本次请求如实失败，不回退到旧账号发送。结果不明或未终结的写入阻止迁移且不重发 append
+
+接口仍不导入接入前已存在于官方云端的归档或 notes，也不能把客户端重放当前有效上下文等同于官方存储迁移；
+托管会话自身的状态按上述规则保存在网关侧。
+新建 Key、切到其他会话池账号或切换客户端接入都不会由网关搬移官方归档；
 同一 OAuth 账号被多个 Key 绑定时共享官方账号空间，原生入口不提供 Key 级历史隔离
+
+#### 原生会话状态存储
+
+托管能力由部署配置 `openai.codex_state_storage_enabled` 控制，默认 `false`：
+
+```yaml
+openai:
+  codex_state_storage_enabled: true
+```
+
+- 关闭：新会话按 legacy 处理，不采集 history、不记录 notes、不参与迁移；已托管会话继续使用本地 history、
+  已发布 notes 域与换号能力，不会因为关闭开关倒退回官方域
+- 开启：新会话仍按官方 `new` 声明、首窗口与完整首请求判定为托管；接入前已有的会话不会被升级成托管
+- `fixed`、普通 `/v1` 与账号级只读接口不受该配置影响
+
+配置只在 Provider 启动时读取，修改后需要重启服务生效。行为与时序见
+[历史与笔记连续性架构](codex-native-state-continuity-plan.md)
 
 ## 4. 浏览器认证
 
