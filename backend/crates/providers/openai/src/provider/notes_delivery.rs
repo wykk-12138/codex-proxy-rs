@@ -231,6 +231,11 @@ impl CodexNotesDelivery {
             .take()
         else {
             // 接收端已被上一次运行取走：关闭 gate，工作不会进入无人读取的通道
+            // 这里不重建接收端、不重放已交接工作；managed notes 写要到进程重启才能恢复
+            tracing::error!(
+                "Codex notes delivery receiver is already gone; managed notes writes stay \
+                 closed until the gateway process restarts"
+            );
             self.close();
             context.cancellation().cancelled().await;
             return;
@@ -464,10 +469,16 @@ async fn deliver_prepared(
     Ok(buffered_response(status.as_u16(), headers, bytes))
 }
 
-/// `start` 失败后锁内读回：只有可证明仍是 `Unsent` 才能按未发送收尾
+/// `start` 失败后锁内读回：区分本 owner 尚未发送的开始事实与结果不明的历史记录
 ///
-/// `InFlight` 说明开始事实可能已经提交但响应丢失；`Unknown`、终态与读回失败都不能
-/// 用“本调用没有发送”推翻，保护性失败交给下一次请求与显式处理
+/// 该调用点上 seq 由本次 append 刚分配、会话互斥由本 owner 持有到交付结束、
+/// 且 `prepared.execute` 尚未调用，因此这里的 `Unsent` 与 `InFlight` 都证明字节
+/// 没有离开网关；按已有的 `Unsent`/`InFlight → Failed` 转换收尾，不新建状态
+/// 或恢复机制。这一证明只适用于本调用点：进程重启遗留的 `InFlight` 与已经
+/// 开始发送后的结果不明都不能据此改判
+///
+/// `Unknown`、终态与读回失败保持原状：前者可能来自真实发送或已提交的其它观察，
+/// 后者无法确认日志记录与本次意图一致；三者都不改写，读回失败时返回原 `start` 失败
 async fn settle_after_start_failure(
     service: &CodexNotesService,
     key_id: &ClientApiKeyId,
@@ -481,20 +492,26 @@ async fn settle_after_start_failure(
     )
     .await
     else {
+        // 读回本身失败：日志记录不可核对，保留原状并如实返回原 start 失败
         return error;
     };
-    if operations
+    let observed = operations
         .iter()
         .find(|operation| operation.seq == seq)
-        .is_none_or(|operation| operation.status != CodexNotesOperationStatus::Unsent)
-    {
-        return notes_state_conflict();
+        .map(|operation| operation.status);
+    if matches!(
+        observed,
+        Some(CodexNotesOperationStatus::Unsent | CodexNotesOperationStatus::InFlight)
+    ) {
+        settle_proven_unsent(service, key_id, session_key, seq).await;
+        return error;
     }
-    settle_proven_unsent(service, key_id, session_key, seq).await;
-    error
+    notes_state_conflict()
 }
 
 /// 已确认字节未离开网关时按 `Unsent`/`InFlight → Failed` 收尾
+///
+/// 只用于本 owner 能证明尚未发送的调用点；收尾失败只记日志，不宣称已终结
 async fn settle_proven_unsent(
     service: &CodexNotesService,
     key_id: &ClientApiKeyId,

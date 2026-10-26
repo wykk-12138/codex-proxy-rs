@@ -24,7 +24,7 @@ use gateway_core::{
         middleware::{MiddlewareHeader, MiddlewareResponse},
         provider::Provider as _,
     },
-    error::ProviderErrorKind,
+    error::{GatewayError, GatewayErrorKind, ProviderErrorKind},
     lifecycle::CancellationToken,
     operation::{GenerateRequest, Operation, ProtocolPayload, ProviderSessionState},
     policy::{ClientApiKeyId, CodexAccessMode},
@@ -120,6 +120,8 @@ struct MemoryNotesStore {
     /// 交付生命周期用例的确定性闸门与故障注入；常规用例保持未设置
     gates: Mutex<GateSet>,
     start_failure: Mutex<Option<StartFailure>>,
+    /// 读回日志本身失败：只模拟故障，不改变已保存的操作
+    read_back_fails: AtomicBool,
     complete_fails_after_commit: AtomicBool,
     completions: Arc<CompletionCounter>,
 }
@@ -174,11 +176,11 @@ impl CompletionCounter {
     }
 }
 
-/// `start` 的错误注入：区分“可能已提交但响应丢失”和“确定没有开始”
+/// `start` 的错误注入：区分“已写下的状态”和“确定没有开始”
 #[derive(Clone, Copy)]
 enum StartFailure {
-    /// 先把状态推进到 `InFlight` 再返回错误
-    Committed,
+    /// 先把状态推进到给定值再返回错误；`InFlight` 即开始事实已提交但调用方只看到错误
+    Observed(CodexNotesOperationStatus),
     /// 不改状态直接返回错误
     NotCommitted,
 }
@@ -243,6 +245,10 @@ impl MemoryNotesStore {
 
     fn fail_start(&self, failure: StartFailure) {
         *self.start_failure.lock().expect("start failure lock") = Some(failure);
+    }
+
+    fn fail_read_back(&self) {
+        self.read_back_fails.store(true, Ordering::SeqCst);
     }
 
     fn complete_fails_after_commit(&self) {
@@ -682,9 +688,9 @@ impl CodexSessionContentPort for MemoryNotesStore {
                 return Err(unavailable("start Codex notes operation"));
             };
             match failure {
-                // 开始事实已经提交，但调用方只看到错误：读回必须是 InFlight
-                Some(StartFailure::Committed) => {
-                    operation.status = CodexNotesOperationStatus::InFlight;
+                // 调用方只看到错误，日志停在给定状态
+                Some(StartFailure::Observed(observed)) => {
+                    operation.status = observed;
                     Err(unavailable("start Codex notes operation"))
                 }
                 Some(StartFailure::NotCommitted) => Err(unavailable("start Codex notes operation")),
@@ -728,7 +734,12 @@ impl CodexSessionContentPort for MemoryNotesStore {
         _key_id: &'a ClientApiKeyId,
         _session_key: &'a ProviderSessionAffinityKey,
     ) -> BoxFuture<'a, Result<Vec<CodexNotesOperation>, ProviderStoreError>> {
-        Box::pin(async move { Ok(self.operations()) })
+        Box::pin(async move {
+            if self.read_back_fails.load(Ordering::SeqCst) {
+                return Err(unavailable("load Codex notes operations"));
+            }
+            Ok(self.operations())
+        })
     }
 }
 
@@ -2604,7 +2615,7 @@ async fn unbuildable_request_fails_before_any_intent_or_upstream_write() {
 }
 
 #[tokio::test]
-async fn committed_start_without_a_response_is_never_overwritten() {
+async fn start_commit_without_a_response_settles_the_new_operation_as_failed() {
     let server = MockServer::start().await;
     let store = Arc::new(MemoryAccountStore::default());
     seed(&store, ACCOUNT, true, false).await;
@@ -2612,29 +2623,21 @@ async fn committed_start_without_a_response_is_never_overwritten() {
         CodexSessionOrigin::Managed,
         CodexNotesReplica::native(account()),
     ));
-    notes.fail_start(StartFailure::Committed);
-    let provider = provider_with_codex_sessions_and_native_notes(
-        &store,
-        Arc::new(MemoryCodexSessions::default()),
-        format!("{}/backend-api", server.uri()),
-        notes_service(&notes),
-    );
-    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
-    service
-        .codex_auxiliary(
-            prepare(&service).await,
-            notes_request(
-                CodexAuxiliaryOperation::NotesWriteFile,
-                &write_body("cipher"),
-            ),
-        )
-        .await
-        .expect_err("ambiguous start failure is returned");
-    // 读回是 InFlight：开始事实可能已提交，不能按“本调用没发送”改判
+    // 开始事实已经提交，但调用方只看到错误：读回是本 owner 刚写下的 InFlight
+    notes.fail_start(StartFailure::Observed(CodexNotesOperationStatus::InFlight));
+    let error = start_failed_write(&store, &server, &notes).await;
+    // seq 由本次 append 分配、会话互斥仍由本 owner 持有、发送尚未开始：
+    // 这条 InFlight 只可能是本次未发送的开始事实，按合法 InFlight → Failed 收尾
     assert_eq!(
         notes.status(1),
-        Some(CodexNotesOperationStatus::InFlight),
-        "an ambiguous start must keep the observed state"
+        Some(CodexNotesOperationStatus::Failed),
+        "a new unconfirmed start must be settled instead of blocking migration"
+    );
+    // 对外仍返回原 start 失败，而不是内部状态冲突
+    assert_eq!(error.kind(), GatewayErrorKind::UpstreamUnavailable);
+    assert_eq!(
+        error.diagnostic().and_then(|diagnostic| diagnostic.code()),
+        Some("store_unavailable")
     );
     assert!(
         server
@@ -2644,6 +2647,7 @@ async fn committed_start_without_a_response_is_never_overwritten() {
             .is_empty(),
         "an unconfirmed start must not send bytes"
     );
+    migrations_are_not_blocked(&notes);
 }
 
 #[tokio::test]
@@ -2656,23 +2660,7 @@ async fn unconfirmed_start_settles_only_the_proven_unsent_operation() {
         CodexNotesReplica::native(account()),
     ));
     notes.fail_start(StartFailure::NotCommitted);
-    let provider = provider_with_codex_sessions_and_native_notes(
-        &store,
-        Arc::new(MemoryCodexSessions::default()),
-        format!("{}/backend-api", server.uri()),
-        notes_service(&notes),
-    );
-    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
-    service
-        .codex_auxiliary(
-            prepare(&service).await,
-            notes_request(
-                CodexAuxiliaryOperation::NotesWriteFile,
-                &write_body("cipher"),
-            ),
-        )
-        .await
-        .expect_err("start failure is returned");
+    start_failed_write(&store, &server, &notes).await;
     // 读回仍是 Unsent：字节从未离开网关，按合法 Unsent → Failed 收尾
     assert_eq!(notes.status(1), Some(CodexNotesOperationStatus::Failed));
     assert!(
@@ -2684,6 +2672,117 @@ async fn unconfirmed_start_settles_only_the_proven_unsent_operation() {
     );
     // 终态已经终结；未终结日志不会再阻止发布
     migrations_are_not_blocked(&notes);
+}
+
+#[tokio::test]
+async fn start_failure_without_proof_of_unsent_keeps_the_observed_state() {
+    // 读回是结果不明或已写入的终态：本调用没有发送不足以推翻这些事实
+    for observed in [
+        CodexNotesOperationStatus::Unknown,
+        CodexNotesOperationStatus::Responded,
+    ] {
+        let server = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        seed(&store, ACCOUNT, true, false).await;
+        let notes = MemoryNotesStore::with_state(state(
+            CodexSessionOrigin::Managed,
+            CodexNotesReplica::native(account()),
+        ));
+        notes.fail_start(StartFailure::Observed(observed));
+        let error = start_failed_write(&store, &server, &notes).await;
+        assert_eq!(
+            notes.status(1),
+            Some(observed),
+            "{observed:?} must not be rewritten"
+        );
+        assert_eq!(error.kind(), GatewayErrorKind::UpstreamUnavailable);
+        assert_eq!(
+            error.diagnostic().and_then(|diagnostic| diagnostic.code()),
+            Some("state_conflict"),
+            "{observed:?} must be reported as a protective conflict"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("received requests")
+                .is_empty()
+        );
+        if observed == CodexNotesOperationStatus::Unknown {
+            // 结果不明仍占住 seq：本 owner 的发送证明不适用于它
+            assert!(
+                notes
+                    .operations()
+                    .iter()
+                    .any(|operation| !operation.status.is_terminal()),
+                "an unknown write must keep blocking migration"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unreadable_log_after_start_failure_keeps_the_recorded_state() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    notes.fail_start(StartFailure::Observed(CodexNotesOperationStatus::InFlight));
+    // 读回本身失败：不能改判，也不能宣称已经终结
+    notes.fail_read_back();
+    let error = start_failed_write(&store, &server, &notes).await;
+    assert_eq!(
+        notes.status(1),
+        Some(CodexNotesOperationStatus::InFlight),
+        "an unreadable log must keep the recorded state"
+    );
+    assert_eq!(error.kind(), GatewayErrorKind::UpstreamUnavailable);
+    assert_eq!(
+        error.diagnostic().and_then(|diagnostic| diagnostic.code()),
+        Some("store_unavailable")
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty()
+    );
+    assert!(
+        notes
+            .operations()
+            .iter()
+            .any(|operation| !operation.status.is_terminal()),
+        "an unreadable log must keep blocking migration"
+    );
+}
+
+/// 执行一次在 `start` 阶段失败的真实 managed 写，返回网关交给客户端的错误
+async fn start_failed_write(
+    store: &Arc<MemoryAccountStore>,
+    server: &MockServer,
+    notes: &Arc<MemoryNotesStore>,
+) -> GatewayError {
+    let provider = provider_with_codex_sessions_and_native_notes(
+        store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("start failure is returned")
 }
 
 /// 收尾后的日志没有未终结操作
@@ -3331,6 +3430,96 @@ async fn closing_the_delivery_gate_refuses_new_writes_without_intent() {
         1,
         "a closed delivery must not record a new intent"
     );
+}
+
+#[tokio::test]
+async fn delivery_keeps_managed_writes_closed_after_the_daemon_restarts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::new(TestLeaseCoordinator::default()),
+        notes_service(&notes),
+    );
+    let task = Arc::new(task.expect("delivery task"));
+    let first = spawn_delivery_run(Arc::clone(&task), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 正对照：第一次运行未终止时同一会话的写正常交付
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("before-restart"),
+            ),
+        )
+        .await
+        .expect("write before the hard kill");
+    assert_eq!(notes.operations().len(), 1);
+    // 硬终止第一次运行：接收端随运行丢弃，门禁没有被正常关闭
+    first.abort();
+    let _ = first.await;
+    // Host 在同一进程内重新拉起 daemon：接收端已经不存在，只关闭门禁，不重建也不重放
+    let cancellation = CancellationToken::new();
+    let restart = spawn_delivery_run(Arc::clone(&task), cancellation.clone());
+    tokio::task::yield_now().await;
+    let error = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("a delivery without its receiver refuses the write");
+    // 关闭的交付在准备或交接阶段如实拒绝：不写意图、不发送，需重启网关才能恢复
+    assert_eq!(error.kind(), GatewayErrorKind::UpstreamUnavailable);
+    assert_eq!(
+        error.diagnostic().and_then(|diagnostic| diagnostic.code()),
+        Some("delivery_closed")
+    );
+    assert_eq!(
+        notes.operations().len(),
+        1,
+        "a closed delivery must not record a new intent"
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        1,
+        "a closed delivery must not send"
+    );
+    cancellation.cancel();
+    restart
+        .await
+        .expect("restarted delivery run exits on cancel");
+}
+
+/// 用同一任务再登记一次运行：模拟 Host 在同一进程内重新拉起 daemon
+fn spawn_delivery_run(
+    task: Arc<provider_openai::CodexNotesDeliveryTask>,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let context = gateway_core::task::WorkerDaemonContext::new(cancellation);
+        let _ = gateway_core::task::DaemonTask::run(&*task, context).await;
+    })
 }
 
 #[tokio::test]
