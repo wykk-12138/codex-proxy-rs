@@ -12,13 +12,14 @@ use gateway_core::engine::codex::CodexAuxiliaryOperation;
 use gateway_core::engine::codex_history::CodexHistoryService;
 use gateway_core::engine::execution::ExecutionService as _;
 use gateway_core::engine::provider::Provider as _;
+use gateway_core::error::GatewayErrorKind;
 use gateway_core::lifecycle::CancellationToken;
 use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload};
 use gateway_core::policy::{ClientApiKeyId, CodexAccessMode};
 use gateway_core::provider_ports::{
     CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
     CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem, CodexHistoryStoredWindow,
-    CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion, CodexNotesOperation,
+    CodexHistoryWindowMetadata, CodexNativeWindowId, CodexNotesCompletion, CodexNotesOperation,
     CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica,
     CodexSessionContentPort, CodexSessionOrigin, CodexSessionState, CodexSessionStatePort,
     NewCodexNotesOperation, ProviderSessionAffinityKey, ProviderStoreError, ProviderStoreErrorKind,
@@ -69,6 +70,8 @@ struct MemoryNativeStore {
     state: Mutex<Option<CodexSessionState>>,
     items: Mutex<Vec<CodexHistoryStoredItem>>,
     pending: Mutex<Vec<CodexHistoryPendingInput>>,
+    /// 内部窗口已持久保存的 context window UUID 别名
+    window_aliases: Mutex<Vec<(String, String)>>,
     fail_commits: AtomicBool,
 }
 
@@ -78,6 +81,7 @@ impl MemoryNativeStore {
             state: Mutex::new(Some(state(origin))),
             items: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
+            window_aliases: Mutex::new(Vec::new()),
             fail_commits: AtomicBool::new(false),
         })
     }
@@ -104,6 +108,16 @@ impl MemoryNativeStore {
                 identity: item_id.to_owned(),
             },
         });
+    }
+
+    /// 登记某内部窗口已持久保存的 context window UUID
+    ///
+    /// 官方客户端用 UUID 传窗口，查询必须解析到同一份档案
+    fn seed_window_alias(&self, window_id: &str, context_window_id: &str) {
+        self.window_aliases
+            .lock()
+            .expect("window aliases lock")
+            .push((window_id.to_owned(), context_window_id.to_owned()));
     }
 
     fn item_ids(&self) -> Vec<String> {
@@ -232,22 +246,41 @@ impl CodexSessionContentPort for MemoryNativeStore {
         _session_key: &'a ProviderSessionAffinityKey,
     ) -> BoxFuture<'a, Result<Vec<CodexHistoryStoredWindow>, ProviderStoreError>> {
         let items = self.items.lock().expect("items lock").clone();
+        let aliases = self
+            .window_aliases
+            .lock()
+            .expect("window aliases lock")
+            .clone();
         Box::pin(async move {
             let mut windows: Vec<CodexHistoryStoredWindow> = Vec::new();
             for item in items {
                 match windows
                     .iter_mut()
-                    .find(|window| window.window.window_id == item.window_id)
+                    .find(|window| window.window_id == item.window_id)
                 {
                     Some(window) => window.item_count += 1,
-                    None => windows.push(CodexHistoryStoredWindow {
-                        window: CodexHistoryWindow {
-                            window_id: item.window_id.clone(),
+                    None => {
+                        let mut metadata = vec![CodexHistoryWindowMetadata {
                             agent_name: Some("/root".to_owned()),
                             context_window_id: None,
-                        },
-                        item_count: 1,
-                    }),
+                        }];
+                        metadata.extend(
+                            aliases
+                                .iter()
+                                .filter(|(window_id, _)| {
+                                    *window_id == item.window_id.expose_to_store()
+                                })
+                                .map(|(_, context_window_id)| CodexHistoryWindowMetadata {
+                                    agent_name: Some("/root".to_owned()),
+                                    context_window_id: Some(context_window_id.clone()),
+                                }),
+                        );
+                        windows.push(CodexHistoryStoredWindow {
+                            window_id: item.window_id.clone(),
+                            item_count: 1,
+                            metadata,
+                        });
+                    }
                 }
             }
             Ok(windows)
@@ -541,6 +574,112 @@ async fn local_history_answers_without_credentials_or_upstream() {
     assert_eq!(body["window_count"], json!(1));
     assert_eq!(body["windows"][0]["window_id"], json!("thread-local:0"));
     assert_eq!(body["windows"][0]["item_count"], json!(1));
+}
+
+/// 官方客户端用 context window UUID 传窗口；本地 history 必须解析到同一份档案
+#[tokio::test]
+async fn local_history_resolves_persisted_context_window_uuids() {
+    const CONTEXT_WINDOW_ID: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e80";
+    const UNKNOWN_WINDOW_ID: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7eff";
+    let native = MemoryNativeStore::with_origin(CodexSessionOrigin::Managed);
+    native.seed_item("thread-alias:0", "msg_history", "recover me");
+    native.seed_window_alias("thread-alias:0", CONTEXT_WINDOW_ID);
+    let store = Arc::new(MemoryAccountStore::default());
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let provider = provider_with_codex_sessions_and_native_history(
+        &store,
+        sessions,
+        "http://127.0.0.1:9".to_owned(),
+        Arc::new(service(&native)),
+    );
+    let provider: Arc<dyn gateway_core::engine::provider::Provider> = provider;
+    let (service, _admissions) =
+        super::native::native_service_with_mode(provider, CodexAccessMode::SessionPool);
+
+    let call = |operation, body: String| {
+        let service = &service;
+        async move {
+            service
+                .codex_auxiliary(
+                    super::native::prepare(service).await,
+                    gateway_core::engine::codex::CodexAuxiliaryRequest {
+                        operation,
+                        query: None,
+                        headers: Vec::new(),
+                        body: Bytes::from(body),
+                    },
+                )
+                .await
+        }
+    };
+
+    // UUID 与内部 ID 得到同一份条目列表；不再被当成非法参数
+    let listed = call(
+        CodexAuxiliaryOperation::HistoryListItems,
+        format!(
+            r#"{{"client_metadata":{{"session_id":"session-native-alias"}},"context":{{"current_agent_name":"/root"}},"window_id":"{CONTEXT_WINDOW_ID}"}}"#
+        ),
+    )
+    .await
+    .expect("uuid window list");
+    let body = read_body(listed).await;
+    assert_eq!(body["window_id"], json!("thread-alias:0"));
+    assert_eq!(body["item_count"], json!(1));
+    assert_eq!(body["items"][0]["item_id"], json!("msg_history"));
+
+    // read_item 同样接受 UUID，并回显规范的内部窗口身份
+    let read = call(
+        CodexAuxiliaryOperation::HistoryReadItem,
+        format!(
+            r#"{{"client_metadata":{{"session_id":"session-native-alias"}},"context":{{"current_agent_name":"/root"}},"window_id":"{CONTEXT_WINDOW_ID}","item_id":"msg_history"}}"#
+        ),
+    )
+    .await
+    .expect("uuid window read");
+    let body = read_body(read).await;
+    assert_eq!(body["window_id"], json!("thread-alias:0"));
+    assert_eq!(body["content"], json!("recover me"));
+
+    // 窗口命中但条目不存在时保持官方 item_not_found 结果
+    let missing = call(
+        CodexAuxiliaryOperation::HistoryReadItem,
+        format!(
+            r#"{{"client_metadata":{{"session_id":"session-native-alias"}},"context":{{"current_agent_name":"/root"}},"window_id":"{CONTEXT_WINDOW_ID}","item_id":"msg_absent"}}"#
+        ),
+    )
+    .await
+    .expect("uuid window read miss");
+    let body = read_body(missing).await;
+    assert_eq!(body["error"], json!("item_not_found"));
+    assert_eq!(body["window_id"], json!(CONTEXT_WINDOW_ID));
+    assert_eq!(body["window_found"], json!(true));
+    assert_eq!(body["item_found"], json!(false));
+
+    // 未知 UUID 与其它不透明形状都只是无匹配，不扩大到全部窗口，也不是参数错误
+    for unknown in [UNKNOWN_WINDOW_ID, "thread-alias", "thread-alias:9"] {
+        let response = call(
+            CodexAuxiliaryOperation::HistoryListItems,
+            format!(
+                r#"{{"client_metadata":{{"session_id":"session-native-alias"}},"context":{{"current_agent_name":"/root"}},"window_id":"{unknown}"}}"#
+            ),
+        )
+        .await
+        .expect("unknown window is not an argument error");
+        let body = read_body(response).await;
+        assert_eq!(body["item_count"], json!(0), "unknown window `{unknown}`");
+        assert_eq!(body["window_id"], json!(unknown));
+    }
+
+    // 真实参数错误仍然报错
+    let error = call(
+        CodexAuxiliaryOperation::HistoryListItems,
+        format!(
+            r#"{{"client_metadata":{{"session_id":"session-native-alias"}},"context":{{"current_agent_name":"/root"}},"window_id":"{CONTEXT_WINDOW_ID}","limit":0}}"#
+        ),
+    )
+    .await
+    .expect_err("zero limit is still invalid");
+    assert_eq!(error.kind(), GatewayErrorKind::InvalidRequest);
 }
 
 #[tokio::test]

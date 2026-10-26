@@ -256,6 +256,8 @@ impl CodexProvider {
                 // realtime calls 端点绑定 ChatGPT OAuth 身份；在候选阶段就排除
                 // API Key 账号，避免混合账号池选中不支持语音的账号后必然失败。
                 requires_oauth: true,
+                // 模型与实时调用沿用本次 attempt 的截止与取消
+                lease_lifecycle: None,
             })
             .await
             .map_err(map_selection_error)?;

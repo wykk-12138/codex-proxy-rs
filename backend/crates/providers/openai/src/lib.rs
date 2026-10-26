@@ -20,7 +20,7 @@ use gateway_core::account::ProviderAccountStore;
 use gateway_core::engine::provider::Provider;
 use gateway_core::provider_ports::ProviderStorePorts;
 use gateway_core::routing::ProviderKind;
-use gateway_core::task::WorkerContribution;
+use gateway_core::task::{WorkerContribution, WorkerDisabledReason, WorkerKind};
 
 use crate::admin::{OpenAiAdminProvider, OpenAiAdminServices, OpenAiOAuthPendingStore};
 use crate::credential::token_client::{AuthorizationCodeExchanger, TokenRefresher};
@@ -41,8 +41,9 @@ pub use jitter::{
     catalog_refresh_jitter, quota_failure_refresh_delay, server_error_retry_jitter, uniform_delay,
 };
 pub use provider::{
-    CodexProvider, CodexProviderConfigError, CodexProviderTransport, OFFICIAL_CODEX_BASE_PATH,
-    OFFICIAL_CODEX_BASE_URL, openai_failure_affects_account_score,
+    CodexNotesDeliveryTask, CodexProvider, CodexProviderConfigError, CodexProviderTransport,
+    NOTES_DELIVERY_LEASE_BUDGET, OFFICIAL_CODEX_BASE_PATH, OFFICIAL_CODEX_BASE_URL,
+    notes_delivery_registration, openai_failure_affects_account_score,
 };
 
 pub mod credential;
@@ -186,7 +187,7 @@ pub async fn initialize(
         )
         .map_err(|_| OpenAiInitializeError::TokenClient)?,
     );
-    let core_provider: Arc<dyn Provider> = Arc::new({
+    let (provider, notes_delivery_task) = {
         let provider = CodexProvider::new(
             selector,
             Arc::clone(&catalog),
@@ -211,24 +212,30 @@ pub async fn initialize(
             .codex_session_state()
             .zip(ports.codex_session_content())
         {
-            Some((state, content)) => provider
-                .with_native_history(Arc::new(
-                    gateway_core::engine::codex_history::CodexHistoryService::new(
-                        Arc::clone(&content),
-                        Arc::clone(&state),
-                        managed_admission,
-                    ),
-                ))
-                .with_native_notes(Arc::new(
-                    gateway_core::engine::codex_notes::CodexNotesService::new(
-                        state,
-                        content,
-                        managed_admission,
-                    ),
-                )),
-            None => provider,
+            Some((state, content)) => {
+                let provider = provider
+                    .with_native_history(Arc::new(
+                        gateway_core::engine::codex_history::CodexHistoryService::new(
+                            Arc::clone(&content),
+                            Arc::clone(&state),
+                            managed_admission,
+                        ),
+                    ))
+                    .with_native_notes(Arc::new(
+                        gateway_core::engine::codex_notes::CodexNotesService::new(
+                            state,
+                            content,
+                            managed_admission,
+                        ),
+                    ));
+                // 交付 owner 的受监督任务随装配取得；没有 notes 协调时不需要它
+                let notes_delivery_task = provider.notes_delivery_task();
+                (provider, notes_delivery_task)
+            }
+            None => (provider, None),
         }
-    });
+    };
+    let core_provider: Arc<dyn Provider> = Arc::new(provider);
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client.clone();
     let credential_admin = Arc::new(
@@ -290,6 +297,19 @@ pub async fn initialize(
         },
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
+    // managed notes 写的交付任务只在装配了 notes 协调时存在；由组装根加入同一份任务计划。
+    // 未装配时贡献明确的窄禁用项：该类别是冻结任务类别，缺少贡献会让整份 Host 计划无法启动
+    let mut worker_contributions = worker_contributions;
+    worker_contributions.push(match notes_delivery_task {
+        Some(task) => WorkerContribution::Registration(
+            provider::notes_delivery_registration(task)
+                .map_err(|_| OpenAiInitializeError::Worker)?,
+        ),
+        None => WorkerContribution::Disabled {
+            kind: WorkerKind::CodexNotesDelivery,
+            reason: WorkerDisabledReason::NotesDeliveryUnavailable,
+        },
+    });
 
     Ok(ProviderBundle {
         core_provider,

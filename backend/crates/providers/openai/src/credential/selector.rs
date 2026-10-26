@@ -17,6 +17,7 @@ use gateway_core::account::{
 };
 use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection, WaitPriority};
 use gateway_core::engine::{AttemptContext, ContinuationAttempt, policy::AccountPolicyError};
+use gateway_core::lifecycle::{CancellationToken, Deadline};
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort,
@@ -108,6 +109,8 @@ pub(crate) struct SelectCodexProviderEndpointCredential<'a> {
     pub model: CodexSelectionModel<'a>,
     /// 本端点只接受 OAuth 凭据时排除 API Key 账号，避免混合池选中后必然失败。
     pub requires_oauth: bool,
+    /// notes 首绑写路径的交付租约生命周期；None 沿用本次 attempt
+    pub lease_lifecycle: Option<&'a NotesLeaseLifecycle>,
 }
 
 /// 选号使用的模型类别，图片额外检查套餐资格，原生端点允许模型未知
@@ -173,7 +176,9 @@ struct CredentialSelectionInput<'a> {
     session_affinity_key: Option<&'a ProviderSessionAffinityKey>,
     session_affinity_observation: Option<&'a CodexSessionAffinity>,
     /// 模型请求的已托管会话允许在 owner 明确额度耗尽时迁移；辅助首绑不设置
-    session_owner_migration: bool,
+    session_owner_migration: Option<CodexSessionMigrationExpectation>,
+    /// notes 首绑写路径的租约续期生命周期；None 沿用本次 attempt 的截止与取消
+    lease_lifecycle: Option<NotesLeaseLifecycle>,
     /// Codex Guardian 自动审批请求；仅在配置独立额度时使用审批容量池
     guardian: bool,
 }
@@ -186,8 +191,32 @@ struct CredentialSelectionInput<'a> {
 pub(crate) struct CodexSessionMigration {
     /// 迁移前的持久 owner
     pub(crate) from: ProviderAccountId,
+    /// 迁移前的持久代次；只比对账号会让 A→B→A 的旧意图重新生效
+    pub(crate) from_generation: u64,
     /// 本次请求的逻辑会话键；模型与 notes 共用同一键
     pub(crate) session_key: ProviderSessionAffinityKey,
+}
+
+/// 已托管会话在选号前观测到的迁移预期快照
+///
+/// 由 Provider 按持久会话状态构造；选号只有在当前 owner 与快照一致时才形成迁移意图，
+/// notes 重建在会话锁内、保存重放目标之前再次复验 owner 与代次
+#[derive(Debug, Clone)]
+pub(crate) struct CodexSessionMigrationExpectation {
+    pub(crate) owner: ProviderAccountId,
+    pub(crate) generation: u64,
+    pub(crate) session_key: ProviderSessionAffinityKey,
+}
+
+/// notes 首绑写路径使用的账号租约生命周期
+///
+/// 租约续期必须随交付工作结束，而不是随调用方请求结束；调用方退出后仍要约束账号容量。
+/// `deadline` 由调用方在申请租约的同一时刻给出（有界准备窗口 + 完整交付预算），
+/// 并由调用方在交接前用同一值复验剩余量
+#[derive(Clone)]
+pub(crate) struct NotesLeaseLifecycle {
+    pub(crate) deadline: Deadline,
+    pub(crate) cancellation: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -375,7 +404,8 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation: None,
-            session_owner_migration: false,
+            session_owner_migration: None,
+            lease_lifecycle: None,
             guardian: false,
         };
         self.select_inner(
@@ -386,7 +416,9 @@ impl CodexCredentialSelector {
         .await
     }
 
-    /// 模型选号；`session_owner_migration` 由调用方按已托管来源与 notes 能力决定
+    /// 模型选号；迁移预期由调用方按已托管来源与 notes 能力观测
+    ///
+    /// 只有当前持久 owner 仍与预期快照一致时才会形成待发布迁移意图
     pub(crate) async fn select_with_cyber_policy(
         &self,
         request: &SelectCodexCredential<'_>,
@@ -394,7 +426,7 @@ impl CodexCredentialSelector {
         session_affinity_observation: Option<&CodexSessionAffinity>,
         requires_websocket: bool,
         guardian: bool,
-        session_owner_migration: bool,
+        session_owner_migration: Option<CodexSessionMigrationExpectation>,
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let input = CredentialSelectionInput {
             requires_websocket,
@@ -404,6 +436,7 @@ impl CodexCredentialSelector {
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation,
             session_owner_migration,
+            lease_lifecycle: None,
             guardian,
         };
         self.select_inner(
@@ -530,7 +563,8 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity.map(CodexSessionAffinity::key),
             session_affinity_observation: request.session_affinity,
-            session_owner_migration: false,
+            session_owner_migration: None,
+            lease_lifecycle: request.lease_lifecycle.cloned(),
             guardian: false,
         };
         self.select_inner(&input, None, request.model).await
@@ -582,6 +616,8 @@ impl CodexCredentialSelector {
         follow_only: bool,
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let diagnostic = request.attempt.is_diagnostic_required_account();
+        // 交付租约只在 notes 首绑写路径提供；普通模型与辅助请求沿用本次 attempt
+        let lease_lifecycle = request.lease_lifecycle.as_ref();
         let binding_key = request.session_affinity_key.filter(|_| !diagnostic);
         let affinity_mode = request
             .attempt
@@ -848,7 +884,7 @@ impl CodexCredentialSelector {
             // 持久 owner 只有在本会话已托管、且它被明确判定额度耗尽时才解除永久钉选；
             // 并发忙、临时限流、认证失效与任意 excluded 仍保持原 owner 失败语义
             let owner_quota_exhausted = owner_pin.as_ref().is_some_and(|owner| {
-                request.session_owner_migration
+                request.session_owner_migration.is_some()
                     && !follow_only
                     && request.attempt.continuation_attempt() == ContinuationAttempt::None
                     && candidates
@@ -863,18 +899,16 @@ impl CodexCredentialSelector {
                         })
             });
             let migration = if owner_quota_exhausted {
-                // 选号阶段只取得候选租约，不改写 PostgreSQL owner；发布由 Provider 完成
-                excluded.extend(owner_pin.clone());
-                owner_pin
-                    .as_ref()
-                    .zip(binding_key)
-                    .map(|(from, key)| CodexSessionMigration {
-                        from: from.clone(),
-                        session_key: key.clone(),
-                    })
+                owner_pin.as_ref().zip(binding_key).and_then(|(from, key)| {
+                    requested_session_migration(request.session_owner_migration.as_ref(), from, key)
+                })
             } else {
                 None
             };
+            if migration.is_some() {
+                // 选号阶段只取得候选租约，不改写 PostgreSQL owner；发布由 Provider 完成
+                excluded.extend(owner_pin.clone());
+            }
             let pinned_account = if migration.is_some() {
                 explicit_pin.as_ref()
             } else {
@@ -1119,11 +1153,19 @@ impl CodexCredentialSelector {
                             account.id().clone(),
                             account.revision(),
                             context.concurrency_limit(&account),
-                            request.attempt.deadline(),
+                            lease_lifecycle.as_ref().map_or_else(
+                                || request.attempt.deadline(),
+                                |lifecycle| lifecycle.deadline,
+                            ),
                         )
                         .with_metadata(request.attempt.lease_metadata())
                         .with_concurrency_pool(concurrency_pool)
-                        .with_cancellation(request.attempt.cancellation().clone()),
+                        .with_cancellation(
+                            lease_lifecycle.as_ref().map_or_else(
+                                || request.attempt.cancellation().clone(),
+                                |lifecycle| lifecycle.cancellation.clone(),
+                            ),
+                        ),
                     ))
                     .await?
                 {
@@ -1890,6 +1932,26 @@ fn active_risk_recovery<'a>(
             path_block_count: 0,
             observed_at: now,
         })
+}
+
+/// 只有当前持久 owner 与选号前观测的快照一致时才形成迁移意图
+///
+/// 不一致说明另一个请求已经发布过新状态；本次不得按旧凭据与旧范围重放 notes，
+/// 也不得因为目标账号恰好相同而复用上一次迁移的成功结论
+fn requested_session_migration(
+    expected: Option<&CodexSessionMigrationExpectation>,
+    from: &ProviderAccountId,
+    session_key: &ProviderSessionAffinityKey,
+) -> Option<CodexSessionMigration> {
+    let expected = expected?;
+    if expected.owner != *from || expected.session_key != *session_key {
+        return None;
+    }
+    Some(CodexSessionMigration {
+        from: from.clone(),
+        from_generation: expected.generation,
+        session_key: session_key.clone(),
+    })
 }
 
 impl fmt::Debug for CodexCredentialSelector {

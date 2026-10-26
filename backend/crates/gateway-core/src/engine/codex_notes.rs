@@ -75,6 +75,19 @@ pub enum CodexNotesError {
     /// 冻结目标尚未全部重放，不能发布新域
     #[error("Codex notes replay has not reached the frozen target")]
     ReplayNotComplete,
+    /// 迁移意图已过期：锁内事实与选号时观测的 owner 或代次不一致
+    #[error("Codex notes migration intent is stale")]
+    MigrationStale,
+}
+
+/// 选号阶段观测到的已托管会话预期快照
+///
+/// 只由会话状态本身体现，不含任何客户端声明；同账号重新选出也必须比对代次，
+/// 否则 A→B→A 之类的前进会让旧意图再次重放并发布
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexNotesSessionExpectation {
+    pub owner: ProviderAccountId,
+    pub generation: u64,
 }
 
 /// 一次重建的冻结目标与按 seq 排列的待重放操作
@@ -188,6 +201,38 @@ impl CodexNotesService {
         }))
     }
 
+    /// 新会话是否会记录 notes
+    ///
+    /// 只暴露已有的准入规则：未认领会话在认领后按同一开关判定来源，因此这里不构成
+    /// 第二套来源判定，也不返回任何具体会话的 owner 或落点
+    #[must_use]
+    pub const fn records_new_sessions(&self) -> bool {
+        self.managed_admission
+    }
+
+    /// 读取选号阶段可用的迁移预期快照
+    ///
+    /// 只对已托管会话返回；未认领与 legacy 不形成迁移意图，也不猜测 owner
+    ///
+    /// # Errors
+    ///
+    /// 读取会话状态失败
+    pub async fn migration_expectation(
+        &self,
+        key_id: &ClientApiKeyId,
+        session_key: &ProviderSessionAffinityKey,
+    ) -> Result<Option<CodexNotesSessionExpectation>, CodexNotesError> {
+        let Some(state) = self.state.load_session(key_id, session_key).await? else {
+            return Ok(None);
+        };
+        Ok(
+            (state.origin == CodexSessionOrigin::Managed).then_some(CodexNotesSessionExpectation {
+                owner: state.owner,
+                generation: state.generation,
+            }),
+        )
+    }
+
     /// 记录一次真实写入意图并取得会话内 seq
     ///
     /// 拿到 seq 才允许发送；内容相同的两次请求是两次真实变更，不按正文去重
@@ -264,16 +309,20 @@ impl CodexNotesService {
 
     /// 冻结当前日志尾部并为目标账号生成新的重建域
     ///
-    /// 调用方必须先持有会话互斥；这里保存冻结目标与零进度，重放期间不持事务
+    /// 调用方必须先持有会话互斥；这里保存冻结目标与零进度，重放期间不持事务。
+    /// 选号时观测的 owner 与代次在保存任何重放事实之前复验：并发请求已经发布
+    /// 新 owner 或新代次时，本意图直接作废，不重放也不覆盖更新的状态
     ///
     /// # Errors
     ///
-    /// 会话未认领或已判定 legacy、日志存在未终结操作、保存冻结目标失败
+    /// 会话未认领或已判定 legacy、迁移意图已过期、日志存在未终结操作、
+    /// 保存冻结目标失败
     pub async fn begin_rebuild(
         &self,
         key_id: &ClientApiKeyId,
         session_key: &ProviderSessionAffinityKey,
         target: &ProviderAccountId,
+        expected: &CodexNotesSessionExpectation,
     ) -> Result<CodexNotesRebuild, CodexNotesError> {
         let state = self
             .state
@@ -282,6 +331,10 @@ impl CodexNotesService {
             .ok_or(CodexNotesError::SessionAbsent)?;
         if state.origin == CodexSessionOrigin::Legacy {
             return Err(CodexNotesError::LegacySession);
+        }
+        // 只比对账号会漏掉 A→B→A；owner 与代次必须同时是选号时的快照
+        if state.owner != expected.owner || state.generation != expected.generation {
+            return Err(CodexNotesError::MigrationStale);
         }
         let operations = self.operations(key_id, session_key).await?;
         // 未终结操作占住自己的 seq，冻结目标不能跳过它
@@ -302,7 +355,8 @@ impl CodexNotesService {
         let rebuild = CodexNotesRebuild {
             account: target.clone(),
             generation: CodexNotesGeneration::generate(),
-            expected_generation: state.generation,
+            // 发布 CAS 沿用复验通过的预期代次，不在复验后重新读取
+            expected_generation: expected.generation,
             through_seq,
             replayed_through_seq,
             steps,

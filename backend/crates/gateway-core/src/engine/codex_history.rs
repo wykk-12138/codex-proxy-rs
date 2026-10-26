@@ -5,7 +5,11 @@
 //! 不可读对象只报告类型与不可读事实，不生成也不推断明文投影
 //! 跨 agent 的读取始终限制在同一 Client Key 与逻辑会话内
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use thiserror::Error;
 
@@ -38,6 +42,16 @@ pub enum CodexHistoryQueryError {
     /// 模型给出的参数不在官方合同内
     #[error("invalid history tool argument `{0}`")]
     InvalidArgument(&'static str),
+    /// 同一 context window 别名对应多个内部窗口
+    ///
+    /// 持久事实冲突时既不能任选一个，也不能把不同窗口的档案合成一份
+    #[error("Codex history window alias matches multiple windows")]
+    AmbiguousWindowAlias,
+    /// 同一内部窗口的已持久元数据声明了多个 agent
+    ///
+    /// 不能按最大值决定可读范围，否则一个 agent 会读到另一个 agent 的条目
+    #[error("Codex history window metadata declares conflicting agents")]
+    ConflictingWindowAgent,
     /// 读取持久事实失败；这是错误而不是无匹配
     #[error(transparent)]
     Store(#[from] ProviderStoreError),
@@ -331,13 +345,22 @@ struct CodexHistoryView<'a> {
 
 struct ResolvedWindow<'a> {
     window_id: &'a CodexNativeWindowId,
-    stored: &'a CodexHistoryStoredWindow,
+    item_count: u64,
     agent_name: String,
+    /// 该窗口已持久保存的 context window UUID；同一窗口可能有多个
+    context_window_ids: Vec<&'a str>,
 }
 
 impl<'a> CodexHistoryView<'a> {
     /// 窗口按首个条目顺序排列；与条目混排时仍保持持久顺序
-    fn new(windows: &'a [CodexHistoryStoredWindow], items: &'a [CodexHistoryStoredItem]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// 同一窗口的已持久元数据声明了多个 agent
+    fn new(
+        windows: &'a [CodexHistoryStoredWindow],
+        items: &'a [CodexHistoryStoredItem],
+    ) -> Result<Self, CodexHistoryQueryError> {
         let mut first_ordinal: HashMap<&str, u64> = HashMap::new();
         for item in items {
             let window_id = item.window_id.expose_to_store();
@@ -348,12 +371,16 @@ impl<'a> CodexHistoryView<'a> {
         }
         let mut resolved: Vec<ResolvedWindow<'a>> = windows
             .iter()
-            .map(|window| ResolvedWindow {
-                window_id: &window.window.window_id,
-                stored: window,
-                agent_name: declared_agent_name(window.window.agent_name.as_deref()),
+            .map(|window| {
+                let (agent_name, context_window_ids) = declared_window_identity(window)?;
+                Ok(ResolvedWindow {
+                    window_id: &window.window_id,
+                    item_count: window.item_count,
+                    agent_name,
+                    context_window_ids,
+                })
             })
-            .collect();
+            .collect::<Result<_, CodexHistoryQueryError>>()?;
         resolved.sort_by(|left, right| {
             let left_key = (
                 first_ordinal
@@ -371,22 +398,82 @@ impl<'a> CodexHistoryView<'a> {
             );
             left_key.cmp(&right_key)
         });
-        Self {
+        Ok(Self {
             windows: resolved,
             items,
-        }
+        })
     }
 
-    fn window(&self, window_id: &CodexNativeWindowId) -> Option<&ResolvedWindow<'a>> {
-        self.windows
+    /// 把客户端给出的窗口值解析为该 agent 范围内的内部窗口
+    ///
+    /// 先按内部 ID 精确匹配，再按该 agent 已持久保存的 context window UUID 别名匹配；
+    /// 都不命中表示这个 agent 没有该窗口，既不回退到全部窗口，也不跨 agent 匹配
+    ///
+    /// # Errors
+    ///
+    /// 同一别名在该 agent 下对应多个内部窗口
+    fn resolve_requested_window(
+        &self,
+        agent: &str,
+        requested: &str,
+    ) -> Result<Option<&ResolvedWindow<'a>>, CodexHistoryQueryError> {
+        if let Some(window) = self
+            .windows
             .iter()
-            .find(|window| *window.window_id == *window_id)
+            .find(|window| window.window_id.expose_to_store() == requested)
+            && window.agent_name == agent
+        {
+            return Ok(Some(window));
+        }
+        let mut aliased = self
+            .windows
+            .iter()
+            .filter(|window| window.agent_name == agent)
+            .filter(|window| window.context_window_ids.contains(&requested));
+        let Some(window) = aliased.next() else {
+            return Ok(None);
+        };
+        if aliased.next().is_some() {
+            return Err(CodexHistoryQueryError::AmbiguousWindowAlias);
+        }
+        Ok(Some(window))
     }
 
     fn agent_of(&self, window_id: &CodexNativeWindowId) -> Option<&str> {
-        self.window(window_id)
+        self.windows
+            .iter()
+            .find(|window| *window.window_id == *window_id)
             .map(|window| window.agent_name.as_str())
     }
+}
+
+/// 窗口的归一化 agent 与已持久 UUID 别名集合
+///
+/// 成对读取同一份元数据，不分别取最大值；未声明 agent 的窗口归到根 agent
+fn declared_window_identity(
+    window: &CodexHistoryStoredWindow,
+) -> Result<(String, Vec<&str>), CodexHistoryQueryError> {
+    let mut agents = BTreeSet::new();
+    let mut context_window_ids: Vec<&str> = Vec::new();
+    for metadata in &window.metadata {
+        agents.insert(declared_agent_name(metadata.agent_name.as_deref()));
+        if let Some(context_window_id) = metadata
+            .context_window_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            && !context_window_ids.contains(&context_window_id)
+        {
+            context_window_ids.push(context_window_id);
+        }
+    }
+    let mut agents = agents.into_iter();
+    let agent_name = agents
+        .next()
+        .unwrap_or_else(|| CODEX_ROOT_AGENT_NAME.to_owned());
+    if agents.next().is_some() {
+        return Err(CodexHistoryQueryError::ConflictingWindowAgent);
+    }
+    Ok((agent_name, context_window_ids))
 }
 
 /// 本地 history 查询服务；只有 Managed 会话由本地回答
@@ -491,7 +578,7 @@ impl CodexHistoryService {
             .content
             .load_history_items(scope.key_id, scope.session_key)
             .await?;
-        let view = CodexHistoryView::new(&windows, &items);
+        let view = CodexHistoryView::new(&windows, &items)?;
 
         let mut matched: Vec<&ResolvedWindow<'_>> = view
             .windows
@@ -518,7 +605,7 @@ impl CodexHistoryService {
             summaries.push(CodexHistoryWindowSummary {
                 window_id: window.window_id.expose_to_store().to_owned(),
                 agent_name: window.agent_name.clone(),
-                item_count: window.stored.item_count,
+                item_count: window.item_count,
             });
         }
         let window_count = summaries.len();
@@ -545,13 +632,12 @@ impl CodexHistoryService {
         let agent =
             resolve_agent_name(scope.current_agent_name, query.filter.agent_name.as_deref())?;
         let limit = page_limit(query.filter.limit)?;
-        let window = requested_window(query.filter.window_id.as_deref())?;
         let content_chars = content_char_cap(query.max_chars_per_item, budget)?;
         self.item_page(
             scope,
             &agent,
             &query.filter,
-            window.as_ref(),
+            query.filter.window_id.as_deref(),
             limit,
             budget,
             content_chars,
@@ -579,13 +665,12 @@ impl CodexHistoryService {
         let agent =
             resolve_agent_name(scope.current_agent_name, query.filter.agent_name.as_deref())?;
         let limit = page_limit(query.filter.limit)?;
-        let window = requested_window(query.filter.window_id.as_deref())?;
         let content_chars = content_char_cap(None, budget)?;
         self.item_page(
             scope,
             &agent,
             &query.filter,
-            window.as_ref(),
+            query.filter.window_id.as_deref(),
             limit,
             budget,
             content_chars,
@@ -610,8 +695,6 @@ impl CodexHistoryService {
         budget: CodexHistoryQueryBudget,
     ) -> Result<CodexHistoryReadItemOutcome, CodexHistoryQueryError> {
         let agent = resolve_agent_name(scope.current_agent_name, query.agent_name.as_deref())?;
-        let window = CodexNativeWindowId::try_new(query.window_id.clone())
-            .map_err(|_| CodexHistoryQueryError::InvalidArgument("window_id"))?;
         let offset = usize::try_from(query.offset_chars.unwrap_or(0)).unwrap_or(usize::MAX);
         let limit = match query.limit_chars {
             Some(0) => return Err(CodexHistoryQueryError::InvalidArgument("limit_chars")),
@@ -627,22 +710,18 @@ impl CodexHistoryService {
             .content
             .load_history_items(scope.key_id, scope.session_key)
             .await?;
-        let view = CodexHistoryView::new(&windows, &items);
-        let Some(resolved) = view.window(&window) else {
+        let view = CodexHistoryView::new(&windows, &items)?;
+        // 显式未知窗口如实报告未命中，不跨窗口兜底，也不扩大到该 agent 的全部窗口
+        let Some(resolved) = view.resolve_requested_window(&agent, &query.window_id)? else {
             return Ok(CodexHistoryReadItemOutcome::NotFound {
                 window_found: false,
             });
         };
-        if resolved.agent_name != agent {
-            // window_found 只描述请求 agent 的窗口范围，不暗示其它 agent 的档案
-            return Ok(CodexHistoryReadItemOutcome::NotFound {
-                window_found: false,
-            });
-        }
+        let window = resolved.window_id;
         let Some(item) = view
             .items
             .iter()
-            .find(|item| item.window_id == window && item.item.item_id == query.item_id)
+            .find(|item| item.window_id == *window && item.item.item_id == query.item_id)
         else {
             return Ok(CodexHistoryReadItemOutcome::NotFound { window_found: true });
         };
@@ -684,7 +763,7 @@ impl CodexHistoryService {
         scope: &CodexHistoryScope<'_>,
         agent: &str,
         filter: &CodexHistoryFilterQuery,
-        window: Option<&CodexNativeWindowId>,
+        window_id: Option<&str>,
         limit: u64,
         budget: CodexHistoryQueryBudget,
         content_chars: usize,
@@ -698,17 +777,17 @@ impl CodexHistoryService {
             .content
             .load_history_items(scope.key_id, scope.session_key)
             .await?;
-        let view = CodexHistoryView::new(&windows, &items);
-        Ok(item_page_of(
+        let view = CodexHistoryView::new(&windows, &items)?;
+        item_page_of(
             &view,
             agent,
             filter,
-            window,
+            window_id,
             limit,
             budget,
             content_chars,
             &matches,
-        ))
+        )
     }
 }
 
@@ -719,18 +798,21 @@ fn item_page_of(
     view: &CodexHistoryView<'_>,
     agent: &str,
     filter: &CodexHistoryFilterQuery,
-    window: Option<&CodexNativeWindowId>,
+    requested_window: Option<&str>,
     limit: u64,
     budget: CodexHistoryQueryBudget,
     content_chars: usize,
     matches: &impl Fn(&CodexHistoryItem) -> bool,
-) -> CodexHistoryItemPage {
+) -> Result<CodexHistoryItemPage, CodexHistoryQueryError> {
+    let window = match requested_window {
+        None => None,
+        Some(requested) => match view.resolve_requested_window(agent, requested)? {
+            Some(resolved) => Some(resolved.window_id),
+            // 显式未知窗口返回空页并回显请求值，不扩大到该 agent 的全部窗口
+            None => return Ok(empty_page(Some(requested.to_owned()), content_chars)),
+        },
+    };
     let window_id = window.map(|window| window.expose_to_store().to_owned());
-    if let Some(window) = window
-        && view.agent_of(window) != Some(agent)
-    {
-        return empty_page(window_id, content_chars);
-    }
     let tool_name = filter_string(filter.tool_name.as_deref());
     let tool_namespace = filter_string(filter.tool_namespace.as_deref());
     let mut selected: Vec<&CodexHistoryStoredItem> = view
@@ -780,14 +862,14 @@ fn item_page_of(
             truncated_content: content,
         });
     }
-    CodexHistoryItemPage {
+    Ok(CodexHistoryItemPage {
         window_id,
         item_count,
         returned: summaries.len(),
         truncated: summaries.len() < item_count,
         max_chars_per_item: content_chars as u64,
         items: summaries,
-    }
+    })
 }
 
 fn empty_page(window_id: Option<String>, content_chars: usize) -> CodexHistoryItemPage {
@@ -867,17 +949,6 @@ fn canonical_agent_path(value: &str) -> Option<String> {
         return None;
     }
     Some(format!("/{}", components.join("/")))
-}
-
-fn requested_window(
-    window_id: Option<&str>,
-) -> Result<Option<CodexNativeWindowId>, CodexHistoryQueryError> {
-    window_id
-        .map(|window_id| {
-            CodexNativeWindowId::try_new(window_id)
-                .map_err(|_| CodexHistoryQueryError::InvalidArgument("window_id"))
-        })
-        .transpose()
 }
 
 fn filter_string(value: Option<&str>) -> Option<&str> {

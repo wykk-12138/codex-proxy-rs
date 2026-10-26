@@ -470,6 +470,11 @@ fn history_query_error(error: CodexHistoryQueryError) -> ProviderError {
             ProviderErrorKind::InvalidRequest,
             UpstreamSendState::NotSent,
         ),
+        // 已持久事实冲突不能用客户端请求修正；不把错误答案冒充成无匹配
+        CodexHistoryQueryError::AmbiguousWindowAlias
+        | CodexHistoryQueryError::ConflictingWindowAgent => {
+            ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        }
         CodexHistoryQueryError::Store(source) => {
             history_store_error(source, UpstreamSendState::NotSent)
         }

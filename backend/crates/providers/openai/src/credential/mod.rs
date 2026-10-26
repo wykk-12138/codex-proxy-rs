@@ -70,8 +70,8 @@ pub use selector::{
     SelectCodexCredential,
 };
 pub(crate) use selector::{
-    CodexCyberPolicyScope, CodexSelectionModel, SelectCodexProviderEndpointCredential,
-    retry_account_snapshot,
+    CodexCyberPolicyScope, CodexSelectionModel, CodexSessionMigrationExpectation,
+    NotesLeaseLifecycle, SelectCodexProviderEndpointCredential, retry_account_snapshot,
 };
 pub use types::{
     CODEX_AUTHENTICATION_KIND_OAUTH, CodexAccountProfile, CodexCookie, CodexCookieCaptureOutcome,

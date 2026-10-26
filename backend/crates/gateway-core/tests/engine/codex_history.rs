@@ -3,17 +3,17 @@
 use futures::{executor::block_on, future::BoxFuture};
 use gateway_core::account::ProviderAccountId;
 use gateway_core::engine::codex_history::{
-    CodexHistoryFilterQuery, CodexHistoryListItemsQuery, CodexHistoryQueryBudget,
-    CodexHistoryQueryError, CodexHistoryReadItemOutcome, CodexHistoryReadQuery, CodexHistoryRoute,
-    CodexHistoryScope, CodexHistorySearchQuery, CodexHistoryService, CodexHistoryToolOutcome,
-    CodexHistoryToolQuery, CodexHistoryToolResult, CodexHistoryWindowQuery, codex_history_item_id,
-    resolve_agent_name,
+    CodexHistoryFilterQuery, CodexHistoryItemPage, CodexHistoryListItemsQuery,
+    CodexHistoryQueryBudget, CodexHistoryQueryError, CodexHistoryReadItemOutcome,
+    CodexHistoryReadQuery, CodexHistoryRoute, CodexHistoryScope, CodexHistorySearchQuery,
+    CodexHistoryService, CodexHistoryToolOutcome, CodexHistoryToolQuery, CodexHistoryToolResult,
+    CodexHistoryWindowQuery, codex_history_item_id, resolve_agent_name,
 };
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
     CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem, CodexHistoryStoredWindow,
-    CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion, CodexNotesOperation,
+    CodexHistoryWindowMetadata, CodexNativeWindowId, CodexNotesCompletion, CodexNotesOperation,
     CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica,
     CodexSessionContentPort, CodexSessionOrigin, CodexSessionState, CodexSessionStatePort,
     NewCodexNotesOperation, ProviderSessionAffinityKey, ProviderStoreError, ProviderStoreErrorKind,
@@ -210,13 +210,32 @@ impl CodexSessionStatePort for FakeSessionState {
 }
 
 fn window(window_id: &str, agent_name: Option<&str>, item_count: u64) -> CodexHistoryStoredWindow {
-    CodexHistoryStoredWindow {
-        window: CodexHistoryWindow {
-            window_id: CodexNativeWindowId::try_new(window_id).expect("window id"),
+    aliased_window(window_id, agent_name, item_count, &[])
+}
+
+/// 已持久保存多个 context window UUID 的同一内部窗口
+///
+/// 恢复后再次推进会得到新 UUID，旧别名仍留在已保存的记录上
+fn aliased_window(
+    window_id: &str,
+    agent_name: Option<&str>,
+    item_count: u64,
+    context_window_ids: &[&str],
+) -> CodexHistoryStoredWindow {
+    let mut metadata = vec![CodexHistoryWindowMetadata {
+        agent_name: agent_name.map(ToOwned::to_owned),
+        context_window_id: None,
+    }];
+    metadata.extend(context_window_ids.iter().map(|context_window_id| {
+        CodexHistoryWindowMetadata {
             agent_name: agent_name.map(ToOwned::to_owned),
-            context_window_id: None,
-        },
+            context_window_id: Some((*context_window_id).to_owned()),
+        }
+    }));
+    CodexHistoryStoredWindow {
+        window_id: CodexNativeWindowId::try_new(window_id).expect("window id"),
         item_count,
+        metadata,
     }
 }
 
@@ -250,13 +269,24 @@ fn item(
 
 const UNICODE_TEXT: &str = "定价规则：单位 250 分\nunit_cents: 250";
 
+// 官方 context window UUID 与内部窗口 ID 是两套身份，别名只来自已持久保存的元数据
+const WINDOW_A0: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e80";
+const WINDOW_A0_ROTATED: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e81";
+const WINDOW_A1: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e82";
+const WINDOW_B0: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e83";
+
 fn history() -> FakeHistory {
     FakeHistory {
         // 窗口目录故意按倒序给出，排序只依据持久条目顺序
         windows: vec![
-            window("thread-b:0", Some("/root/worker"), 2),
-            window("thread-a:1", Some("/root"), 2),
-            window("thread-a:0", Some("/root"), 4),
+            aliased_window("thread-b:0", Some("/root/worker"), 2, &[WINDOW_B0]),
+            aliased_window("thread-a:1", Some("/root"), 2, &[WINDOW_A1]),
+            aliased_window(
+                "thread-a:0",
+                Some("/root"),
+                4,
+                &[WINDOW_A0, WINDOW_A0_ROTATED],
+            ),
         ],
         items: vec![
             item(
@@ -371,7 +401,7 @@ fn service(history: FakeHistory, origin: Option<CodexSessionOrigin>) -> CodexHis
 fn assert_invalid(error: CodexHistoryQueryError, argument: &'static str) {
     match error {
         CodexHistoryQueryError::InvalidArgument(value) => assert_eq!(value, argument),
-        CodexHistoryQueryError::Store(error) => panic!("unexpected store error: {error}"),
+        other => panic!("unexpected error: {other:?}"),
     }
 }
 
@@ -380,7 +410,7 @@ fn assert_store_unavailable(error: CodexHistoryQueryError) {
         CodexHistoryQueryError::Store(error) => {
             assert_eq!(error.kind(), ProviderStoreErrorKind::Unavailable);
         }
-        CodexHistoryQueryError::InvalidArgument(value) => panic!("unexpected invalid `{value}`"),
+        other => panic!("unexpected error: {other:?}"),
     }
 }
 
@@ -567,7 +597,8 @@ fn list_items_should_filter_window_agent_role_and_tools() {
     assert_eq!(unknown_window.item_count, 0);
     assert!(!unknown_window.truncated);
 
-    let error = block_on(service.list_items(
+    // 既不是内部 ID 也不是已持久别名的形状同样只是无匹配，不是参数错误
+    let opaque_window = block_on(service.list_items(
         &scope,
         &CodexHistoryListItemsQuery {
             filter: CodexHistoryFilterQuery {
@@ -578,8 +609,387 @@ fn list_items_should_filter_window_agent_role_and_tools() {
         },
         BUDGET,
     ))
-    .expect_err("malformed window id");
-    assert_invalid(error, "window_id");
+    .expect("opaque window value");
+    assert_eq!(opaque_window.item_count, 0);
+    assert!(opaque_window.items.is_empty());
+    assert_eq!(opaque_window.window_id.as_deref(), Some("thread-a"));
+
+    let error = block_on(service.list_items(
+        &scope,
+        &CodexHistoryListItemsQuery {
+            filter: CodexHistoryFilterQuery {
+                limit: Some(0),
+                ..CodexHistoryFilterQuery::default()
+            },
+            ..CodexHistoryListItemsQuery::default()
+        },
+        BUDGET,
+    ))
+    .expect_err("zero limit is still a real argument error");
+    assert_invalid(error, "limit");
+}
+
+/// 一次按窗口查询条目的调用；窗口值可以是内部 ID 或已持久保存的 context window UUID
+fn list_window(
+    service: &CodexHistoryService,
+    scope: &CodexHistoryScope<'_>,
+    window_id: &str,
+) -> CodexHistoryItemPage {
+    block_on(service.list_items(
+        scope,
+        &CodexHistoryListItemsQuery {
+            filter: CodexHistoryFilterQuery {
+                window_id: Some(window_id.to_owned()),
+                ..CodexHistoryFilterQuery::default()
+            },
+            ..CodexHistoryListItemsQuery::default()
+        },
+        BUDGET,
+    ))
+    .expect("window page")
+}
+
+fn search_window(
+    service: &CodexHistoryService,
+    scope: &CodexHistoryScope<'_>,
+    window_id: &str,
+    query: &str,
+) -> CodexHistoryItemPage {
+    block_on(service.search_contents(
+        scope,
+        &CodexHistorySearchQuery {
+            query: query.to_owned(),
+            filter: CodexHistoryFilterQuery {
+                window_id: Some(window_id.to_owned()),
+                ..CodexHistoryFilterQuery::default()
+            },
+        },
+        BUDGET,
+    ))
+    .expect("window search")
+}
+
+fn read_window(
+    service: &CodexHistoryService,
+    scope: &CodexHistoryScope<'_>,
+    window_id: &str,
+    item_id: &str,
+) -> CodexHistoryReadItemOutcome {
+    block_on(service.read_item(
+        scope,
+        &CodexHistoryReadQuery {
+            agent_name: None,
+            window_id: window_id.to_owned(),
+            item_id: item_id.to_owned(),
+            offset_chars: None,
+            limit_chars: None,
+        },
+        BUDGET,
+    ))
+    .expect("window read")
+}
+
+#[test]
+fn context_window_alias_should_answer_the_same_window_as_the_internal_id() {
+    let key = key();
+    let session = session_key();
+    let service = service(history(), Some(CodexSessionOrigin::Managed));
+    let scope = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+
+    // 官方客户端用 context window UUID 传窗口；它与内部 ID 指向同一份档案
+    assert_eq!(
+        list_window(&service, &scope, WINDOW_A0),
+        list_window(&service, &scope, "thread-a:0")
+    );
+    let by_alias = list_window(&service, &scope, WINDOW_A0);
+    assert_eq!(by_alias.item_count, 4);
+    assert_eq!(
+        by_alias.window_id.as_deref(),
+        Some("thread-a:0"),
+        "命中后的规范窗口身份仍是内部 ID"
+    );
+    assert!(
+        by_alias
+            .items
+            .iter()
+            .all(|item| item.window_id == "thread-a:0")
+    );
+
+    assert_eq!(
+        search_window(&service, &scope, WINDOW_A0, "same text"),
+        search_window(&service, &scope, "thread-a:0", "same text")
+    );
+    assert_eq!(
+        search_window(&service, &scope, WINDOW_A0, "same text").item_count,
+        2
+    );
+
+    let CodexHistoryReadItemOutcome::Read(by_alias_read) =
+        read_window(&service, &scope, WINDOW_A0, "msg_u1")
+    else {
+        panic!("alias read");
+    };
+    assert_eq!(
+        read_window(&service, &scope, WINDOW_A0, "msg_u1"),
+        read_window(&service, &scope, "thread-a:0", "msg_u1")
+    );
+    assert_eq!(by_alias_read.window_id, "thread-a:0");
+    assert_eq!(
+        read_window(&service, &scope, WINDOW_A0, "msg_u2"),
+        CodexHistoryReadItemOutcome::NotFound { window_found: true },
+        "别名解析后仍按该窗口的条目命中，不跨窗口兜底"
+    );
+
+    // 窗口目录仍只按内部 ID 列出，别名不新增目录项也不改条目数
+    let windows =
+        block_on(service.list_windows(&scope, &CodexHistoryWindowQuery::default(), BUDGET))
+            .expect("window directory");
+    assert_eq!(windows.total_windows, 2);
+    assert_eq!(windows.windows[0].window_id, "thread-a:0");
+    assert_eq!(windows.windows[0].item_count, 4);
+}
+
+#[test]
+fn every_persisted_window_alias_should_match_without_duplicating_the_directory() {
+    let key = key();
+    let session = session_key();
+    let service = service(history(), Some(CodexSessionOrigin::Managed));
+    let scope = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+
+    // 同一内部窗口恢复后再次推进会留下第二个 UUID；两个别名都必须命中
+    let current = list_window(&service, &scope, WINDOW_A0);
+    let rotated = list_window(&service, &scope, WINDOW_A0_ROTATED);
+    assert_eq!(rotated, current);
+    assert_eq!(rotated.item_count, 4);
+
+    let windows =
+        block_on(service.list_windows(&scope, &CodexHistoryWindowQuery::default(), BUDGET))
+            .expect("window directory");
+    assert_eq!(
+        windows.total_windows, 2,
+        "多个别名不重复窗口目录，也不因元数据展开增加条目数"
+    );
+    assert_eq!(
+        windows
+            .windows
+            .iter()
+            .map(|window| (window.window_id.as_str(), window.item_count))
+            .collect::<Vec<_>>(),
+        vec![("thread-a:0", 4), ("thread-a:1", 2)]
+    );
+}
+
+#[test]
+fn unknown_window_values_should_answer_empty_instead_of_every_window() {
+    let key = key();
+    let session = session_key();
+    let service = service(history(), Some(CodexSessionOrigin::Managed));
+    let scope = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+
+    for unknown in [
+        "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7eff",
+        "thread-a",
+        "thread-a:9",
+        "opaque-window-value",
+    ] {
+        let page = list_window(&service, &scope, unknown);
+        assert_eq!(page.item_count, 0, "unknown window `{unknown}`");
+        assert!(page.items.is_empty(), "unknown window `{unknown}`");
+        assert_eq!(page.window_id.as_deref(), Some(unknown));
+        assert_eq!(
+            search_window(&service, &scope, unknown, "same text").item_count,
+            0
+        );
+        assert_eq!(
+            read_window(&service, &scope, unknown, "msg_u1"),
+            CodexHistoryReadItemOutcome::NotFound {
+                window_found: false
+            }
+        );
+    }
+
+    // 未指定窗口仍是该 agent 的全部窗口
+    let all = block_on(service.list_items(&scope, &CodexHistoryListItemsQuery::default(), BUDGET))
+        .expect("all windows");
+    assert_eq!(all.item_count, 6);
+    assert_eq!(all.window_id, None);
+}
+
+#[test]
+fn window_alias_should_stay_inside_the_requested_agent_scope() {
+    let key = key();
+    let session = session_key();
+    let service = service(history(), Some(CodexSessionOrigin::Managed));
+    let root = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+    let worker = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root/worker",
+    };
+
+    // 根 agent 范围内不解析 worker 窗口的别名，也不解析 worker 的内部 ID
+    assert_eq!(list_window(&service, &root, WINDOW_B0).item_count, 0);
+    assert_eq!(list_window(&service, &root, "thread-b:0").item_count, 0);
+    assert_eq!(
+        read_window(&service, &root, WINDOW_B0, "msg_w1"),
+        CodexHistoryReadItemOutcome::NotFound {
+            window_found: false
+        }
+    );
+    // worker 范围内同样看不到根 agent 的窗口
+    assert_eq!(list_window(&service, &worker, WINDOW_A0).item_count, 0);
+    assert_eq!(list_window(&service, &worker, "thread-a:0").item_count, 0);
+    // 自己的别名正常命中
+    assert_eq!(list_window(&service, &worker, WINDOW_B0).item_count, 2);
+    assert_eq!(list_window(&service, &worker, "thread-b:0").item_count, 2);
+}
+
+#[test]
+fn ambiguous_alias_and_conflicting_window_agents_should_fail_protectively() {
+    let key = key();
+    let session = session_key();
+    let scope = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+
+    // 同一 agent 下两个内部窗口共享同一 UUID：不猜其中一个，也不合并档案
+    let mut ambiguous = history();
+    ambiguous
+        .windows
+        .push(aliased_window("thread-a:2", Some("/root"), 1, &[WINDOW_A0]));
+    ambiguous.items.push(item(
+        "thread-a:2",
+        8,
+        "msg_u3",
+        Some(CodexHistoryRole::User),
+        "message",
+        Some("third window"),
+        None,
+        None,
+    ));
+    let service_with_ambiguity = service(ambiguous, Some(CodexSessionOrigin::Managed));
+    let error = block_on(service_with_ambiguity.list_items(
+        &scope,
+        &CodexHistoryListItemsQuery {
+            filter: CodexHistoryFilterQuery {
+                window_id: Some(WINDOW_A0.to_owned()),
+                ..CodexHistoryFilterQuery::default()
+            },
+            ..CodexHistoryListItemsQuery::default()
+        },
+        BUDGET,
+    ))
+    .expect_err("ambiguous alias");
+    assert!(
+        matches!(error, CodexHistoryQueryError::AmbiguousWindowAlias),
+        "{error:?}"
+    );
+    let error = block_on(service_with_ambiguity.read_item(
+        &scope,
+        &CodexHistoryReadQuery {
+            agent_name: None,
+            window_id: WINDOW_A0.to_owned(),
+            item_id: "msg_u1".to_owned(),
+            offset_chars: None,
+            limit_chars: None,
+        },
+        BUDGET,
+    ))
+    .expect_err("ambiguous alias read");
+    assert!(
+        matches!(error, CodexHistoryQueryError::AmbiguousWindowAlias),
+        "{error:?}"
+    );
+    // 内部 ID 仍精确命中，歧义只影响别名
+    assert_eq!(
+        list_window(&service_with_ambiguity, &scope, "thread-a:0").item_count,
+        4
+    );
+
+    // 不同 agent 各自持有同名 UUID 不构成歧义：作用域内只有一个候选
+    let mut shared = history();
+    shared.windows[0] = aliased_window("thread-b:0", Some("/root/worker"), 2, &[WINDOW_A0]);
+    let service_with_shared = service(shared, Some(CodexSessionOrigin::Managed));
+    assert_eq!(
+        list_window(&service_with_shared, &scope, WINDOW_A0).item_count,
+        4
+    );
+
+    // 同一内部窗口的已持久元数据声明了两个 agent：不按最大值决定可读范围
+    let mut conflicting = history();
+    conflicting.windows[2] = aliased_window("thread-a:0", Some("/root"), 4, &[WINDOW_A0]);
+    conflicting.windows[2]
+        .metadata
+        .push(CodexHistoryWindowMetadata {
+            agent_name: Some("/root/worker".to_owned()),
+            context_window_id: Some(WINDOW_A0_ROTATED.to_owned()),
+        });
+    let service_with_conflict = service(conflicting, Some(CodexSessionOrigin::Managed));
+    let error = block_on(service_with_conflict.list_windows(
+        &scope,
+        &CodexHistoryWindowQuery::default(),
+        BUDGET,
+    ))
+    .expect_err("conflicting window agents");
+    assert!(
+        matches!(error, CodexHistoryQueryError::ConflictingWindowAgent),
+        "{error:?}"
+    );
+    let error = block_on(service_with_conflict.list_items(
+        &scope,
+        &CodexHistoryListItemsQuery::default(),
+        BUDGET,
+    ))
+    .expect_err("conflicting window agents");
+    assert!(
+        matches!(error, CodexHistoryQueryError::ConflictingWindowAgent),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn window_alias_lookup_should_report_storage_failures_instead_of_no_matches() {
+    let key = key();
+    let session = session_key();
+    let mut history = history();
+    history.unavailable = true;
+    let service = service(history, Some(CodexSessionOrigin::Managed));
+    let scope = CodexHistoryScope {
+        key_id: &key,
+        session_key: &session,
+        current_agent_name: "/root",
+    };
+    let error = block_on(service.list_items(
+        &scope,
+        &CodexHistoryListItemsQuery {
+            filter: CodexHistoryFilterQuery {
+                window_id: Some(WINDOW_A0.to_owned()),
+                ..CodexHistoryFilterQuery::default()
+            },
+            ..CodexHistoryListItemsQuery::default()
+        },
+        BUDGET,
+    ))
+    .expect_err("store failure is an error");
+    assert_store_unavailable(error);
 }
 
 #[test]
@@ -824,7 +1234,7 @@ fn output_budget_should_bound_page_size_and_content_bytes() {
     ));
     history
         .windows
-        .retain(|window| window.window.window_id.expose_to_store() != "thread-a:1");
+        .retain(|window| window.window_id.expose_to_store() != "thread-a:1");
     history.windows.push(window("thread-a:1", Some("/root"), 3));
     let service = service(history, Some(CodexSessionOrigin::Managed));
     let scope = CodexHistoryScope {

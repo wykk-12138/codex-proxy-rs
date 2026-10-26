@@ -19,7 +19,7 @@ use gateway_core::task::{
 use gateway_host::workers::{WorkerStartError, WorkerSupervisor};
 use tokio::sync::Notify;
 
-const ACTIVE_KINDS: [WorkerKind; 11] = [
+const ACTIVE_KINDS: [WorkerKind; 12] = [
     WorkerKind::OAuthRefresh,
     WorkerKind::QuotaCatalogHealth,
     WorkerKind::RuntimeSnapshotReconciliation,
@@ -31,6 +31,7 @@ const ACTIVE_KINDS: [WorkerKind; 11] = [
     WorkerKind::AccountImport,
     WorkerKind::AccountFreezeRecovery,
     WorkerKind::ResetCreditAutomation,
+    WorkerKind::CodexNotesDelivery,
 ];
 
 #[derive(Clone)]
@@ -816,6 +817,36 @@ fn registration_value(
         },
     )
     .expect("valid registration")
+}
+
+/// 未装配 native notes 端口时 provider 贡献明确禁用项；这样的完整计划必须仍能启动
+#[tokio::test]
+async fn notes_delivery_without_state_ports_stays_a_legal_disabled_kind() {
+    let leases = Arc::new(FakeLeasePort::default());
+    let supervisor = supervisor();
+    supervisor
+        .start(
+            complete_plan(vec![WorkerContribution::Disabled {
+                kind: WorkerKind::CodexNotesDelivery,
+                reason: WorkerDisabledReason::NotesDeliveryUnavailable,
+            }]),
+            leases.clone(),
+            Arc::new(RecordingDiagnostics::default()),
+        )
+        .expect("complete plan with a disabled notes delivery kind");
+    wait_until(|| leases.requests().len() >= ACTIVE_KINDS.len() - 1).await;
+    let snapshot = supervisor.health_source().snapshot();
+    assert!(snapshot.iter().any(|state| {
+        state.key == WorkerHealthKey::Disabled(WorkerKind::CodexNotesDelivery)
+            && state.state == WorkerRuntimeState::Disabled
+    }));
+    assert!(
+        leases
+            .requests()
+            .iter()
+            .all(|request| request.worker().kind() != WorkerKind::CodexNotesDelivery)
+    );
+    supervisor.shutdown(Duration::from_secs(1)).await;
 }
 
 fn complete_plan(mut custom: Vec<WorkerContribution>) -> Vec<WorkerContribution> {

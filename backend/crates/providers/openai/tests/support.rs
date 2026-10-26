@@ -17,6 +17,7 @@ use gateway_core::account::{
     QuotaWriteOutcome,
 };
 use gateway_core::error::{StoreError, StoreErrorKind};
+use gateway_core::lifecycle::REQUEST_LEASE_TTL;
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     CodexSessionClaim, CodexSessionClaimOutcome, CodexSessionOwnershipPort,
@@ -33,6 +34,7 @@ use provider_openai::credential::{
     ImportCodexOAuthCredential,
 };
 use secrecy::SecretString;
+use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone)]
 struct StoredAccount {
@@ -685,9 +687,37 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
     .with_request_location(current.request_location().cloned())
 }
 
+/// 受控租约端口记录的一次账号槽位占用
+///
+/// `expires_at` 按请求 deadline 建模 Redis TTL：到期即视为槽位可被其他会话重新取得，
+/// 因此断言的是“槽位是否仍然有效”，而不是 guard 对象是否存活
+#[derive(Clone)]
+pub(crate) struct RecordedSchedulingLease {
+    pub(crate) account_id: ProviderAccountId,
+    pub(crate) expires_at: SystemTime,
+    pub(crate) cancellation: gateway_core::lifecycle::CancellationToken,
+    /// guard 释放时据此移除同一条占用
+    sequence: u64,
+}
+
+impl RecordedSchedulingLease {
+    /// 该时刻槽位是否仍被这次占用覆盖
+    pub(crate) fn covers(&self, at: SystemTime) -> bool {
+        self.expires_at > at
+    }
+
+    /// 从该时刻起还剩多少有效期
+    pub(crate) fn remaining_at(&self, at: SystemTime) -> Duration {
+        self.expires_at.duration_since(at).unwrap_or(Duration::ZERO)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TestLeaseCoordinator {
     pub(crate) requests: Mutex<Vec<ProviderSchedulingLeaseRequest>>,
+    /// 仍被占用的槽位；guard 释放即移除，模拟异步尽力释放后的可再取得状态
+    held: Arc<Mutex<Vec<RecordedSchedulingLease>>>,
+    next_lease_sequence: Arc<Mutex<u64>>,
     pub(crate) busy: Mutex<bool>,
     pub(crate) busy_accounts: Mutex<BTreeSet<ProviderAccountId>>,
     pub(crate) signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
@@ -701,14 +731,40 @@ impl TestLeaseCoordinator {
     pub(crate) fn live_leases(&self) -> usize {
         self.live_leases.load(Ordering::SeqCst)
     }
+
+    /// 仍被占用的槽位快照；按 deadline 建模 TTL 到期
+    pub(crate) fn held(&self) -> Vec<RecordedSchedulingLease> {
+        let now = SystemTime::now();
+        self.held
+            .lock()
+            .expect("held leases lock")
+            .iter()
+            .filter(|lease| lease.covers(now))
+            .cloned()
+            .collect()
+    }
+
+    /// 最近一次仍有效的槽位占用
+    pub(crate) fn latest_held(&self) -> Option<RecordedSchedulingLease> {
+        self.held().pop()
+    }
 }
 
-/// 在 guard 销毁时递减占用计数，用来断言临时租约没有遗留
-struct TestLeaseGuard(Arc<AtomicUsize>);
+/// 在 guard 销毁时递减占用计数并移除槽位占用，用来断言租约没有遗留
+struct TestLeaseGuard {
+    live: Arc<AtomicUsize>,
+    held: Arc<Mutex<Vec<RecordedSchedulingLease>>>,
+    sequence: u64,
+}
 
 impl Drop for TestLeaseGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        // 与 Redis 的异步尽力释放对应：内存端口立即移除，TTL 只是兜底
+        self.held
+            .lock()
+            .expect("held leases lock")
+            .retain(|lease| lease.sequence != self.sequence);
     }
 }
 
@@ -772,6 +828,10 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                 .lock()
                 .expect("busy account lock")
                 .contains(request.account_id());
+            // 取出建模 TTL 与续期所需的事实，再把请求本身留作记录
+            let account_id = request.account_id().clone();
+            let ttl = request.deadline().bounded(REQUEST_LEASE_TTL);
+            let cancellation = request.cancellation();
             self.requests
                 .lock()
                 .expect("lease requests lock")
@@ -781,9 +841,35 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                     retry_after: Some(Duration::from_millis(25)),
                 })
             } else {
+                // 与 Store 一致：TTL 由请求 deadline 决定，到期即失去槽位
+                let expires_at = SystemTime::now()
+                    .checked_add(ttl)
+                    .expect("lease expiry fits the clock");
+                let sequence = {
+                    let mut next = self
+                        .next_lease_sequence
+                        .lock()
+                        .expect("lease sequence lock");
+                    let sequence = *next;
+                    *next += 1;
+                    sequence
+                };
+                self.held
+                    .lock()
+                    .expect("held leases lock")
+                    .push(RecordedSchedulingLease {
+                        account_id,
+                        expires_at,
+                        cancellation,
+                        sequence,
+                    });
                 self.live_leases.fetch_add(1, Ordering::SeqCst);
                 Ok(ProviderLeaseAcquisition::Acquired(Box::new(
-                    TestLeaseGuard(self.live_leases.clone()),
+                    TestLeaseGuard {
+                        live: self.live_leases.clone(),
+                        held: self.held.clone(),
+                        sequence,
+                    },
                 )))
             }
         })
@@ -980,6 +1066,10 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
 pub(crate) struct MemoryCodexSessions {
     owners: Mutex<BTreeMap<(String, String), ProviderAccountId>>,
     claims: Mutex<Vec<CodexSessionClaim>>,
+    /// 认领写入之后停顿的闸门：用于把准备阶段暂停在“已取得租约”之后
+    claim_gate: Mutex<Option<Arc<Gate>>>,
+    /// 认领期间的受控准备耗时：在暂停时钟下按 tokio 计时器等待
+    claim_delay: Mutex<Option<Duration>>,
     conflict_with: Mutex<Option<ProviderAccountId>>,
     identity_changed: AtomicBool,
     identity_changed_once: AtomicBool,
@@ -1021,6 +1111,30 @@ impl MemoryCodexSessions {
         self.claims.lock().expect("session claim lock").clone()
     }
 
+    /// 让认领在写入归属之后停在闸门内，模拟“取得租约之后”的异步准备等待
+    pub(crate) fn gate_claims(&self, gate: &Arc<Gate>) {
+        *self.claim_gate.lock().expect("claim gate lock") = Some(Arc::clone(gate));
+    }
+
+    /// 让认领在暂停时钟下等待给定耗时：用于验证不同接管路径的准备期限
+    ///
+    /// 等待结束即恢复真实时钟，避免自动推进影响后续 loopback 握手
+    pub(crate) fn delay_claims(&self, delay: Duration) {
+        *self.claim_delay.lock().expect("claim delay lock") = Some(delay);
+    }
+
+    async fn enter_claim_gate(&self) {
+        let gate = self.claim_gate.lock().expect("claim gate lock").clone();
+        if let Some(gate) = gate {
+            gate.enter().await;
+        }
+        let delay = *self.claim_delay.lock().expect("claim delay lock");
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+            tokio::time::resume();
+        }
+    }
+
     /// 下一次认领报告已有并发赢家，并补写赢家的归属行
     pub(crate) fn conflict_with(&self, owner: ProviderAccountId) {
         *self.conflict_with.lock().expect("session claim lock") = Some(owner);
@@ -1060,6 +1174,7 @@ impl CodexSessionOwnershipPort for MemoryCodexSessions {
                 .lock()
                 .expect("session claim lock")
                 .push(claim.clone());
+            self.enter_claim_gate().await;
             if self.identity_changed.load(Ordering::SeqCst)
                 || self.identity_changed_once.swap(false, Ordering::SeqCst)
             {
@@ -1095,6 +1210,62 @@ impl CodexSessionOwnershipPort for MemoryCodexSessions {
                 }
             }
         })
+    }
+}
+
+/// 受控等待的定向超时：正常路径毫秒级返回，超时即说明测试没有继续驱动工作
+pub(crate) const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 只在被测代码到达指定位置时放行，不用 sleep 猜时序
+pub(crate) struct Gate {
+    entered: AtomicUsize,
+    signal: Notify,
+    release: Semaphore,
+}
+
+impl Gate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            signal: Notify::new(),
+            release: Semaphore::new(0),
+        })
+    }
+
+    pub(crate) async fn enter(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.signal.notify_waiters();
+        let permit = self.release.acquire().await.expect("gate is open");
+        // 放行是一次性的：许可不能被归还给下一个进入者
+        permit.forget();
+    }
+
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// 等待达到指定进入数；超时只用于把“有人没被驱动”变成可定位失败
+    pub(crate) async fn wait(&self, count: usize) {
+        tokio::time::timeout(GATE_WAIT_TIMEOUT, async {
+            loop {
+                let notified = self.signal.notified();
+                if self.entered() >= count {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "gate wait timed out: expected {count} entrances, observed {}",
+                self.entered()
+            )
+        });
+    }
+
+    pub(crate) fn release(&self, count: usize) {
+        self.release.add_permits(count);
     }
 }
 

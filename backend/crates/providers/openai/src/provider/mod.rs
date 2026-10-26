@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use gateway_core::account::{AccountFeedbackStats, ProviderAccount};
 use gateway_core::engine::codex_history::CodexHistoryService;
-use gateway_core::engine::codex_notes::CodexNotesService;
+use gateway_core::engine::codex_notes::{CodexNotesService, CodexNotesSessionExpectation};
 use gateway_core::engine::continuation::{ContinuationBinding, NativeContinuationScope};
 use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_core::engine::provider::{
@@ -34,9 +34,7 @@ use gateway_core::operation::{
     CapabilityRequirements, GenerateRequest, ImageRequest, ImageRequestKind, Operation,
     OperationKind, ProviderSessionState, StandaloneSearchRequest,
 };
-use gateway_core::provider_ports::{
-    CodexNotesPublishOutcome, CodexSessionOrigin, ProviderSessionAffinityKey,
-};
+use gateway_core::provider_ports::{CodexNotesPublishOutcome, ProviderSessionAffinityKey};
 use gateway_core::routing::{
     ModelCapabilities, ModelPresentation, ProviderCandidate, ProviderCatalogGeneration,
     ProviderKind, ProviderModelCapabilities, UpstreamModelId,
@@ -63,8 +61,9 @@ use crate::credential::{
     CodexAccountFailure, CodexCredentialCatalogError, CodexCredentialCatalogService,
     CodexCredentialLease, CodexCredentialQuotaService, CodexCredentialRefreshOutcome,
     CodexCredentialRefreshService, CodexCredentialRepository, CodexCredentialSelector,
-    CodexCyberPolicyScope, CodexQuotaRefreshPolicy, CodexSessionAffinity, CredentialSelectionError,
-    RuntimeCodexCookie, SelectCodexCredential, SelectCodexProviderEndpointCredential,
+    CodexCyberPolicyScope, CodexQuotaRefreshPolicy, CodexSessionAffinity,
+    CodexSessionMigrationExpectation, CredentialSelectionError, RuntimeCodexCookie,
+    SelectCodexCredential, SelectCodexProviderEndpointCredential,
     derive_codex_cyber_policy_session_key, derive_codex_endpoint_session_affinity,
     derive_codex_session_affinity, derive_codex_transport_key,
     derive_endpoint_affinity_with_headers, derive_live_session_affinity,
@@ -115,6 +114,7 @@ mod execution;
 pub(crate) mod failure;
 mod live;
 mod native;
+mod notes_delivery;
 mod observation;
 mod upstream_adapter;
 mod workers;
@@ -126,6 +126,10 @@ use execution::*;
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
 use native::notes_coordination_error;
+use notes_delivery::CodexNotesDelivery;
+#[doc(hidden)]
+pub use notes_delivery::notes_delivery_registration;
+pub use notes_delivery::{CodexNotesDeliveryTask, NOTES_DELIVERY_LEASE_BUDGET};
 use observation::*;
 pub(crate) use workers::worker_contributions;
 
@@ -175,6 +179,8 @@ pub struct CodexProvider {
     native_history: Option<Arc<CodexHistoryService>>,
     /// notes 操作日志、已发布副本域映射与按序重建；未装配时完全保持既有转发行为
     native_notes: Option<Arc<CodexNotesService>>,
+    /// managed notes 写的受监督交付 owner；与 `native_notes` 同时装配
+    notes_delivery: Option<Arc<CodexNotesDelivery>>,
 }
 
 struct PreparedGenerateRequest {
@@ -369,6 +375,7 @@ impl CodexProvider {
             native_token_client: None,
             native_history: None,
             native_notes: None,
+            notes_delivery: None,
         })
     }
 
@@ -383,10 +390,13 @@ impl CodexProvider {
 
     /// 装配 notes 会话顺序、日志与重建协调
     ///
-    /// 同一实例由组合根交给 notes 辅助与切换入口；每请求另建实例会让会话互斥失效
+    /// 同一实例由组合根交给 notes 辅助与切换入口；每请求另建实例会让会话互斥失效。
+    /// managed 写的交付 owner 随之装配：写入一旦交接就由 Host 监督的任务持有，
+    /// 不再随调用方取消或 future 丢弃失去观察
     #[must_use]
     pub fn with_native_notes(mut self, notes: Arc<CodexNotesService>) -> Self {
-        self.native_notes = Some(notes);
+        self.native_notes = Some(Arc::clone(&notes));
+        self.notes_delivery = Some(CodexNotesDelivery::new());
         self
     }
 
@@ -731,12 +741,14 @@ impl Provider for CodexProvider {
                 )
             });
         // 只有已 managed 且装配了 notes 重建能力的会话才允许把持久 owner 迁到新账号；
-        // legacy、未判定与未装配存储保持永久归属
+        // legacy、未判定与未装配存储保持永久归属。观测到的 owner 与代次随选号携带，
+        // 锁内重建前再复验，避免并发请求用过期的迁移意图重复重放与发布
         let session_owner_migration = match selection_session_affinity.as_ref() {
             Some(affinity) if context.codex_session_pool() => {
-                self.session_owner_can_migrate(&context, affinity).await?
+                self.session_migration_expectation(&context, affinity)
+                    .await?
             }
-            _ => false,
+            _ => None,
         };
         let selection_started_at = Instant::now();
         let selection = async {
@@ -1216,20 +1228,25 @@ impl CodexProvider {
     /// 已托管会话可在持久 owner 明确额度耗尽时换号
     ///
     /// 与 notes 辅助共用同一条会话状态事实；未装配 notes 时无法重建，也不迁移
-    /// legacy 与未判定会话保持永久归属
-    async fn session_owner_can_migrate(
+    /// legacy 与未判定会话保持永久归属。返回的快照是选号时的预期，不是授权结论：
+    /// 选号仍要核实当前 owner 与实际额度，重建还要在会话锁内复验 owner 与代次
+    async fn session_migration_expectation(
         &self,
         context: &AttemptContext,
         affinity: &CodexSessionAffinity,
-    ) -> Result<bool, ProviderError> {
+    ) -> Result<Option<CodexSessionMigrationExpectation>, ProviderError> {
         let Some(service) = self.native_notes.as_deref() else {
-            return Ok(false);
+            return Ok(None);
         };
-        let domain = service
-            .domain(context.client_api_key_ref(), affinity.key())
+        let expected = service
+            .migration_expectation(context.client_api_key_ref(), affinity.key())
             .await
             .map_err(|error| notes_coordination_error(error, UpstreamSendState::NotSent))?;
-        Ok(domain.is_some_and(|domain| domain.origin == CodexSessionOrigin::Managed))
+        Ok(expected.map(|expected| CodexSessionMigrationExpectation {
+            owner: expected.owner,
+            generation: expected.generation,
+            session_key: affinity.key().clone(),
+        }))
     }
 
     /// 在目标账号发送前重建 notes 并发布新 owner 与新域
@@ -1259,6 +1276,10 @@ impl CodexProvider {
                 &migration.session_key,
                 &target,
                 credential_revision,
+                &CodexNotesSessionExpectation {
+                    owner: migration.from.clone(),
+                    generation: migration.from_generation,
+                },
             )
             .await?;
         match outcome {
@@ -1271,16 +1292,16 @@ impl CodexProvider {
                     "OpenAI managed session migrated with rebuilt notes"
                 );
             }
-            // 并发请求已把同一个目标发布到更新的代次，域已就绪
-            CodexNotesPublishOutcome::GenerationChanged(state) if state.owner == target => {
+            // 同一目标账号也不代表原租约、凭据版本与作用域仍有效：旧 attempt 一律拒绝，
+            // 零模型发送；客户端重试时按当时 owner 重新准备，不在这里复用旧成功结论
+            CodexNotesPublishOutcome::GenerationChanged(state) => {
                 tracing::info!(
                     request_id = context.request_id().as_str(),
                     account_id = %target,
+                    current_owner = %state.owner,
                     session_generation = state.generation,
-                    "OpenAI managed session migration was published concurrently"
+                    "OpenAI managed session migration intent was stale"
                 );
-            }
-            CodexNotesPublishOutcome::GenerationChanged(_) => {
                 return Err(
                     migration_publish_error("replay_generation_changed").with_retry_prohibited()
                 );

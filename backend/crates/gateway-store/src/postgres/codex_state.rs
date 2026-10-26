@@ -12,12 +12,12 @@ use gateway_core::{
     provider_ports::{
         CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
         CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem,
-        CodexHistoryStoredWindow, CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion,
-        CodexNotesGeneration, CodexNotesOperation, CodexNotesOperationKind,
-        CodexNotesOperationStatus, CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay,
-        CodexNotesReplica, CodexSessionContentPort, CodexSessionOrigin, CodexSessionState,
-        CodexSessionStatePort, NewCodexNotesOperation, ProviderSessionAffinityKey,
-        ProviderStoreError, ProviderStoreErrorKind,
+        CodexHistoryStoredWindow, CodexHistoryWindow, CodexHistoryWindowMetadata,
+        CodexNativeWindowId, CodexNotesCompletion, CodexNotesGeneration, CodexNotesOperation,
+        CodexNotesOperationKind, CodexNotesOperationStatus, CodexNotesPublish,
+        CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica, CodexSessionContentPort,
+        CodexSessionOrigin, CodexSessionState, CodexSessionStatePort, NewCodexNotesOperation,
+        ProviderSessionAffinityKey, ProviderStoreError, ProviderStoreErrorKind,
     },
 };
 use sqlx::{PgPool, Postgres, Transaction, types::Json};
@@ -703,30 +703,61 @@ impl CodexSessionContentPort for PgCodexSessionState {
         session_key: &'a ProviderSessionAffinityKey,
     ) -> BoxFuture<'a, Result<Vec<CodexHistoryStoredWindow>, ProviderStoreError>> {
         Box::pin(async move {
-            let rows: Vec<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
-                "select window_id, max(agent_name), max(context_window_id), count(*)
-                 from client_api_key_codex_history_items
-                 where key_id = $1 and session_key = $2
-                 group by window_id
-                 order by min(ordinal)",
+            // 目录与条目数只来自已落库条目；响应锚与发送前快照只补充同一窗口的
+            // 已持久元数据，因此不能创建目录项也不能影响计数
+            // union 按 (window_id, agent_name, context_window_id) 去重，同一窗口的
+            // 多个 UUID 分别保留，不取最大值拼出不存在的组合
+            let rows: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+                "with item_windows as (
+                   select window_id, count(*) as item_count, min(ordinal) as first_ordinal
+                   from client_api_key_codex_history_items
+                   where key_id = $1 and session_key = $2
+                   group by window_id
+                 ), window_metadata as (
+                   select window_id, agent_name, context_window_id
+                   from client_api_key_codex_history_items
+                   where key_id = $1 and session_key = $2
+                   union
+                   select window_id, agent_name, context_window_id
+                   from client_api_key_codex_history_responses
+                   where key_id = $1 and session_key = $2
+                   union
+                   select window_id, agent_name, context_window_id
+                   from client_api_key_codex_history_pending_inputs
+                   where key_id = $1 and session_key = $2
+                 )
+                 select item_windows.window_id, item_windows.item_count,
+                        window_metadata.agent_name, window_metadata.context_window_id
+                 from item_windows
+                 join window_metadata on window_metadata.window_id = item_windows.window_id
+                 order by item_windows.first_ordinal, window_metadata.agent_name nulls first,
+                          window_metadata.context_window_id nulls first",
             )
             .bind(key_id.as_str())
             .bind(session_key.expose_to_store())
             .fetch_all(&self.pool)
             .await
             .map_err(|source| unavailable("load Codex history windows", source))?;
-            rows.into_iter()
-                .map(|(window_id, agent_name, context_window_id, item_count)| {
-                    Ok(CodexHistoryStoredWindow {
-                        window: CodexHistoryWindow {
-                            window_id: CodexNativeWindowId::try_new(window_id)?,
-                            agent_name,
-                            context_window_id,
-                        },
+            let mut windows: Vec<CodexHistoryStoredWindow> = Vec::new();
+            for (window_id, item_count, agent_name, context_window_id) in rows {
+                let window_id = CodexNativeWindowId::try_new(window_id)?;
+                let metadata = CodexHistoryWindowMetadata {
+                    agent_name,
+                    context_window_id,
+                };
+                // 条目序号在会话内唯一，同一窗口的行按首条序号连续排列
+                match windows.last_mut() {
+                    Some(window) if window.window_id == window_id => {
+                        window.metadata.push(metadata);
+                    }
+                    _ => windows.push(CodexHistoryStoredWindow {
                         item_count: non_negative(item_count, "load Codex history windows")?,
-                    })
-                })
-                .collect()
+                        window_id,
+                        metadata: vec![metadata],
+                    }),
+                }
+            }
+            Ok(windows)
         })
     }
 

@@ -45,7 +45,7 @@ use gateway_core::routing::{
     ProviderModel, PublicModelId, RoutingContext, RuntimeAccount, RuntimeAccountDirectory,
     RuntimeSnapshot, UpstreamModelId,
 };
-use gateway_core::task::{WorkerContribution, WorkerKind, WorkerRunnable};
+use gateway_core::task::{WorkerContribution, WorkerDisabledReason, WorkerKind, WorkerRunnable};
 use provider_openai::config::OpenAiConfig;
 use provider_openai::credential::{CodexCredentialCodec, ImportCodexOAuthCredential};
 use provider_openai::transport::profile::APPCAST_POLL_INTERVAL;
@@ -164,7 +164,22 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    assert_eq!(contributions.len(), 8);
+    // 未装配 native notes 端口时该类别贡献明确的禁用项，而不是缺席
+    assert_eq!(contributions.len(), 9);
+    let disabled = contributions
+        .iter()
+        .find_map(|contribution| match contribution {
+            WorkerContribution::Disabled { kind, reason } => Some((*kind, *reason)),
+            WorkerContribution::Registration(_) => None,
+        })
+        .expect("notes delivery is disabled without native notes ports");
+    assert_eq!(
+        disabled,
+        (
+            WorkerKind::CodexNotesDelivery,
+            WorkerDisabledReason::NotesDeliveryUnavailable
+        )
+    );
     assert!(
         contributions
             .iter()

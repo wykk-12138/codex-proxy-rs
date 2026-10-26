@@ -567,11 +567,28 @@ impl fmt::Debug for CodexHistoryStoredItem {
     }
 }
 
+/// 一条已落库记录声明的窗口元数据
+///
+/// agent 与 context window UUID 来自同一条记录，必须成对保留：
+/// 同一内部窗口恢复后再次推进可能保存多个 UUID，分别取最大值会拼出不存在的组合
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexHistoryWindowMetadata {
+    /// 官方 metadata 声明的 agent；None 表示未声明
+    pub agent_name: Option<String>,
+    /// 官方独立的 context window UUID，与窗口 ID 不是同一值
+    pub context_window_id: Option<String>,
+}
+
 /// 已落库的逻辑窗口目录
+///
+/// 目录、顺序与条目数只由已落库条目定义；元数据集合另外合并条目、响应锚与
+/// 发送前快照中同一窗口的已持久事实，只用于解析查询别名，不参与计数
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexHistoryStoredWindow {
-    pub window: CodexHistoryWindow,
+    pub window_id: CodexNativeWindowId,
     pub item_count: u64,
+    /// 去重的已持久窗口元数据；空集表示该窗口没有声明 agent 与 UUID
+    pub metadata: Vec<CodexHistoryWindowMetadata>,
 }
 
 /// 会话状态与切换发布的持久事实
@@ -676,6 +693,10 @@ pub trait CodexSessionContentPort: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<CodexHistoryPendingInput>, ProviderStoreError>>;
 
     /// 读取会话的窗口目录及条目数；过滤与排序预算由查询方实现
+    ///
+    /// 目录与条目数只由已落库条目定义；每个窗口附带条目、响应锚与发送前快照中
+    /// 已持久保存的去重窗口元数据，供查询解析 context window UUID 别名
+    /// 元数据集合不增加窗口或条目数，也不能为没有条目的窗口创建目录项
     fn load_history_windows<'a>(
         &'a self,
         key_id: &'a ClientApiKeyId,

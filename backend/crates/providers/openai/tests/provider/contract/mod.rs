@@ -76,7 +76,7 @@ use provider_openai::credential::{
 };
 use provider_openai::transport::CodexWebSocketPool;
 use provider_openai::transport::profile::{CodexWireProfile, CodexWireProfileState};
-use provider_openai::{CodexProvider, OFFICIAL_CODEX_BASE_URL};
+use provider_openai::{CodexNotesDeliveryTask, CodexProvider, OFFICIAL_CODEX_BASE_URL};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -1332,6 +1332,43 @@ fn provider_and_quota_with_codex_sessions(
     Arc<CodexCredentialQuotaService>,
     Arc<CodexWebSocketPool>,
 ) {
+    let (provider, quota, pool, notes_delivery) = build_provider_with_codex_sessions(
+        store,
+        session_affinity,
+        base_url,
+        leases,
+        stream_max_retries,
+        cooldowns,
+        policy,
+        codex_sessions,
+        native_history,
+        native_notes,
+    );
+    // notes 交付 owner 由 Host 监督；测试在此登记同一任务，交接与观察与生产一致
+    if let Some(task) = notes_delivery {
+        spawn_notes_delivery(task, CancellationToken::new());
+    }
+    (Arc::new(provider), quota, pool)
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_provider_with_codex_sessions(
+    store: &Arc<MemoryAccountStore>,
+    session_affinity: Arc<MemorySessionAffinity>,
+    base_url: String,
+    leases: Arc<TestLeaseCoordinator>,
+    stream_max_retries: u32,
+    cooldowns: Arc<MemoryCooldownPort>,
+    policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
+    codex_sessions: Option<Arc<dyn CodexSessionOwnershipPort>>,
+    native_history: Option<Arc<CodexHistoryService>>,
+    native_notes: Option<Arc<CodexNotesService>>,
+) -> (
+    CodexProvider,
+    Arc<CodexCredentialQuotaService>,
+    Arc<CodexWebSocketPool>,
+    Option<CodexNotesDeliveryTask>,
+) {
     let profile = wire_profile();
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -1387,10 +1424,46 @@ fn provider_and_quota_with_codex_sessions(
         Some(notes) => provider.with_native_notes(notes),
         None => provider,
     };
-    (Arc::new(provider), quota, websocket_pool)
+    let notes_delivery = provider.notes_delivery_task();
+    (provider, quota, websocket_pool, notes_delivery)
 }
 
-/// 池模式并装配原生 history；其余构造与既有池用例一致
+/// 在当前测试运行时登记 notes 交付任务，替代 Host 的监督循环
+///
+/// 传入的取消即 Host 的关闭信号：取消后交付 owner 关闭接收 gate 并观察在途工作
+pub(super) fn spawn_notes_delivery(
+    task: CodexNotesDeliveryTask,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let context = gateway_core::task::WorkerDaemonContext::new(cancellation);
+        let _ = gateway_core::task::DaemonTask::run(&task, context).await;
+    })
+}
+
+/// 装配 notes 但不登记交付任务：由测试自己决定何时启动与关闭
+pub(super) fn provider_and_notes_delivery_task(
+    store: &Arc<MemoryAccountStore>,
+    sessions: Arc<MemoryCodexSessions>,
+    base_url: String,
+    leases: Arc<TestLeaseCoordinator>,
+    notes: Arc<CodexNotesService>,
+) -> (Arc<CodexProvider>, Option<CodexNotesDeliveryTask>) {
+    let (provider, _, _, notes_delivery) = build_provider_with_codex_sessions(
+        store,
+        Arc::new(MemorySessionAffinity::default()),
+        base_url,
+        leases,
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
+        Arc::new(MemoryCooldownPort::new()),
+        crate::support::runtime_policy(),
+        Some(sessions),
+        None,
+        Some(notes),
+    );
+    (Arc::new(provider), notes_delivery)
+}
+
 /// 池模式并装配原生 notes；其余构造与既有池用例一致
 pub(super) fn provider_with_codex_sessions_and_native_notes(
     store: &Arc<MemoryAccountStore>,

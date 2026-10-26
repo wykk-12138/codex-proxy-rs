@@ -14,8 +14,8 @@ use gateway_core::{
     policy::ClientApiKeyId,
     provider_ports::{
         CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
-        CodexHistoryRole, CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion,
-        CodexNotesGeneration, CodexNotesOperation, CodexNotesOperationKind,
+        CodexHistoryRole, CodexHistoryWindow, CodexHistoryWindowMetadata, CodexNativeWindowId,
+        CodexNotesCompletion, CodexNotesGeneration, CodexNotesOperation, CodexNotesOperationKind,
         CodexNotesOperationStatus, CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay,
         CodexNotesReplica, CodexSessionClaim, CodexSessionClaimOutcome,
         CodexSessionContentPort as _, CodexSessionOrigin, CodexSessionOwnershipPort as _,
@@ -656,8 +656,16 @@ async fn history_items_keep_original_objects_order_and_response_anchors() {
 
     let windows = store.load_history_windows(&key_id, &session).await.unwrap();
     assert_eq!(windows.len(), 1);
-    assert_eq!(windows[0].window, window);
+    assert_eq!(windows[0].window_id, window.window_id);
     assert_eq!(windows[0].item_count, 5);
+    // 条目与响应锚声明同一份元数据，投影只保留一份
+    assert_eq!(
+        windows[0].metadata,
+        vec![CodexHistoryWindowMetadata {
+            agent_name: window.agent_name.clone(),
+            context_window_id: window.context_window_id.clone(),
+        }]
+    );
 
     let anchor = store
         .load_history_response(&key_id, &session, "resp_1")
@@ -921,6 +929,188 @@ async fn pending_history_input_keeps_the_latest_logical_input_per_window() {
             .unwrap(),
         None
     );
+    database.close().await;
+}
+
+/// 窗口目录只由条目定义；条目、响应锚与发送前快照里的 UUID 都保留为别名
+#[tokio::test]
+async fn history_window_aliases_keep_every_persisted_uuid_without_changing_counts() {
+    const FIRST: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e80";
+    const SECOND: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e81";
+    const THIRD: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e82";
+    const UNLISTED: &str = "0193f0b7-1d2a-7c31-9b0e-2a3f5c6d7e83";
+    let Some(database) = TestDatabase::create("codex_state_history_aliases").await else {
+        return;
+    };
+    let key_id = create_key(&database, "key_state_history_aliases").await;
+    let other_key_id = create_key(&database, "key_state_history_aliases_other").await;
+    let session = session_key("session-history-aliases");
+    let other_session = session_key("session-history-aliases-other");
+    let store = PgCodexSessionState::new(database.pool.clone());
+
+    store
+        .commit_history_request(&CodexHistoryRequest {
+            key_id: key_id.clone(),
+            session_key: session.clone(),
+            window: history_window_with_context("thread-alias", 0, FIRST),
+            previous_response_id: None,
+            items: vec![history_item(
+                "item_alias",
+                Some(CodexHistoryRole::User),
+                "message",
+                r#"{"type":"message","role":"user"}"#,
+                Some("hello"),
+            )],
+        })
+        .await
+        .unwrap();
+    // 恢复后同一内部窗口换成第二个 UUID：已知条目不再新增，只留下发送前快照
+    store
+        .save_history_pending_input(
+            &key_id,
+            &session,
+            &CodexHistoryPendingInput {
+                window: history_window_with_context("thread-alias", 0, SECOND),
+                previous_response_id: None,
+                input: vec!["item_alias".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+    // 零输出响应只建立锚，锚上保存的是第二个 UUID
+    store
+        .commit_history_response(&CodexHistoryResponse {
+            key_id: key_id.clone(),
+            session_key: session.clone(),
+            response_id: "resp_alias".to_owned(),
+            window: history_window_with_context("thread-alias", 0, SECOND),
+            previous_response_id: None,
+            input: vec!["item_alias".to_owned()],
+            items: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let windows = store.load_history_windows(&key_id, &session).await.unwrap();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window_id.expose_to_store(), "thread-alias:0");
+    assert_eq!(windows[0].item_count, 1, "别名集合不改变条目数");
+    assert_eq!(
+        windows[0].metadata,
+        vec![window_metadata(FIRST), window_metadata(SECOND),],
+        "条目、响应锚与快照中的 UUID 分别保留且不重复"
+    );
+
+    // 快照被后续请求覆盖后，旧锚上的别名仍然有效
+    store
+        .save_history_pending_input(
+            &key_id,
+            &session,
+            &CodexHistoryPendingInput {
+                window: history_window_with_context("thread-alias", 0, THIRD),
+                previous_response_id: Some("resp_alias".to_owned()),
+                input: vec!["item_alias".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+    let windows = store.load_history_windows(&key_id, &session).await.unwrap();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].item_count, 1);
+    assert_eq!(
+        windows[0].metadata,
+        vec![
+            window_metadata(FIRST),
+            window_metadata(SECOND),
+            window_metadata(THIRD),
+        ]
+    );
+
+    // 没有条目的窗口只能有锚与快照：不能据此创建目录项
+    store
+        .commit_history_response(&CodexHistoryResponse {
+            key_id: key_id.clone(),
+            session_key: session.clone(),
+            response_id: "resp_unlisted".to_owned(),
+            window: history_window_with_context("thread-alias", 1, UNLISTED),
+            previous_response_id: None,
+            input: Vec::new(),
+            items: Vec::new(),
+        })
+        .await
+        .unwrap();
+    store
+        .save_history_pending_input(
+            &key_id,
+            &session,
+            &CodexHistoryPendingInput {
+                window: history_window_with_context("thread-alias", 1, UNLISTED),
+                previous_response_id: None,
+                input: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let windows = store.load_history_windows(&key_id, &session).await.unwrap();
+    assert_eq!(windows.len(), 1, "只有锚的窗口不进入目录");
+    assert!(
+        windows[0]
+            .metadata
+            .iter()
+            .all(|metadata| metadata.context_window_id.as_deref() != Some(UNLISTED)),
+        "只有锚的窗口不贡献别名"
+    );
+
+    // Key 与逻辑会话都参与隔离：其它作用域的同名窗口不贡献别名
+    store
+        .commit_history_request(&CodexHistoryRequest {
+            key_id: other_key_id.clone(),
+            session_key: session.clone(),
+            window: history_window_with_context("thread-alias", 0, UNLISTED),
+            previous_response_id: None,
+            items: vec![history_item(
+                "item_other_key",
+                Some(CodexHistoryRole::User),
+                "message",
+                r#"{"type":"message"}"#,
+                Some("other key"),
+            )],
+        })
+        .await
+        .unwrap();
+    store
+        .commit_history_request(&CodexHistoryRequest {
+            key_id: key_id.clone(),
+            session_key: other_session.clone(),
+            window: history_window_with_context("thread-alias", 0, UNLISTED),
+            previous_response_id: None,
+            items: vec![history_item(
+                "item_other_session",
+                Some(CodexHistoryRole::User),
+                "message",
+                r#"{"type":"message"}"#,
+                Some("other session"),
+            )],
+        })
+        .await
+        .unwrap();
+    let windows = store.load_history_windows(&key_id, &session).await.unwrap();
+    assert_eq!(
+        windows[0].metadata,
+        vec![
+            window_metadata(FIRST),
+            window_metadata(SECOND),
+            window_metadata(THIRD),
+        ],
+        "其它 Key 与会话的 UUID 不进入本作用域"
+    );
+    let other_windows = store
+        .load_history_windows(&other_key_id, &session)
+        .await
+        .unwrap();
+    assert_eq!(other_windows.len(), 1);
+    assert_eq!(other_windows[0].item_count, 1);
+    assert_eq!(other_windows[0].metadata, vec![window_metadata(UNLISTED)]);
     database.close().await;
 }
 
@@ -1352,10 +1542,26 @@ fn session_key(value: &str) -> ProviderSessionAffinityKey {
 }
 
 fn history_window(thread: &str, number: u64) -> CodexHistoryWindow {
+    history_window_with_context(thread, number, CONTEXT_WINDOW_ID)
+}
+
+/// 同一内部窗口在不同持久记录上可以保存不同的 context window UUID
+fn history_window_with_context(
+    thread: &str,
+    number: u64,
+    context_window_id: &str,
+) -> CodexHistoryWindow {
     CodexHistoryWindow {
         window_id: CodexNativeWindowId::try_new(format!("{thread}:{number}")).unwrap(),
         agent_name: Some("/root".to_owned()),
-        context_window_id: Some(CONTEXT_WINDOW_ID.to_owned()),
+        context_window_id: Some(context_window_id.to_owned()),
+    }
+}
+
+fn window_metadata(context_window_id: &str) -> CodexHistoryWindowMetadata {
+    CodexHistoryWindowMetadata {
+        agent_name: Some("/root".to_owned()),
+        context_window_id: Some(context_window_id.to_owned()),
     }
 }
 

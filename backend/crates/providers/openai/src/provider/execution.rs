@@ -184,6 +184,8 @@ impl CodexProvider {
                 session_affinity: request.session_affinity.as_ref(),
                 model,
                 requires_oauth: false,
+                // 模型与实时调用沿用本次 attempt 的截止与取消
+                lease_lifecycle: None,
             })
             .await
             .map_err(map_selection_error)?;

@@ -72,6 +72,30 @@ pub(crate) fn native_service_with_mode(
     provider: Arc<dyn Provider>,
     mode: CodexAccessMode,
 ) -> (DefaultExecutionService, Arc<NativeAdmissions>) {
+    let admissions = Arc::new(NativeAdmissions::default());
+    (
+        native_service_with(provider, mode, 1, admissions.clone()),
+        admissions,
+    )
+}
+
+/// 允许同时驱动多个调用方的服务
+///
+/// 容量与同会话等待用例必须并发推进多个 future，单并发准入会先把它们排在同一层，
+/// 从而绕开被测的交付容量边界
+pub(crate) fn native_service_with_parallel_admissions(
+    provider: Arc<dyn Provider>,
+    mode: CodexAccessMode,
+) -> DefaultExecutionService {
+    native_service_with(provider, mode, 0, Arc::new(ConcurrentAdmissions::default()))
+}
+
+fn native_service_with(
+    provider: Arc<dyn Provider>,
+    mode: CodexAccessMode,
+    max_concurrency: u64,
+    admissions: Arc<dyn ClientAdmissionPort>,
+) -> DefaultExecutionService {
     let provider_kind = ProviderKind::new("openai").unwrap();
     let account_id = ProviderAccountId::new(ACCOUNT).unwrap();
     let directory = Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([
@@ -93,7 +117,7 @@ pub(crate) fn native_service_with_mode(
         )),
         true,
         RateLimits {
-            max_concurrency: 1,
+            max_concurrency,
             requests_per_minute: 100,
         },
     )
@@ -112,18 +136,14 @@ pub(crate) fn native_service_with_mode(
     )
     .unwrap()
     .with_account_directory(directory);
-    let admissions = Arc::new(NativeAdmissions::default());
-    (
-        DefaultExecutionService::new(
-            RuntimeSnapshotHandle::new(snapshot),
-            Arc::new(NoModelExecution),
-            ProviderRegistry::new([provider]).unwrap(),
-            admissions.clone(),
-            Arc::new(NoModelExecution),
-            Arc::new(NoModelExecution),
-            Arc::new(crate::RecordingDiagnostics::default()),
-        ),
+    DefaultExecutionService::new(
+        RuntimeSnapshotHandle::new(snapshot),
+        Arc::new(NoModelExecution),
+        ProviderRegistry::new([provider]).unwrap(),
         admissions,
+        Arc::new(NoModelExecution),
+        Arc::new(NoModelExecution),
+        Arc::new(crate::RecordingDiagnostics::default()),
     )
 }
 
@@ -624,6 +644,39 @@ async fn notes_with_unknown_write_result_are_never_replayed() {
         assert!(!admissions.0.load(Ordering::SeqCst));
         stop.send(()).unwrap();
         upstream.await.unwrap();
+    }
+}
+
+/// 允许多个请求同时准入：只计数，不设上限
+#[derive(Default)]
+pub(crate) struct ConcurrentAdmissions(std::sync::atomic::AtomicUsize);
+
+impl ClientAdmissionPort for ConcurrentAdmissions {
+    fn abandon(&self, _: &ClientApiKeyId, _: &ModelRequestId) {}
+    fn admit(
+        &self,
+        _: ClientAdmissionRequest,
+    ) -> BoxFuture<'_, Result<ClientAdmissionDecision, ClientAdmissionError>> {
+        Box::pin(async {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ClientAdmissionDecision::Granted)
+        })
+    }
+    fn release<'a>(
+        &'a self,
+        _: &'a ClientApiKeyId,
+        _: &'a ModelRequestId,
+    ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
+        Box::pin(async {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        })
+    }
+    fn restore(
+        &self,
+        _: ClientAdmissionRecovery,
+    ) -> BoxFuture<'_, Result<ClientAdmissionRestoreResult, ClientAdmissionError>> {
+        Box::pin(async { Ok(ClientAdmissionRestoreResult::default()) })
     }
 }
 

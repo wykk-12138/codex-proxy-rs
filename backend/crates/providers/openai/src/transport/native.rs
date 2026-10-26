@@ -2,13 +2,31 @@
 
 use gateway_core::engine::codex::{CodexAuxiliaryOperation, CodexAuxiliaryRequest};
 use reqwest::{
-    Method, Response,
+    Method, RequestBuilder, Response,
     header::{CONTENT_TYPE, HeaderName, HeaderValue},
 };
 
 use super::{
     CodexBackendClient, CodexClientError, CodexClientResult, CodexRequestContext, endpoint_url,
 };
+
+/// 已构造完成、只待发送的辅助请求
+///
+/// 地址、身份头、业务头与正文都在准备阶段确定；准备失败时字节还没有离开网关，
+/// 调用方可以据此在记录写意图之前返回真实失败
+pub(crate) struct PreparedNativeAuxiliary {
+    request: RequestBuilder,
+}
+
+impl PreparedNativeAuxiliary {
+    /// 交给交付任务后只发送一次，不重试也不重新构造身份头
+    pub(crate) async fn execute(self) -> CodexClientResult<Response> {
+        self.request
+            .send()
+            .await
+            .map_err(CodexClientError::HttpJson)
+    }
+}
 
 impl CodexBackendClient {
     pub(crate) async fn native_auxiliary(
@@ -17,6 +35,21 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
         is_fedramp: bool,
     ) -> CodexClientResult<Response> {
+        self.prepare_native_auxiliary(request, context, is_fedramp)?
+            .execute()
+            .await
+    }
+
+    /// 只构造请求而不发送
+    ///
+    /// 可确定的地址、头与正文错误在这里返回；调用方必须在本步骤成功后才允许
+    /// 记录持久写意图或让字节离开网关
+    pub(crate) fn prepare_native_auxiliary(
+        &self,
+        request: CodexAuxiliaryRequest,
+        context: CodexRequestContext<'_>,
+        is_fedramp: bool,
+    ) -> CodexClientResult<PreparedNativeAuxiliary> {
         let (method, path) = auxiliary_endpoint(request.operation);
         let mut url = endpoint_url(&self.base_url, path);
         if let Some(query) = &request.query {
@@ -49,13 +82,13 @@ impl CodexBackendClient {
             headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
         }
         // 包括 notes 写入在内均只发送一次，上游错误状态也作为原始响应交付
-        self.client
-            .request(method, url)
-            .headers(headers)
-            .body(request.body)
-            .send()
-            .await
-            .map_err(CodexClientError::HttpJson)
+        Ok(PreparedNativeAuxiliary {
+            request: self
+                .client
+                .request(method, url)
+                .headers(headers)
+                .body(request.body),
+        })
     }
 }
 

@@ -12,7 +12,7 @@ pub mod diagnostics;
 mod downstream;
 pub mod endpoints;
 pub mod headers;
-mod native;
+pub(crate) mod native;
 pub mod profile;
 pub mod profile_avatar;
 pub mod profile_statistics;

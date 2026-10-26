@@ -30,10 +30,12 @@ pub enum WorkerKind {
     AccountImport,
     AccountFreezeRecovery,
     ResetCreditAutomation,
+    /// 已交接的 notes 写交付：只观察真实发送与落库，不做恢复扫描或重放
+    CodexNotesDelivery,
 }
 
 impl WorkerKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OAuthRefresh,
         Self::QuotaCatalogHealth,
         Self::RuntimeSnapshotReconciliation,
@@ -46,6 +48,7 @@ impl WorkerKind {
         Self::AccountImport,
         Self::AccountFreezeRecovery,
         Self::ResetCreditAutomation,
+        Self::CodexNotesDelivery,
     ];
 
     #[must_use]
@@ -63,6 +66,7 @@ impl WorkerKind {
             Self::AccountImport => "account_import",
             Self::AccountFreezeRecovery => "account_freeze_recovery",
             Self::ResetCreditAutomation => "reset_credit_automation",
+            Self::CodexNotesDelivery => "codex_notes_delivery",
         }
     }
 }
@@ -467,10 +471,12 @@ impl WorkerRegistration {
     }
 }
 
-/// Final DB 明确没有相应持久化状态时允许的禁用原因
+/// 允许的禁用原因：要么 Final DB 明确没有相应持久化状态，要么装配确实缺少该能力
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkerDisabledReason {
     NoBufferedOpsEvents,
+    /// 未装配该能力对应的持久端口，任务没有可处理的事实
+    NotesDeliveryUnavailable,
 }
 
 impl WorkerDisabledReason {
@@ -478,6 +484,7 @@ impl WorkerDisabledReason {
     pub const fn kind(self) -> WorkerKind {
         match self {
             Self::NoBufferedOpsEvents => WorkerKind::OpsFlush,
+            Self::NotesDeliveryUnavailable => WorkerKind::CodexNotesDelivery,
         }
     }
 
@@ -485,6 +492,7 @@ impl WorkerDisabledReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoBufferedOpsEvents => "ops events have no flush buffer",
+            Self::NotesDeliveryUnavailable => "native notes state ports are not assembled",
         }
     }
 }

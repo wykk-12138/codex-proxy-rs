@@ -457,7 +457,7 @@ impl CodexHistoryService {
             .await?;
         Ok(windows
             .iter()
-            .find(|stored| stored.window.window_id == window.window_id)
+            .find(|stored| stored.window_id == window.window_id)
             .map_or(0, |stored| stored.item_count))
     }
 }

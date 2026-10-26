@@ -16,10 +16,11 @@ use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
     CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem, CodexHistoryStoredWindow,
-    CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion, CodexNotesOperation,
-    CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica,
-    CodexSessionContentPort, CodexSessionOrigin, CodexSessionState, CodexSessionStatePort,
-    NewCodexNotesOperation, ProviderSessionAffinityKey, ProviderStoreError, ProviderStoreErrorKind,
+    CodexHistoryWindow, CodexHistoryWindowMetadata, CodexNativeWindowId, CodexNotesCompletion,
+    CodexNotesOperation, CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay,
+    CodexNotesReplica, CodexSessionContentPort, CodexSessionOrigin, CodexSessionState,
+    CodexSessionStatePort, NewCodexNotesOperation, ProviderSessionAffinityKey, ProviderStoreError,
+    ProviderStoreErrorKind,
 };
 
 fn unavailable(operation: &'static str) -> ProviderStoreError {
@@ -331,16 +332,16 @@ impl CodexSessionContentPort for MemoryStore {
             for item in items {
                 match windows
                     .iter_mut()
-                    .find(|window| window.window.window_id == item.window_id)
+                    .find(|window| window.window_id == item.window_id)
                 {
                     Some(window) => window.item_count += 1,
                     None => windows.push(CodexHistoryStoredWindow {
-                        window: CodexHistoryWindow {
-                            window_id: item.window_id.clone(),
+                        window_id: item.window_id.clone(),
+                        item_count: 1,
+                        metadata: vec![CodexHistoryWindowMetadata {
                             agent_name: Some("/root".to_owned()),
                             context_window_id: None,
-                        },
-                        item_count: 1,
+                        }],
                     }),
                 }
             }

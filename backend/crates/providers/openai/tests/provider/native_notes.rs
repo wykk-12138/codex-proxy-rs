@@ -1,7 +1,10 @@
 //! 验证原生 notes 六端点的已发布域映射、写入日志真实语义与异常不重试
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -16,7 +19,7 @@ use gateway_core::{
     engine::{
         codex::{CodexAuxiliaryOperation, CodexAuxiliaryRequest},
         codex_history::CodexHistoryService,
-        codex_notes::CodexNotesService,
+        codex_notes::{CodexNotesService, CodexNotesSessionExpectation},
         execution::ExecutionService as _,
         middleware::{MiddlewareHeader, MiddlewareResponse},
         provider::Provider as _,
@@ -28,17 +31,22 @@ use gateway_core::{
     provider_ports::{
         CodexHistoryItem, CodexHistoryPendingInput, CodexHistoryRequest, CodexHistoryResponse,
         CodexHistoryResponseAnchor, CodexHistoryRole, CodexHistoryStoredItem,
-        CodexHistoryStoredWindow, CodexHistoryWindow, CodexNativeWindowId, CodexNotesCompletion,
-        CodexNotesGeneration, CodexNotesOperation, CodexNotesOperationKind,
-        CodexNotesOperationStatus, CodexNotesPublish, CodexNotesPublishOutcome, CodexNotesReplay,
-        CodexNotesReplica, CodexSessionContentPort, CodexSessionOrigin, CodexSessionState,
-        CodexSessionStatePort, NewCodexNotesOperation, ProviderSessionAffinityKey,
-        ProviderStoreError, ProviderStoreErrorKind,
+        CodexHistoryStoredWindow, CodexHistoryWindow, CodexHistoryWindowMetadata,
+        CodexNativeWindowId, CodexNotesCompletion, CodexNotesGeneration, CodexNotesOperation,
+        CodexNotesOperationKind, CodexNotesOperationStatus, CodexNotesPublish,
+        CodexNotesPublishOutcome, CodexNotesReplay, CodexNotesReplica, CodexSessionContentPort,
+        CodexSessionOrigin, CodexSessionState, CodexSessionStatePort, NewCodexNotesOperation,
+        ProviderSessionAffinityKey, ProviderStoreError, ProviderStoreErrorKind,
     },
+    task::{WorkerKind, WorkerRunnable},
     upstream::UpstreamSendState,
 };
 use serde_json::{Map, Value, json};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpListener,
+    sync::Notify,
+};
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -46,13 +54,18 @@ use wiremock::{
 };
 
 use super::contract::{
-    generate_with_session_context, planned_request, pool_context,
+    generate_with_session_context, planned_request, pool_context, provider_and_notes_delivery_task,
     provider_with_codex_sessions_and_native_notes,
-    provider_with_codex_sessions_native_history_and_notes,
+    provider_with_codex_sessions_native_history_and_notes, spawn_notes_delivery,
 };
-use super::native::{native_service_with_mode, prepare, seed, seed_workspace};
+use super::native::{
+    native_service_with_mode, native_service_with_parallel_admissions, prepare, seed,
+    seed_workspace,
+};
 use super::native_history::{CAPTURED_SSE, pool_turn_request, pool_turn_request_with_input};
-use crate::support::{MemoryAccountStore, MemoryCodexSessions};
+use crate::support::{
+    GATE_WAIT_TIMEOUT, Gate, MemoryAccountStore, MemoryCodexSessions, TestLeaseCoordinator,
+};
 use crate::transport::accept_codex_test_websocket;
 
 const ACCOUNT: &str = "acct_native_bound";
@@ -101,18 +114,147 @@ struct MemoryNotesStore {
     history_items: Mutex<Vec<CodexHistoryStoredItem>>,
     history_anchors: Mutex<Vec<CodexHistoryResponseAnchor>>,
     history_pending: Mutex<Vec<CodexHistoryPendingInput>>,
+    /// 未认领会话：认领之后才出现会话状态，用于验证 notes 先于模型请求到达
+    /// 以及另一请求在认领期间按既有来源判定固定来源
+    claiming: Mutex<Option<(Arc<MemoryCodexSessions>, CodexSessionOrigin)>>,
+    /// 交付生命周期用例的确定性闸门与故障注入；常规用例保持未设置
+    gates: Mutex<GateSet>,
+    start_failure: Mutex<Option<StartFailure>>,
+    complete_fails_after_commit: AtomicBool,
+    completions: Arc<CompletionCounter>,
+}
+
+/// 可挂接闸门的持久阶段
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotesStage {
+    Append,
+    Start,
+    Complete,
+}
+
+/// 可挂接的持久阶段闸门：工作进入后停住，测试再决定取消、丢弃或放行
+#[derive(Default)]
+struct GateSet {
+    append: Option<Arc<Gate>>,
+    start: Option<Arc<Gate>>,
+    complete: Option<Arc<Gate>>,
+}
+
+/// 结束观察的到达计数：测试据此等待真实落库，而不是按时间推测
+#[derive(Default)]
+struct CompletionCounter {
+    completed: AtomicUsize,
+    signal: Notify,
+}
+
+impl CompletionCounter {
+    /// 等待真实落库到达；超时同样只用于定位测试驱动错误
+    async fn wait(&self, count: usize) {
+        tokio::time::timeout(GATE_WAIT_TIMEOUT, async {
+            loop {
+                let notified = self.signal.notified();
+                if self.completed.load(Ordering::SeqCst) >= count {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "completion wait timed out: expected {count}, observed {}",
+                self.completed.load(Ordering::SeqCst)
+            )
+        });
+    }
+
+    fn record(&self) {
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        self.signal.notify_waiters();
+    }
+}
+
+/// `start` 的错误注入：区分“可能已提交但响应丢失”和“确定没有开始”
+#[derive(Clone, Copy)]
+enum StartFailure {
+    /// 先把状态推进到 `InFlight` 再返回错误
+    Committed,
+    /// 不改状态直接返回错误
+    NotCommitted,
 }
 
 impl MemoryNotesStore {
     fn with_state(state: CodexSessionState) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Some(state)),
-            operations: Mutex::new(Vec::new()),
-            publishes: Mutex::new(Vec::new()),
-            history_items: Mutex::new(Vec::new()),
-            history_anchors: Mutex::new(Vec::new()),
-            history_pending: Mutex::new(Vec::new()),
+            ..Self::default()
         })
+    }
+
+    /// 会话尚未认领：状态行只在归属认领之后出现，与真实 Store 的认领建行一致
+    fn claiming(sessions: Arc<MemoryCodexSessions>, origin: CodexSessionOrigin) -> Arc<Self> {
+        Arc::new(Self {
+            claiming: Mutex::new(Some((sessions, origin))),
+            ..Self::default()
+        })
+    }
+
+    /// 模拟另一请求按既有来源判定把已存在的会话固定成给定来源
+    fn resolve_session_as(&self, origin: CodexSessionOrigin) {
+        if let Some(state) = self.state.lock().expect("state lock").as_mut() {
+            state.origin = origin;
+        }
+    }
+
+    /// 模拟另一请求在认领期间按既有来源判定把该会话固定成给定来源
+    fn resolve_unclaimed_as(&self, origin: CodexSessionOrigin) {
+        if let Some((_, current)) = self.claiming.lock().expect("claiming lock").as_mut() {
+            *current = origin;
+        }
+    }
+
+    fn gate(&self, stage: NotesStage) -> Option<Arc<Gate>> {
+        let gates = self.gates.lock().expect("gates lock");
+        match stage {
+            NotesStage::Append => gates.append.clone(),
+            NotesStage::Start => gates.start.clone(),
+            NotesStage::Complete => gates.complete.clone(),
+        }
+    }
+
+    fn attach_gate(&self, stage: NotesStage, gate: &Arc<Gate>) {
+        let mut gates = self.gates.lock().expect("gates lock");
+        match stage {
+            NotesStage::Append => gates.append = Some(Arc::clone(gate)),
+            NotesStage::Start => gates.start = Some(Arc::clone(gate)),
+            NotesStage::Complete => gates.complete = Some(Arc::clone(gate)),
+        }
+    }
+
+    async fn enter(&self, stage: NotesStage) {
+        if let Some(gate) = self.gate(stage) {
+            gate.enter().await;
+        }
+    }
+
+    fn completions(&self) -> &Arc<CompletionCounter> {
+        &self.completions
+    }
+
+    fn fail_start(&self, failure: StartFailure) {
+        *self.start_failure.lock().expect("start failure lock") = Some(failure);
+    }
+
+    fn complete_fails_after_commit(&self) {
+        self.complete_fails_after_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn status(&self, seq: u64) -> Option<CodexNotesOperationStatus> {
+        self.operations()
+            .into_iter()
+            .find(|operation| operation.seq == seq)
+            .map(|operation| operation.status)
     }
 
     fn history_item_ids(&self) -> Vec<String> {
@@ -219,11 +361,32 @@ impl MemoryNotesStore {
 impl CodexSessionStatePort for MemoryNotesStore {
     fn load_session<'a>(
         &'a self,
-        _key_id: &'a ClientApiKeyId,
-        _session_key: &'a ProviderSessionAffinityKey,
+        key_id: &'a ClientApiKeyId,
+        session_key: &'a ProviderSessionAffinityKey,
     ) -> BoxFuture<'a, Result<Option<CodexSessionState>, ProviderStoreError>> {
         let state = self.state.lock().expect("state lock").clone();
-        Box::pin(async move { Ok(state) })
+        let claiming = self.claiming.lock().expect("claiming lock").clone();
+        Box::pin(async move {
+            if let Some(state) = state {
+                return Ok(Some(state));
+            }
+            let Some((sessions, origin)) = claiming else {
+                return Ok(None);
+            };
+            // 未认领就没有状态行；首绑成功之后才按认领的 owner 建立会话事实
+            let Some(owner) = sessions.owner_of(key_id, session_key) else {
+                return Ok(None);
+            };
+            let state = CodexSessionState {
+                origin,
+                notes: CodexNotesReplica::native(owner.clone()),
+                owner,
+                generation: 4,
+                notes_replay: None,
+            };
+            *self.state.lock().expect("state lock") = Some(state.clone());
+            Ok(Some(state))
+        })
     }
 
     fn resolve_session_origin<'a>(
@@ -405,16 +568,16 @@ impl CodexSessionContentPort for MemoryNotesStore {
             for item in items {
                 match windows
                     .iter_mut()
-                    .find(|window| window.window.window_id == item.window_id)
+                    .find(|window| window.window_id == item.window_id)
                 {
                     Some(window) => window.item_count += 1,
                     None => windows.push(CodexHistoryStoredWindow {
-                        window: CodexHistoryWindow {
-                            window_id: item.window_id.clone(),
+                        window_id: item.window_id.clone(),
+                        item_count: 1,
+                        metadata: vec![CodexHistoryWindowMetadata {
                             agent_name: Some("/root".to_owned()),
                             context_window_id: None,
-                        },
-                        item_count: 1,
+                        }],
                     }),
                 }
             }
@@ -485,20 +648,23 @@ impl CodexSessionContentPort for MemoryNotesStore {
         &'a self,
         operation: &'a NewCodexNotesOperation,
     ) -> BoxFuture<'a, Result<CodexNotesOperation, ProviderStoreError>> {
-        let mut operations = self.operations.lock().expect("operations lock");
-        let seq = operations.len() as u64 + 1;
-        let recorded = CodexNotesOperation {
-            seq,
-            replica: operation.replica.clone(),
-            agent_name: operation.agent_name.clone(),
-            kind: operation.kind,
-            status: CodexNotesOperationStatus::Unsent,
-            request: operation.request.clone(),
-            response: None,
-            response_status: None,
-        };
-        operations.push(recorded.clone());
-        Box::pin(async move { Ok(recorded) })
+        Box::pin(async move {
+            self.enter(NotesStage::Append).await;
+            let mut operations = self.operations.lock().expect("operations lock");
+            let seq = operations.len() as u64 + 1;
+            let recorded = CodexNotesOperation {
+                seq,
+                replica: operation.replica.clone(),
+                agent_name: operation.agent_name.clone(),
+                kind: operation.kind,
+                status: CodexNotesOperationStatus::Unsent,
+                request: operation.request.clone(),
+                response: None,
+                response_status: None,
+            };
+            operations.push(recorded.clone());
+            Ok(recorded)
+        })
     }
 
     fn start_notes_operation<'a>(
@@ -507,31 +673,54 @@ impl CodexSessionContentPort for MemoryNotesStore {
         _session_key: &'a ProviderSessionAffinityKey,
         seq: u64,
     ) -> BoxFuture<'a, Result<CodexNotesOperation, ProviderStoreError>> {
-        let mut operations = self.operations.lock().expect("operations lock");
-        let Some(operation) = operations.iter_mut().find(|operation| operation.seq == seq) else {
-            return Box::pin(async { Err(unavailable("start Codex notes operation")) });
-        };
-        operation.status = CodexNotesOperationStatus::InFlight;
-        let operation = operation.clone();
-        Box::pin(async move { Ok(operation) })
+        Box::pin(async move {
+            self.enter(NotesStage::Start).await;
+            let failure = *self.start_failure.lock().expect("start failure lock");
+            let mut operations = self.operations.lock().expect("operations lock");
+            let Some(operation) = operations.iter_mut().find(|operation| operation.seq == seq)
+            else {
+                return Err(unavailable("start Codex notes operation"));
+            };
+            match failure {
+                // 开始事实已经提交，但调用方只看到错误：读回必须是 InFlight
+                Some(StartFailure::Committed) => {
+                    operation.status = CodexNotesOperationStatus::InFlight;
+                    Err(unavailable("start Codex notes operation"))
+                }
+                Some(StartFailure::NotCommitted) => Err(unavailable("start Codex notes operation")),
+                None => {
+                    operation.status = CodexNotesOperationStatus::InFlight;
+                    Ok(operation.clone())
+                }
+            }
+        })
     }
 
     fn complete_notes_operation<'a>(
         &'a self,
         completion: &'a CodexNotesCompletion,
     ) -> BoxFuture<'a, Result<CodexNotesOperation, ProviderStoreError>> {
-        let mut operations = self.operations.lock().expect("operations lock");
-        let Some(operation) = operations
-            .iter_mut()
-            .find(|operation| operation.seq == completion.seq)
-        else {
-            return Box::pin(async { Err(unavailable("complete Codex notes operation")) });
-        };
-        operation.status = completion.status;
-        operation.response.clone_from(&completion.response);
-        operation.response_status = completion.response_status;
-        let operation = operation.clone();
-        Box::pin(async move { Ok(operation) })
+        Box::pin(async move {
+            self.enter(NotesStage::Complete).await;
+            let mut operations = self.operations.lock().expect("operations lock");
+            let Some(operation) = operations
+                .iter_mut()
+                .find(|operation| operation.seq == completion.seq)
+            else {
+                return Err(unavailable("complete Codex notes operation"));
+            };
+            operation.status = completion.status;
+            operation.response.clone_from(&completion.response);
+            operation.response_status = completion.response_status;
+            let operation = operation.clone();
+            drop(operations);
+            self.completions().record();
+            if self.complete_fails_after_commit.load(Ordering::SeqCst) {
+                // 提交已经生效，但调用方只看到持久失败：不得据此重写终态
+                return Err(unavailable("complete Codex notes operation"));
+            }
+            Ok(operation)
+        })
     }
 
     fn load_notes_operations<'a>(
@@ -544,7 +733,19 @@ impl CodexSessionContentPort for MemoryNotesStore {
 }
 
 fn notes_service(store: &Arc<MemoryNotesStore>) -> Arc<CodexNotesService> {
-    Arc::new(CodexNotesService::new(store.clone(), store.clone(), true))
+    notes_service_with_admission(store, true)
+}
+
+/// 关闭托管准入时，新会话按既有准入规则固定为 legacy
+fn notes_service_with_admission(
+    store: &Arc<MemoryNotesStore>,
+    managed_admission: bool,
+) -> Arc<CodexNotesService> {
+    Arc::new(CodexNotesService::new(
+        store.clone(),
+        store.clone(),
+        managed_admission,
+    ))
 }
 
 fn history_service(store: &Arc<MemoryNotesStore>) -> Arc<CodexHistoryService> {
@@ -1884,4 +2085,1475 @@ async fn failed_response_does_not_reuse_the_capture_handle_of_the_next_attempt()
         notes.history_item_ids(),
         vec!["msg_user".to_owned(), "msg_answer".to_owned()]
     );
+}
+
+/// 官方 notes 写正文但会话 ID 可变：交付容量与互斥用例需要多个独立会话
+fn write_body_for_session(session: &str, text: &str) -> String {
+    json!({
+        "context": {"session_id": session, "current_agent_name": "/root"},
+        "path": "/root/notes.md",
+        "text": text,
+    })
+    .to_string()
+}
+
+/// 已交付写响应；用例用它断言原始正文被完整保存
+fn responded_operation(notes: &MemoryNotesStore) -> CodexNotesOperation {
+    let operations = notes.operations();
+    assert_eq!(operations.len(), 1, "exactly one recorded operation");
+    operations[0].clone()
+}
+
+#[tokio::test]
+async fn dropped_caller_future_keeps_the_real_delivery_observation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        sessions,
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    // 交付已经交接：调用方仍在等待结果，真实发送还没有开始
+    assert!(futures::poll!(&mut call).is_pending());
+    append_gate.wait(1).await;
+    // 直接丢弃调用方 future；工作不能被连带丢弃
+    drop(call);
+    append_gate.release(1);
+    notes.completions().wait(1).await;
+    let operation = responded_operation(&notes);
+    assert_eq!(operation.status, CodexNotesOperationStatus::Responded);
+    assert_eq!(operation.response.as_deref(), Some(REPLAYED));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        1,
+        "the dropped caller must not duplicate the upstream write"
+    );
+}
+
+#[tokio::test]
+async fn caller_cancellation_after_handoff_still_persists_the_observation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/append_to_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let prepared = prepare(&service).await;
+    let caller_cancellation = prepared.cancellation();
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepared,
+        notes_request(
+            CodexAuxiliaryOperation::NotesAppendToFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    append_gate.wait(1).await;
+    caller_cancellation.cancel();
+    // 调用方立即结束，但交接后的发送与落库仍要完成
+    call.await.expect_err("cancelled caller");
+    append_gate.release(1);
+    notes.completions().wait(1).await;
+    let operation = responded_operation(&notes);
+    assert_eq!(operation.status, CodexNotesOperationStatus::Responded);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn assembled_notes_ports_register_a_real_delivery_daemon() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let (_, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::new(TestLeaseCoordinator::default()),
+        notes_service(&notes),
+    );
+    // 装配了 notes 持久端口时必须贡献真实 daemon，而不是禁用项
+    let registration = provider_openai::notes_delivery_registration(task.expect("delivery task"))
+        .expect("delivery registration");
+    assert_eq!(registration.id.kind(), WorkerKind::CodexNotesDelivery);
+    assert!(
+        matches!(registration.runnable, WorkerRunnable::Daemon { .. }),
+        "the notes delivery owner must run as a supervised daemon"
+    );
+}
+
+#[tokio::test]
+async fn legacy_resolution_after_the_delivery_lease_refuses_before_any_intent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    let claim_gate = Gate::new();
+    sessions.gate_claims(&claim_gate);
+    // 未认领会话：先按准入规则准备成交付接管
+    let notes = MemoryNotesStore::claiming(Arc::clone(&sessions), CodexSessionOrigin::Managed);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service(&notes),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    // 停在认领之后：交付租约已取得并持有，最终落点尚未复读
+    tokio::select! {
+        () = claim_gate.wait(1) => {}
+        _ = &mut call => panic!("the write completed before the claim gate"),
+    }
+    let held = leases.latest_held().expect("delivery lease slot");
+    assert!(
+        !held.cancellation.is_cancelled(),
+        "the first bind must hold the delivery lease here"
+    );
+    // 另一请求按既有来源判定把同一会话固定为 legacy
+    notes.resolve_unclaimed_as(CodexSessionOrigin::Legacy);
+    claim_gate.release(1);
+    // 交付接管不成立，但租约已按交付生命周期取得：在任何意图与发送之前拒绝
+    call.await
+        .expect_err("a session that became legacy keeps no delivery lease");
+    assert!(
+        notes.operations().is_empty(),
+        "no notes intent may be recorded for the refused attempt"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "no notes bytes may leave the gateway for the refused attempt"
+    );
+    assert!(
+        leases.held().is_empty(),
+        "the refused attempt releases its slot"
+    );
+    // 后续请求走正常已知 legacy 路径：不再申请交付租约，也不记录日志
+    let lease_requests = leases.requests.lock().expect("requests").len();
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect("known legacy passthrough");
+    assert_eq!(
+        leases.requests.lock().expect("requests").len(),
+        lease_requests,
+        "a known legacy session must not take a delivery lease"
+    );
+    assert!(notes.operations().is_empty());
+    let (status, _) = read_body(response).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn known_legacy_in_the_session_lock_takes_no_delivery_lease() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    // 探针仍看到托管会话，锁内复读被另一请求固定成 legacy
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let service_handle = notes_service(&notes);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        Arc::clone(&service_handle),
+    );
+    let key_id = ClientApiKeyId::new("key_native_test").expect("client key");
+    let session_key = auxiliary_session_key(&provider, SESSION);
+    sessions.seed_owner(&key_id, &session_key, account());
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 测试先持有多会话互斥：请求在锁外探测之后、锁内复读之前停住
+    let guard = service_handle.lock_session(&key_id, &session_key).await;
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    notes.resolve_session_as(CodexSessionOrigin::Legacy);
+    drop(guard);
+    let response = call.await.expect("known legacy passthrough");
+    let (status, _) = read_body(response).await;
+    assert_eq!(status, 200);
+    // 锁内已是 legacy：不申请交付租约、不占容量、不记录日志
+    assert!(
+        leases.requests.lock().expect("requests").is_empty(),
+        "a session already known to be legacy must not request a delivery lease"
+    );
+    assert!(notes.operations().is_empty());
+}
+
+#[tokio::test]
+async fn unmanaged_preparation_keeps_the_caller_budget_beyond_the_delivery_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    // 受控准备耗时超过托管交付的 60 秒准备窗口，但仍在调用方/选号预算内
+    sessions.delay_claims(std::time::Duration::from_secs(70));
+    let notes = MemoryNotesStore::claiming(Arc::clone(&sessions), CodexSessionOrigin::Legacy);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service_with_admission(&notes, false),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 暂停时钟：受控准备按虚拟时间推进，结束后端口内部恢复真实时钟再做 loopback 发送
+    tokio::time::pause();
+    let response = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect("an unmanaged path keeps the caller budget");
+    let (status, _) = read_body(response).await;
+    assert_eq!(status, 200);
+    // 未接管：不记录日志，也不申请交付租约
+    assert!(notes.operations().is_empty());
+    assert!(leases.held().is_empty());
+}
+
+#[tokio::test]
+async fn managed_preparation_window_refuses_before_any_intent_or_send() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    // 同一受控准备耗时：接管路径必须被 60 秒准备窗口截断
+    sessions.delay_claims(std::time::Duration::from_secs(70));
+    let notes = MemoryNotesStore::claiming(Arc::clone(&sessions), CodexSessionOrigin::Managed);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service(&notes),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    tokio::time::pause();
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("the managed preparation window is enforced");
+    assert!(
+        notes.operations().is_empty(),
+        "a preparation timeout must not record a write intent"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "a preparation timeout must not reach the upstream"
+    );
+    assert!(leases.held().is_empty());
+}
+
+#[tokio::test]
+async fn notes_write_that_arrives_before_the_model_request_binds_the_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    // 会话还没有状态行：本次 notes 写是第一次触达，必须先完成首绑再读落点
+    let notes = MemoryNotesStore::claiming(Arc::clone(&sessions), CodexSessionOrigin::Managed);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect("a notes write may arrive before the first model request");
+    let operations = notes.operations();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, CodexNotesOperationStatus::Responded);
+    // 首绑只发生一次，且落点与日志都属于认领到的账号
+    assert_eq!(sessions.claims().len(), 1);
+    assert_eq!(notes.owner(), Some(account()));
+}
+
+#[tokio::test]
+async fn cancel_before_handoff_leaves_no_intent_and_no_upstream_write() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let service_handle = notes_service(&notes);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&service_handle),
+    );
+    let key_id = ClientApiKeyId::new("key_native_test").expect("client key");
+    let session_key = auxiliary_session_key(&provider, SESSION);
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 另一个写方持有多会话互斥：准备阶段停在取得互斥之前
+    let guard = service_handle.lock_session(&key_id, &session_key).await;
+    let prepared = prepare(&service).await;
+    let caller_cancellation = prepared.cancellation();
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepared,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    caller_cancellation.cancel();
+    call.await.expect_err("cancelled before handoff");
+    drop(guard);
+    tokio::task::yield_now().await;
+    assert!(
+        notes.operations().is_empty(),
+        "a cancelled preparation must not record a write intent"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "a cancelled preparation must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn unbuildable_request_fails_before_any_intent_or_upstream_write() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 可确定的请求头构造错误必须在记录写意图之前返回
+    let mut request = notes_request(
+        CodexAuxiliaryOperation::NotesWriteFile,
+        &write_body("cipher"),
+    );
+    request.headers.push(MiddlewareHeader::new(
+        "x-test",
+        Bytes::from_static(b"bad\x7fvalue"),
+    ));
+    service
+        .codex_auxiliary(prepare(&service).await, request)
+        .await
+        .expect_err("unbuildable request is rejected");
+    assert!(
+        notes.operations().is_empty(),
+        "preparation failure must not record a write intent"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn committed_start_without_a_response_is_never_overwritten() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    notes.fail_start(StartFailure::Committed);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("ambiguous start failure is returned");
+    // 读回是 InFlight：开始事实可能已提交，不能按“本调用没发送”改判
+    assert_eq!(
+        notes.status(1),
+        Some(CodexNotesOperationStatus::InFlight),
+        "an ambiguous start must keep the observed state"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "an unconfirmed start must not send bytes"
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_start_settles_only_the_proven_unsent_operation() {
+    let server = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    notes.fail_start(StartFailure::NotCommitted);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("start failure is returned");
+    // 读回仍是 Unsent：字节从未离开网关，按合法 Unsent → Failed 收尾
+    assert_eq!(notes.status(1), Some(CodexNotesOperationStatus::Failed));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty()
+    );
+    // 终态已经终结；未终结日志不会再阻止发布
+    migrations_are_not_blocked(&notes);
+}
+
+/// 收尾后的日志没有未终结操作
+fn migrations_are_not_blocked(notes: &MemoryNotesStore) {
+    assert!(
+        notes
+            .operations()
+            .iter()
+            .all(|operation| operation.status.is_terminal()),
+        "a settled operation must not block migration"
+    );
+}
+
+#[tokio::test]
+async fn completion_commit_without_a_response_keeps_the_recorded_outcome() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    notes.complete_fails_after_commit();
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("unknown persistence result is reported");
+    let operation = responded_operation(&notes);
+    // 提交结果可能已经落库：不得补写 Failed/Unknown 覆盖 Responded
+    assert_eq!(operation.status, CodexNotesOperationStatus::Responded);
+    assert_eq!(operation.response.as_deref(), Some(REPLAYED));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        1,
+        "a persistence failure must not resend the write"
+    );
+}
+
+#[tokio::test]
+async fn session_mutex_outlives_the_dropped_caller_until_completion() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let mut first = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("first"),
+        ),
+    ));
+    assert!(futures::poll!(&mut first).is_pending());
+    append_gate.wait(1).await;
+    drop(first);
+    // 第二个写方必须等同会话落库结束；交接后的互斥没有随调用方消失
+    let mut second = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("second"),
+        ),
+    ));
+    for _ in 0..8 {
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "the second write must wait for the first delivery"
+        );
+    }
+    assert_eq!(
+        append_gate.entered(),
+        1,
+        "the second write must not reach the append stage"
+    );
+    append_gate.release(2);
+    second.await.expect("second write");
+    notes.completions().wait(2).await;
+    let operations = notes.operations();
+    assert_eq!(operations.len(), 2);
+    assert!(operations.iter().all(|operation| {
+        operation.status == CodexNotesOperationStatus::Responded
+            && operation.response.as_deref() == Some(REPLAYED)
+    }));
+    assert_eq!(operations[0].seq, 1);
+    assert_eq!(operations[1].seq, 2);
+}
+
+#[tokio::test]
+async fn first_bind_lease_covers_the_delivery_after_the_post_acquisition_preparation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    // 取得租约之后才进入的异步准备：认领停在这里，证明预算覆盖准备而不只是锁等待
+    let claim_gate = Gate::new();
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    sessions.gate_claims(&claim_gate);
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let complete_gate = Gate::new();
+    notes.attach_gate(NotesStage::Complete, &complete_gate);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service(&notes),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let prepared = prepare(&service).await;
+    let caller_cancellation = prepared.cancellation();
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepared,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    // 租约已取得、准备停在认领之后；必须继续驱动调用方才能推进交接
+    tokio::select! {
+        () = claim_gate.wait(1) => {}
+        _ = &mut call => panic!("the write completed before the claim gate"),
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let lease = leases.latest_held().expect("first-bind lease slot");
+    // 准备消耗两秒后，槽位剩余仍须覆盖完整交付预算（旧实现只剩 155s-2s，必然失败）
+    assert!(
+        lease.remaining_at(std::time::SystemTime::now())
+            >= provider_openai::NOTES_DELIVERY_LEASE_BUDGET,
+        "post-acquisition preparation must not consume the delivery budget: {:?}",
+        lease.remaining_at(std::time::SystemTime::now())
+    );
+    claim_gate.release(1);
+    // 交接完成：工作已由交付 owner 持有
+    tokio::select! {
+        () = append_gate.wait(1) => {}
+        _ = &mut call => panic!("the write completed before it was handed off"),
+    }
+    caller_cancellation.cancel();
+    call.await.expect_err("cancelled caller");
+    // 调用方取消不停止续期：槽位仍覆盖发送与落库
+    assert!(
+        !lease.cancellation.is_cancelled(),
+        "the delivery lease must not follow the caller cancellation"
+    );
+    append_gate.release(1);
+    // 交付已发送并读完正文，停在落库之前；drain 期间槽位必须仍有效
+    complete_gate.wait(1).await;
+    let observing_at = std::time::SystemTime::now();
+    let lease = leases
+        .latest_held()
+        .expect("slot still held while observing");
+    assert!(
+        lease.covers(observing_at),
+        "the account slot must stay valid until the observation ends"
+    );
+    complete_gate.release(1);
+    notes.completions().wait(1).await;
+    let completed_at = std::time::SystemTime::now();
+    assert_eq!(
+        notes.status(1),
+        Some(CodexNotesOperationStatus::Responded),
+        "the delivery must finish after the caller left"
+    );
+    assert!(
+        lease.covers(completed_at),
+        "the slot must not lapse before the delivery completes"
+    );
+    assert_eq!(leases.live_leases(), 0);
+    assert!(leases.held().is_empty());
+}
+
+#[tokio::test]
+async fn legacy_first_bind_keeps_the_caller_lease_lifecycle() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let sessions = Arc::new(MemoryCodexSessions::default());
+    // 关闭托管准入：无状态会话在认领后按既有准入规则固定为 legacy
+    let notes = MemoryNotesStore::claiming(Arc::clone(&sessions), CodexSessionOrigin::Legacy);
+    let claim_gate = Gate::new();
+    sessions.gate_claims(&claim_gate);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::clone(&sessions),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service_with_admission(&notes, false),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let prepared = prepare(&service).await;
+    let caller_cancellation = prepared.cancellation();
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepared,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    tokio::select! {
+        () = claim_gate.wait(1) => {}
+        _ = &mut call => panic!("the write must reach the claim before it can complete"),
+    }
+    let lease = leases.latest_held().expect("first-bind lease slot");
+    // 未被交付接管的 legacy 写沿用调用方期限：这里调用方没有显式期限，
+    // 槽位因此按 REQUEST_LEASE_TTL 兜底，而不是交付预留的期限
+    let remaining = lease.remaining_at(std::time::SystemTime::now());
+    assert!(
+        remaining > provider_openai::NOTES_DELIVERY_LEASE_BUDGET,
+        "legacy first bind must keep the caller deadline instead of the delivery reservation: {remaining:?}"
+    );
+    caller_cancellation.cancel();
+    // 续期取消来源仍是调用方：取消后租约随之失效
+    assert!(
+        lease.cancellation.is_cancelled(),
+        "legacy first bind must keep the caller cancellation"
+    );
+    claim_gate.release(1);
+    let _ = call.await;
+    // 未记录日志，沿既有转发语义
+    assert!(notes.operations().is_empty());
+}
+
+#[tokio::test]
+async fn delivery_capacity_refuses_the_next_write_before_any_intent() {
+    /// 与交付 owner 的本地上限一致：占满后第 N+1 个写必须被拒绝
+    const IN_FLIGHT: usize = 32;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 每个写交接后调用方立即离开：容量由交付 owner 持有，直到工作真正结束
+    for index in 0..IN_FLIGHT {
+        let body = write_body_for_session(&format!("session-capacity-{index}"), "cipher");
+        let mut call = Box::pin(service.codex_auxiliary(
+            prepare(&service).await,
+            notes_request(CodexAuxiliaryOperation::NotesWriteFile, &body),
+        ));
+        assert!(futures::poll!(&mut call).is_pending());
+        append_gate.wait(index + 1).await;
+        drop(call);
+    }
+    assert_eq!(append_gate.entered(), IN_FLIGHT);
+    let refused = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body_for_session("session-capacity-refused", "cipher"),
+            ),
+        )
+        .await
+        .expect_err("capacity is exhausted");
+    assert!(
+        notes.operations().is_empty(),
+        "a refused write must not record an intent: {refused:?}"
+    );
+    assert_eq!(
+        append_gate.entered(),
+        IN_FLIGHT,
+        "a refused write must not reach the append stage"
+    );
+    // 多放行一个许可留给容量恢复后的写
+    append_gate.release(IN_FLIGHT + 1);
+    notes.completions().wait(IN_FLIGHT).await;
+    assert_eq!(
+        notes.operations().len(),
+        IN_FLIGHT,
+        "only the admitted writes may be recorded"
+    );
+    assert!(
+        notes
+            .operations()
+            .iter()
+            .all(|operation| operation.status == CodexNotesOperationStatus::Responded),
+        "every admitted write must still land its real observation"
+    );
+    // 工作结束后容量恢复
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body_for_session("session-capacity-recovered", "cipher"),
+            ),
+        )
+        .await
+        .expect("capacity recovered");
+    assert_eq!(notes.operations().len(), IN_FLIGHT + 1);
+}
+
+#[tokio::test]
+async fn capacity_counts_same_session_waiters_before_the_session_mutex() {
+    const IN_FLIGHT: usize = 32;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        leases,
+        notes_service(&notes),
+    );
+    // 保留任务句柄以便直接观察容量准入，同时按 Host 方式运行同一 daemon
+    let task = Arc::new(task.expect("delivery task"));
+    let capacity = Arc::clone(&task);
+    tokio::spawn(async move {
+        let context = gateway_core::task::WorkerDaemonContext::new(CancellationToken::new());
+        let _ = gateway_core::task::DaemonTask::run(&*task, context).await;
+    });
+    let service = Arc::new(native_service_with_parallel_admissions(
+        provider,
+        CodexAccessMode::SessionPool,
+    ));
+    // 第一个写：交付持有会话互斥并停在 append（同一会话键，全部请求共用）
+    let first = {
+        let service = Arc::clone(&service);
+        let body = write_body("first");
+        tokio::spawn(async move {
+            service
+                .codex_auxiliary(
+                    prepare(&service).await,
+                    notes_request(CodexAuxiliaryOperation::NotesWriteFile, &body),
+                )
+                .await
+        })
+    };
+    append_gate.wait(1).await;
+    // 同一会话再提交其余在途写：它们在会话互斥之前就占用容量
+    let mut waiters = Vec::new();
+    for index in 1..IN_FLIGHT {
+        let service = Arc::clone(&service);
+        let body = write_body(&format!("waiter-{index}"));
+        waiters.push(tokio::spawn(async move {
+            service
+                .codex_auxiliary(
+                    prepare(&service).await,
+                    notes_request(CodexAuxiliaryOperation::NotesWriteFile, &body),
+                )
+                .await
+        }));
+    }
+    // 等容量真正被占满：同会话等待者也计入在途上限
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while capacity.available_capacity() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-session waiters must occupy the delivery capacity");
+    // 第 33 个同会话写在取得会话互斥之前就被拒绝，且零意图、零发送
+    let refused = service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("refused"),
+            ),
+        )
+        .await
+        .expect_err("capacity is exhausted for the same session");
+    assert!(notes.operations().is_empty(), "{refused:?}");
+    assert_eq!(append_gate.entered(), 1);
+    append_gate.release(IN_FLIGHT);
+    notes.completions().wait(IN_FLIGHT).await;
+    first.await.expect("first write task").expect("first write");
+    for waiter in waiters {
+        waiter.await.expect("waiter task").expect("waiter write");
+    }
+    assert_eq!(notes.operations().len(), IN_FLIGHT);
+}
+
+#[tokio::test]
+async fn graceful_close_keeps_the_delivery_lease_until_the_observation_ends() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let complete_gate = Gate::new();
+    notes.attach_gate(NotesStage::Complete, &complete_gate);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service(&notes),
+    );
+    let shutdown = CancellationToken::new();
+    let daemon = spawn_notes_delivery(task.expect("delivery task"), shutdown.clone());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let prepared = prepare(&service).await;
+    let caller_cancellation = prepared.cancellation();
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepared,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    // 交付已经发送并读完正文，停在落库之前；此间调用方离开
+    complete_gate.wait(1).await;
+    let lease = leases.latest_held().expect("first-bind lease slot");
+    assert_eq!(lease.account_id, account());
+    caller_cancellation.cancel();
+    call.await.expect_err("cancelled caller");
+    // Host 优雅关闭：先停止接收，再让在途工作完成观察
+    shutdown.cancel();
+    // 关闭不再接收新工作，但在途工作继续完成观察；落库许可必须早于 30s 持久上限
+    complete_gate.release(1);
+    daemon.await.expect("delivery daemon exits");
+    let completed_at = std::time::SystemTime::now();
+    assert!(
+        notes
+            .operations()
+            .iter()
+            .all(|operation| operation.status.is_terminal()),
+        "the drain must finish the in-flight observation before the daemon exits"
+    );
+    assert_eq!(
+        notes.status(1),
+        Some(CodexNotesOperationStatus::Responded),
+        "a delivered write must still record its real observation during the drain"
+    );
+    assert!(
+        lease.covers(completed_at),
+        "the account slot must cover the drain of an in-flight delivery"
+    );
+    assert!(leases.held().is_empty());
+    // 关闭后不再接收新工作：新写在准备阶段被拒绝，不写意图
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("after-close"),
+            ),
+        )
+        .await
+        .expect_err("closed delivery refuses the write");
+    assert_eq!(notes.operations().len(), 1);
+}
+
+#[tokio::test]
+async fn hard_kill_drops_the_lease_without_rewriting_the_operation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let complete_gate = Gate::new();
+    notes.attach_gate(NotesStage::Complete, &complete_gate);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        notes_service(&notes),
+    );
+    let daemon = spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    complete_gate.wait(1).await;
+    assert_eq!(leases.live_leases(), 1);
+    // Host 硬终止：任务被 abort，交付 future 连同 guard、互斥与租约一起释放
+    daemon.abort();
+    let _ = daemon.await;
+    drop(call);
+    tokio::time::timeout(GATE_WAIT_TIMEOUT, async {
+        while leases.live_leases() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborted delivery must release the account slot");
+    assert!(leases.held().is_empty());
+    // 允许留下未终结操作：不补写终态、不重放
+    assert_eq!(
+        notes.status(1),
+        Some(CodexNotesOperationStatus::InFlight),
+        "a hard kill leaves the operation unsettled instead of rewriting it"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_delivery_gate_refuses_new_writes_without_intent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        leases,
+        notes_service(&notes),
+    );
+    let cancellation = CancellationToken::new();
+    let daemon = spawn_notes_delivery(task.expect("delivery task"), cancellation.clone());
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect("write before close");
+    cancellation.cancel();
+    daemon.await.expect("delivery daemon exits");
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("closed delivery refuses the write");
+    assert_eq!(
+        notes.operations().len(),
+        1,
+        "a closed delivery must not record a new intent"
+    );
+}
+
+#[tokio::test]
+async fn stale_migration_intent_replays_nothing_after_a_concurrent_publish() {
+    let server = MockServer::start().await;
+    for route in ["write_file", "append_to_file"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/backend-api/codex/alpha/notes/v2/{route}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+            .mount(&server)
+            .await;
+    }
+    let store = Arc::new(MemoryAccountStore::default());
+    seed_workspace(&store, OWNER_A, true, false, &format!("chatgpt-{OWNER_A}")).await;
+    seed_workspace(&store, OWNER_B, true, false, &format!("chatgpt-{OWNER_B}")).await;
+    let notes = MemoryNotesStore::with_state(migration_state(CodexSessionOrigin::Managed, OWNER_A));
+    migration_log(&notes);
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        notes_service(&notes),
+    );
+    let owner_a = ProviderAccountId::new(OWNER_A).expect("owner a");
+    let owner_b = ProviderAccountId::new(OWNER_B).expect("owner b");
+    let session_key = pool_session_key(&provider, MIGRATE_SESSION);
+    let authorization = pool_context("req_stale_migration", CancellationToken::new())
+        .session_authorization()
+        .expect("session authorization");
+    let revision_b = store
+        .account(OWNER_B)
+        .expect("seeded account")
+        .revision()
+        .get();
+    // 选号时观测到的迁移意图：A 与代次 3
+    let intent = CodexNotesSessionExpectation {
+        owner: owner_a.clone(),
+        generation: 3,
+    };
+    // 第一个请求按该意图重放冻结日志并发布 B
+    let published = provider
+        .rebuild_notes(&authorization, &session_key, &owner_b, revision_b, &intent)
+        .await
+        .expect("first migration publishes");
+    assert!(matches!(published, CodexNotesPublishOutcome::Published(_)));
+    let replayed = server
+        .received_requests()
+        .await
+        .expect("received requests")
+        .len();
+    assert_eq!(replayed, 2, "the accepted intent replays the frozen log");
+    // 并发请求已发布 B；同一旧意图随后取得会话锁时必须零重放、零发布
+    let stale = provider
+        .rebuild_notes(&authorization, &session_key, &owner_b, revision_b, &intent)
+        .await
+        .expect_err("a stale intent is rejected");
+    assert!(stale.retry_is_prohibited());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        replayed,
+        "a stale intent must not replay any operation"
+    );
+    assert_eq!(
+        notes.publishes().len(),
+        1,
+        "a stale intent must not publish"
+    );
+    assert_eq!(notes.owner(), Some(owner_b.clone()));
+    // 目标恰好等于当前 owner 也不构成成功捷径：代次已经前进
+    let same_target = CodexNotesSessionExpectation {
+        owner: owner_b.clone(),
+        generation: 3,
+    };
+    let error = provider
+        .rebuild_notes(
+            &authorization,
+            &session_key,
+            &owner_b,
+            revision_b,
+            &same_target,
+        )
+        .await
+        .expect_err("matching the owner alone is not enough");
+    assert!(error.retry_is_prohibited());
+    assert_eq!(notes.publishes().len(), 1);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .len(),
+        replayed
+    );
+    assert_eq!(notes.owner(), Some(owner_b));
+}
+
+#[tokio::test]
+async fn delivery_lease_budget_is_anchored_at_the_lease_not_the_preparation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/notes/v2/write_file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(REPLAYED))
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let append_gate = Gate::new();
+    notes.attach_gate(NotesStage::Append, &append_gate);
+    let service_handle = notes_service(&notes);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (provider, task) = provider_and_notes_delivery_task(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("{}/backend-api", server.uri()),
+        Arc::clone(&leases),
+        Arc::clone(&service_handle),
+    );
+    spawn_notes_delivery(task.expect("delivery task"), CancellationToken::new());
+    let key_id = ClientApiKeyId::new("key_native_test").expect("client key");
+    let session_key = auxiliary_session_key(&provider, SESSION);
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    // 准备阶段先在会话互斥上等待：这段等待不能提前消耗交付租约有效期
+    let guard = service_handle.lock_session(&key_id, &session_key).await;
+    let mut call = Box::pin(service.codex_auxiliary(
+        prepare(&service).await,
+        notes_request(
+            CodexAuxiliaryOperation::NotesWriteFile,
+            &write_body("cipher"),
+        ),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    drop(guard);
+    // 调用方必须继续被驱动到交接，闸门才能被工作进入
+    tokio::select! {
+        () = append_gate.wait(1) => {}
+        _ = &mut call => panic!("the write must be handed off before it can complete"),
+    }
+    let request = leases
+        .requests
+        .lock()
+        .expect("lease requests lock")
+        .last()
+        .cloned()
+        .expect("first-bind lease request");
+    let remaining = request
+        .deadline()
+        .remaining()
+        .expect("delivery lease keeps a bounded deadline");
+    assert!(
+        remaining
+            > provider_openai::NOTES_DELIVERY_LEASE_BUDGET - std::time::Duration::from_secs(1),
+        "the lease budget must start at the lease, not at preparation: {remaining:?}"
+    );
+    append_gate.release(1);
+    call.await.expect("write after the preparation wait");
+    notes.completions().wait(1).await;
+    assert_eq!(notes.status(1), Some(CodexNotesOperationStatus::Responded));
+}
+
+#[tokio::test]
+async fn upstream_total_budget_covers_the_full_response_body() {
+    // 上游只回响应头、正文永不完整：35 秒整体预算必须覆盖发送到完整响应
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\npartial",
+            )
+            .await
+            .expect("response headers");
+        std::future::pending::<()>().await;
+    });
+    let store = Arc::new(MemoryAccountStore::default());
+    seed(&store, ACCOUNT, true, false).await;
+    let notes = MemoryNotesStore::with_state(state(
+        CodexSessionOrigin::Managed,
+        CodexNotesReplica::native(account()),
+    ));
+    let provider = provider_with_codex_sessions_and_native_notes(
+        &store,
+        Arc::new(MemoryCodexSessions::default()),
+        format!("http://{address}/backend-api"),
+        notes_service(&notes),
+    );
+    let (service, _) = native_service_with_mode(provider, CodexAccessMode::SessionPool);
+    let started = std::time::Instant::now();
+    service
+        .codex_auxiliary(
+            prepare(&service).await,
+            notes_request(
+                CodexAuxiliaryOperation::NotesWriteFile,
+                &write_body("cipher"),
+            ),
+        )
+        .await
+        .expect_err("a stalled body is bounded by the total budget");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(30),
+        "the stalled body must be cut by the overall budget: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "the overall budget must not extend into a caller wait: {elapsed:?}"
+    );
+    notes.completions().wait(1).await;
+    // 已收到响应头但正文不完整：结果不明，仍阻止自动迁移
+    let operation = responded_operation(&notes);
+    assert_eq!(operation.status, CodexNotesOperationStatus::Unknown);
+    assert!(operation.response.is_none());
+    assert_eq!(operation.response_status, Some(200));
+    upstream.abort();
 }

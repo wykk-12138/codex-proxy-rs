@@ -7,6 +7,7 @@ use gateway_core::{
     account::ProviderAccountId,
     engine::codex_notes::{
         CodexNotesDomain, CodexNotesError, CodexNotesRebuild, CodexNotesService,
+        CodexNotesSessionExpectation,
     },
     policy::ClientApiKeyId,
     provider_ports::{
@@ -42,6 +43,14 @@ fn target() -> ProviderAccountId {
 
 fn unavailable(operation: &'static str) -> ProviderStoreError {
     ProviderStoreError::new(ProviderStoreErrorKind::Unavailable, operation)
+}
+
+/// 选号时观测到的预期快照；正常路径与夹具状态一致
+fn expectation() -> CodexNotesSessionExpectation {
+    CodexNotesSessionExpectation {
+        owner: account(),
+        generation: 4,
+    }
 }
 
 fn state(origin: CodexSessionOrigin, replica: CodexNotesReplica) -> CodexSessionState {
@@ -408,7 +417,8 @@ fn rebuild_freezes_terminal_log_and_replays_responded_operations_in_order() {
         CodexNotesOperationStatus::Responded,
         r#"{"text":"three"}"#,
     );
-    let rebuild = block_on(service.begin_rebuild(&key(), &session(), &target())).expect("rebuild");
+    let rebuild = block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+        .expect("rebuild");
     assert_eq!(rebuild.through_seq, 3);
     assert_eq!(rebuild.expected_generation, 4);
     assert_eq!(
@@ -445,7 +455,8 @@ fn failed_tail_is_covered_by_the_last_replayed_step() {
         r#"{"text":"two"}"#,
     );
     let mut rebuild =
-        block_on(service.begin_rebuild(&key(), &session(), &target())).expect("rebuild");
+        block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+            .expect("rebuild");
     assert_eq!(rebuild.through_seq, 2);
     assert_eq!(
         rebuild
@@ -484,7 +495,13 @@ fn rebuild_rejects_unsettled_operations_without_saving_target() {
             status,
             r#"{"text":"one"}"#,
         );
-        let error = block_on(service.begin_rebuild(&key(), &session(), &target()))
+        // 之后的 Responded 写入只有完整 HTTP 响应，不能把前面的未终结操作当成已应用
+        store.record(
+            CodexNotesOperationKind::AppendToFile,
+            CodexNotesOperationStatus::Responded,
+            r#"{"text":"two"}"#,
+        );
+        let error = block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
             .expect_err("unsettled operation blocks rebuild");
         assert!(matches!(
             error,
@@ -492,6 +509,41 @@ fn rebuild_rejects_unsettled_operations_without_saving_target() {
         ));
         assert!(store.replay().is_none());
     }
+}
+
+#[test]
+fn stale_rebuild_intent_is_rejected_before_saving_any_replay_fact() {
+    // 并发请求已经发布新 owner/代次；旧意图必须零重放、零保存
+    let store = managed_store();
+    let service = service(&store);
+    store.record(
+        CodexNotesOperationKind::WriteFile,
+        CodexNotesOperationStatus::Responded,
+        r#"{"text":"one"}"#,
+    );
+    let generation_changed = CodexNotesSessionExpectation {
+        owner: account(),
+        generation: 3,
+    };
+    let owner_changed = CodexNotesSessionExpectation {
+        owner: ProviderAccountId::new("acct_codex_notes_other").expect("account id"),
+        generation: 4,
+    };
+    for stale in [generation_changed, owner_changed] {
+        assert!(matches!(
+            block_on(service.begin_rebuild(&key(), &session(), &target(), &stale)),
+            Err(CodexNotesError::MigrationStale)
+        ));
+        assert!(
+            store.replay().is_none(),
+            "a stale intent must not persist a replay target"
+        );
+    }
+    // 与观测快照一致的意图才允许冻结并保存目标
+    let rebuild = block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+        .expect("matching intent rebuilds");
+    assert_eq!(rebuild.expected_generation, 4);
+    assert!(store.replay().is_some());
 }
 
 #[test]
@@ -506,7 +558,8 @@ fn rebuild_progress_must_follow_the_frozen_order() {
         );
     }
     let mut rebuild =
-        block_on(service.begin_rebuild(&key(), &session(), &target())).expect("rebuild");
+        block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+            .expect("rebuild");
     assert!(matches!(
         block_on(service.advance_rebuild(&key(), &session(), &mut rebuild, 2)),
         Err(CodexNotesError::ReplayOutOfOrder)
@@ -532,7 +585,8 @@ fn publish_requires_complete_replay_and_the_observed_generation() {
         CodexNotesOperationStatus::Responded,
         r#"{"text":"one"}"#,
     );
-    let rebuild = block_on(service.begin_rebuild(&key(), &session(), &target())).expect("rebuild");
+    let rebuild = block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+        .expect("rebuild");
     assert!(matches!(
         block_on(service.publish_rebuild(&key(), &session(), &rebuild, 7)),
         Err(CodexNotesError::ReplayNotComplete)
@@ -572,7 +626,7 @@ fn legacy_sessions_keep_the_native_domain_and_are_never_rebuilt() {
         "client-session"
     );
     assert!(matches!(
-        block_on(service.begin_rebuild(&key(), &session(), &target())),
+        block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation())),
         Err(CodexNotesError::LegacySession)
     ));
     assert!(store.replay().is_none());
@@ -635,7 +689,7 @@ fn missing_session_reports_absent() {
             .is_none()
     );
     assert!(matches!(
-        block_on(service.begin_rebuild(&key(), &session(), &target())),
+        block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation())),
         Err(CodexNotesError::SessionAbsent)
     ));
 }
@@ -645,7 +699,8 @@ fn empty_log_rebuild_publishes_through_zero() {
     let store = managed_store();
     let service = service(&store);
     let rebuild: CodexNotesRebuild =
-        block_on(service.begin_rebuild(&key(), &session(), &target())).expect("rebuild");
+        block_on(service.begin_rebuild(&key(), &session(), &target(), &expectation()))
+            .expect("rebuild");
     assert_eq!(rebuild.through_seq, 0);
     assert!(rebuild.steps.is_empty());
     assert!(rebuild.is_replayed());
